@@ -490,3 +490,71 @@ def get_articles_status_by_urls(urls: list) -> dict:
             rows = cur.fetchall()
 
     return {row[0]: row[1] for row in rows}
+
+
+def upsert_article_image(
+    article_id:        int,
+    original_url:      str,
+    thumbnail_path:    Optional[str] = None,
+    is_representative: bool          = False,
+    alt_text:          Optional[str] = None,
+) -> int:
+    """
+    article_images 행을 UPSERT 합니다 (original_url 유니크 기준).
+
+    INSERT:
+        새 이미지 레코드를 생성합니다.
+
+    ON CONFLICT (original_url) DO UPDATE:
+        thumbnail_path    — 새 경로가 있으면 갱신, 없으면 기존 값 유지
+        is_representative — 항상 최신값으로 덮어씁니다
+        alt_text          — 새 텍스트가 있으면 갱신, 없으면 기존 값 유지
+        updated_at        — 자동 갱신
+
+    Args:
+        article_id:        소속 articles.id
+        original_url:      원본 이미지 URL (UNIQUE 키)
+        thumbnail_path:    생성된 썸네일 로컬 경로
+                           예) "static/thumbnails/42_3a8f.webp"
+        is_representative: True 면 기사 대표 이미지 (og:image 등)
+        alt_text:          HTML alt 속성 또는 AI 생성 대체 텍스트
+
+    Returns:
+        article_images.id (int)
+    """
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO article_images
+                    (article_id, original_url, thumbnail_path,
+                     is_representative, alt_text)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (original_url) DO UPDATE SET
+                    thumbnail_path    = COALESCE(
+                                            EXCLUDED.thumbnail_path,
+                                            article_images.thumbnail_path
+                                        ),
+                    is_representative = EXCLUDED.is_representative,
+                    alt_text          = COALESCE(
+                                            EXCLUDED.alt_text,
+                                            article_images.alt_text
+                                        ),
+                    updated_at        = NOW()
+                RETURNING id
+                """,
+                (
+                    article_id,
+                    original_url,
+                    thumbnail_path,
+                    is_representative,
+                    alt_text,
+                ),
+            )
+            img_id: int = cur.fetchone()[0]
+
+    logger.debug(
+        "article_image upsert | id=%d article_id=%d url=%.60s",
+        img_id, article_id, original_url,
+    )
+    return img_id

@@ -98,6 +98,7 @@ from scraper.db import (
     get_articles_status_by_urls,
     get_latest_published_at,
     upsert_article,
+    upsert_article_image,
 )
 from scraper.throttle import get_session
 
@@ -595,6 +596,22 @@ class BaseScraper(abc.ABC):
         return to_scrape, skipped
 
     # ─────────────────────────────────────────────────────────
+    # 후처리 훅 (서브클래스 선택적 재정의)
+    # ─────────────────────────────────────────────────────────
+
+    def _on_article_saved(self, article_id: int, data: dict[str, Any]) -> None:
+        """
+        DB 저장 성공 직후 호출되는 후처리 훅.
+
+        기본 구현은 아무것도 하지 않습니다.
+        서브클래스에서 재정의하여 이미지 처리, 태그 추출 등 추가 작업을 수행합니다.
+
+        Args:
+            article_id: 방금 저장된 articles.id
+            data:       _parse_article() + 공통 필드가 병합된 전체 데이터 딕셔너리
+        """
+
+    # ─────────────────────────────────────────────────────────
     # 추상 메서드 (서브클래스 구현 필수)
     # ─────────────────────────────────────────────────────────
 
@@ -731,6 +748,9 @@ class BaseScraper(abc.ABC):
 
                 # 5. DB 즉시 커밋 (UPSERT)
                 article_id = upsert_article(url, data, job_id=job_id)
+
+                # 6. 후처리 훅 (이미지 저장 등 — 서브클래스에서 구현)
+                self._on_article_saved(article_id, data)
 
                 result.success.append({
                     "url":        url,
@@ -1012,6 +1032,47 @@ class TenAsiaScraper(BaseScraper):
         """og:image 에서만 thumbnail_url 수집 — 인라인 <img> 아님."""
         return og.get("og:image") or og.get("twitter:image") or None
 
+    @staticmethod
+    def _extract_image_urls(soup: BeautifulSoup) -> list[tuple[str, Optional[str]]]:
+        """
+        HTML에서 모든 <img> 태그의 이미지 URL 과 alt 텍스트를 수집합니다.
+
+        반드시 _clean_soup() 호출 **전** 에 실행해야 합니다.
+        _clean_soup() 가 <img> 태그를 모두 제거하기 때문입니다.
+
+        수집 속성 우선순위:
+            src → data-src → data-lazy-src → data-original
+            (lazy loading / 지연 로딩 속성 지원)
+
+        필터링:
+            - URL 이 http(s):// 로 시작하지 않으면 제외 (data URI, 상대 경로 제외)
+            - 중복 URL 제거 (첫 번째 occurrence 유지)
+
+        Returns:
+            [(url, alt_text), ...] — alt_text 는 없으면 None
+        """
+        results: list[tuple[str, Optional[str]]] = []
+        seen: set[str] = set()
+
+        for img_tag in soup.find_all("img"):
+            url = ""
+            for attr in ("src", "data-src", "data-lazy-src", "data-original"):
+                candidate = img_tag.get(attr, "").strip()
+                if candidate:
+                    url = candidate
+                    break
+
+            if not url or not url.startswith("http"):
+                continue
+            if url in seen:
+                continue
+
+            seen.add(url)
+            alt = img_tag.get("alt", "").strip() or None
+            results.append((url, alt))
+
+        return results
+
     # ── 핵심 파싱 메서드 (BaseScraper 구현) ──────────────────
 
     def _parse_article(self, url: str, soup: BeautifulSoup) -> dict[str, Any]:
@@ -1034,6 +1095,9 @@ class TenAsiaScraper(BaseScraper):
 
         # 2. thumbnail_url — og:image 에서만, 인라인 <img> 아님
         thumbnail_url = self._extract_thumbnail(og)
+
+        # 2b. 본문 인라인 이미지 URL 수집 (_clean_soup 전 — 이후 <img> 전부 제거됨)
+        image_urls = self._extract_image_urls(soup)
 
         # 3. 미디어·노이즈 제거 (이후 soup 은 텍스트만 남음)
         self._clean_soup(soup)
@@ -1060,12 +1124,129 @@ class TenAsiaScraper(BaseScraper):
         )
 
         return {
-            "title_ko":     title_ko,
-            "content_ko":   content_ko,
-            "author":       author,
-            "published_at": published_at,
+            "title_ko":      title_ko,
+            "content_ko":    content_ko,
+            "author":        author,
+            "published_at":  published_at,
             "thumbnail_url": thumbnail_url,
+            # 본문 인라인 이미지 (url, alt_text) 튜플 목록.
+            # _process_article_images() 에서 소비됩니다.
+            # article_images 테이블 저장 + 썸네일 생성에 사용됩니다.
+            "image_urls":    image_urls,
         }
+
+    # ── 이미지 후처리 ─────────────────────────────────────────
+
+    def _on_article_saved(self, article_id: int, data: dict[str, Any]) -> None:
+        """
+        DB 저장 후 이미지 처리 훅 (BaseScraper 재정의).
+
+        data["image_urls"] 의 인라인 이미지와 data["thumbnail_url"] (og:image) 을
+        article_images 테이블에 저장하고 썸네일을 생성합니다.
+        """
+        image_urls   = data.get("image_urls") or []
+        og_thumbnail = data.get("thumbnail_url")
+
+        if not image_urls and not og_thumbnail:
+            return
+
+        self._process_article_images(
+            article_id=article_id,
+            image_urls=image_urls,
+            og_thumbnail=og_thumbnail,
+        )
+
+    def _process_article_images(
+        self,
+        article_id:  int,
+        image_urls:  list[tuple[str, Optional[str]]],
+        og_thumbnail: Optional[str] = None,
+    ) -> None:
+        """
+        수집된 이미지 URL 을 article_images 테이블에 저장하고 썸네일을 생성합니다.
+
+        처리 순서:
+            1. og:image (is_representative=True) 를 먼저 처리합니다.
+            2. 본문 <img> URL 을 순서대로 처리합니다.
+               og:image 와 동일한 URL 은 중복 처리하지 않습니다.
+
+        Throttling:
+            이미지 다운로드 전 _human_delay() 를 호출하여 스크래퍼와 동일한
+            2-레이어 쓰로틀링을 적용합니다:
+                1층 — ThrottledSession (self._session): DomainThrottle 자동 적용
+                2층 — _human_delay():  random 2~5초 추가 대기 (봇 패턴 회피)
+
+        Args:
+            article_id:   소속 articles.id
+            image_urls:   _extract_image_urls() 의 [(url, alt_text)] 목록
+            og_thumbnail: og:image URL (대표 이미지, None 허용)
+        """
+        from core.image_utils import generate_thumbnail
+
+        # 처리 대상: og:image 선두(representative), 이후 본문 이미지 순
+        og_set: set[str] = {og_thumbnail} if og_thumbnail else set()
+
+        # [(url, alt_text, is_representative)]
+        to_process: list[tuple[str, Optional[str], bool]] = []
+
+        if og_thumbnail:
+            to_process.append((og_thumbnail, None, True))
+
+        for img_url, alt_text in image_urls:
+            if img_url not in og_set:
+                to_process.append((img_url, alt_text, False))
+
+        if not to_process:
+            return
+
+        self.log.info(
+            "img_batch_start",
+            article_id=article_id,
+            count=len(to_process),
+        )
+
+        for img_url, alt_text, is_rep in to_process:
+            try:
+                # ── Throttling: 스크래퍼와 동일한 2-레이어 적용 ──────
+                # Layer 1: self._session (ThrottledSession) — DomainThrottle 자동
+                # Layer 2: _human_delay() — random 2~5초 추가 지연
+                self._human_delay()
+
+                thumb_path = generate_thumbnail(
+                    image_url=img_url,
+                    article_id=article_id,
+                    session=self._session,   # ThrottledSession 재사용
+                )
+
+                upsert_article_image(
+                    article_id=article_id,
+                    original_url=img_url,
+                    thumbnail_path=thumb_path,
+                    is_representative=is_rep,
+                    alt_text=alt_text,
+                )
+
+                self.log.info(
+                    "img_saved",
+                    article_id=article_id,
+                    url=img_url[:70],
+                    thumb=thumb_path,
+                    representative=is_rep,
+                )
+
+            except Exception as exc:
+                self.log.warning(
+                    "img_failed",
+                    article_id=article_id,
+                    url=img_url[:70],
+                    error=str(exc),
+                )
+
+        self.log.info(
+            "img_batch_done",
+            article_id=article_id,
+            processed=len(to_process),
+        )
 
     # ── RSS / 목록 페이지 ─────────────────────────────────────
 
