@@ -1,0 +1,80 @@
+# =============================================================
+# .pre-commit-config.yaml
+#
+# Install:
+#   pip install pre-commit detect-secrets
+#   pre-commit install
+#   pre-commit install --hook-type pre-push
+#
+# Run manually:
+#   pre-commit run --all-files
+#
+# Initialize detect-secrets baseline (first time only):
+#   detect-secrets scan > .secrets.baseline
+#   git add .secrets.baseline
+# =============================================================
+
+default_stages: [pre-commit]
+fail_fast: false
+
+repos:
+
+  # -- 1. Secret detection (Yelp detect-secrets) --------------
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: v1.5.0
+    hooks:
+      - id: detect-secrets
+        name: "Secret detection (detect-secrets)"
+        args:
+          - "--baseline"
+          - ".secrets.baseline"
+        exclude: |
+          (?x)^(
+            \.env\.example|
+            terraform/terraform\.tfvars\.example|
+            .*\.md$
+          )$
+
+  # -- 2. General file safety checks --------------------------
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: check-added-large-files
+        name: "Large file check (>500KB)"
+        args: ["--maxkb=500"]
+
+      - id: detect-private-key
+        name: "Private key detection"
+
+      - id: check-merge-conflict
+        name: "Merge conflict marker check"
+
+      - id: check-yaml
+        name: "YAML syntax check"
+
+      - id: check-json
+        name: "JSON syntax check"
+        exclude: "^.vscode/.*"
+
+      - id: end-of-file-fixer
+        name: "End-of-file newline fix"
+        exclude: "^static/.*"
+
+      - id: trailing-whitespace
+        name: "Trailing whitespace removal"
+        exclude: "^static/.*|.*\\.md$"
+
+      - id: no-commit-to-branch
+        name: "Block direct commits to main"
+        args: ["--branch", "main", "--branch", "master"]
+        stages: [pre-commit]
+
+  # -- 3. Python checks ---------------------------------------
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: check-ast
+        name: "Python AST syntax check"
+
+      - id: debug-statements
+        name: "Debug statement detection (pdb, breakpoint)"
