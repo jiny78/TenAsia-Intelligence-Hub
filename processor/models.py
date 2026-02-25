@@ -53,17 +53,16 @@ class ArticleExtracted(BaseModel):
       - 각 텍스트 필드 앞뒤 공백 자동 제거
     """
 
-    # 제목
+    # 제목 (다국어)
     title_ko:        str            = Field(..., min_length=1, description="한국어 제목 (필수)")
     title_en:        Optional[str]  = None
 
-    # 본문 요약
-    body_ko:         Optional[str]  = None
-    body_en:         Optional[str]  = None
+    # 원문 (한국어만 저장 — 영어 전체 번역은 비용 효율상 미제공)
+    content_ko:      Optional[str]  = None
 
-    # SNS 캡션용 짧은 요약
-    summary_ko:      Optional[str]  = Field(None, max_length=200)
-    summary_en:      Optional[str]  = Field(None, max_length=200)
+    # 요약 / SNS 캡션 (다국어 — 영어 요약은 global_priority=True 일 때 생성)
+    summary_ko:      Optional[str]  = Field(None, max_length=500)
+    summary_en:      Optional[str]  = Field(None, max_length=500)
 
     # 아티스트
     artist_name_ko:  Optional[str]  = None
@@ -78,6 +77,11 @@ class ArticleExtracted(BaseModel):
 
     # 썸네일 (process_thumbnail 이후 S3 URL)
     thumbnail_url:   Optional[str]  = None
+
+    # AI 생성 SEO 해시태그 (메타데이터 포함 JSONB)
+    # 구조: {"tags": [...], "model": "...", "confidence": 0.95, "generated_at": "..."}
+    # hashtags_en(단순 배열)과의 차이: 생성 이력·신뢰도 추적 가능
+    seo_hashtags:    Optional[dict] = None
 
     model_config = {"str_strip_whitespace": True}
 
@@ -95,7 +99,7 @@ class ArticleExtracted(BaseModel):
             if tag and str(tag).strip()
         ]
 
-    @field_validator("body_ko", "body_en", "summary_ko", "summary_en", mode="before")
+    @field_validator("content_ko", "summary_ko", "summary_en", mode="before")
     @classmethod
     def empty_to_none(cls, v: object) -> object:
         """빈 문자열을 None으로 변환."""
@@ -111,13 +115,16 @@ class ArticleExtracted(BaseModel):
 
     @model_validator(mode="after")
     def warn_missing_english(self) -> "ArticleExtracted":
-        """global_priority=True 인데 영어 제목이 없으면 경고 로그."""
-        if self.global_priority and not self.title_en:
+        """global_priority=True 인데 영어 필드가 없으면 경고 로그."""
+        if self.global_priority:
             import structlog
-            structlog.get_logger(__name__).warning(
-                "global_priority=True 이지만 title_en 없음",
-                title_ko=self.title_ko,
-            )
+            log = structlog.get_logger(__name__)
+            if not self.title_en:
+                log.warning("global_priority=True 이지만 title_en 없음",
+                            title_ko=self.title_ko)
+            if not self.summary_en:
+                log.warning("global_priority=True 이지만 summary_en 없음",
+                            title_ko=self.title_ko)
         return self
 
 

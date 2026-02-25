@@ -1,10 +1,15 @@
 # =============================================================
 # TenAsia Intelligence Hub — Makefile
 #
-# 사용법:
-#   make setup        ← 최초 배포 전 전체 셋업 (이것만 실행하면 됩니다)
-#   make deploy       ← 수동 배포 트리거
-#   make secrets      ← Secrets Manager 값만 재등록
+# 로컬 개발:
+#   make setup          ← 가상환경 생성 + requirements.txt 설치
+#   make dev-web        ← FastAPI(8000) + Streamlit(8501) 동시 실행
+#   make db-init        ← Alembic 마이그레이션 (upgrade head)
+#   make test-scraper   ← 어제 날짜 1일치 dry-run 스크래핑
+#
+# 클라우드:
+#   make cloud-setup  ← AWS 인프라 전체 셋업
+#   make deploy       ← App Runner 수동 배포 트리거
 #   make destroy      ← 인프라 전체 삭제 (주의)
 # =============================================================
 
@@ -15,16 +20,39 @@ SCRIPTS_DIR   := scripts
 # 색상
 GREEN  := \033[0;32m
 YELLOW := \033[1;33m
+CYAN   := \033[0;36m
 NC     := \033[0m
 
-.PHONY: help setup bootstrap tf-init tf-apply secrets github-secrets deploy destroy clean
+# ── 가상환경 경로 (Windows / Unix 자동 감지) ───────────────
+VENV := .venv
+ifeq ($(OS),Windows_NT)
+    VENV_BIN := $(VENV)/Scripts
+else
+    VENV_BIN := $(VENV)/bin
+endif
+PY  := $(VENV_BIN)/python
+PIP := $(VENV_BIN)/pip
+
+# test-scraper 기본 날짜 (어제, 덮어쓰기 가능)
+SCRAPE_DATE ?= $(shell date -d "1 day ago" +%Y-%m-%d 2>/dev/null || date +%Y-%m-%d)
+
+.PHONY: help setup dev-web db-init test-scraper \
+        cloud-setup bootstrap tf-init tf-apply secrets github-secrets deploy destroy clean \
+        docker-dev docker-build docker-up docker-down docker-logs docker-ps docker-clean
 
 help:
 	@echo ""
 	@echo "  $(GREEN)TenAsia Intelligence Hub$(NC)"
 	@echo ""
-	@echo "  $(YELLOW)최초 배포$(NC)"
-	@echo "    make setup          전체 셋업 (값 수집 → 인프라 → 시크릿 → GitHub 순서로 자동 처리)"
+	@echo "  $(CYAN)로컬 개발$(NC)"
+	@echo "    make setup          가상환경 생성 및 requirements.txt 설치"
+	@echo "    make dev-web        FastAPI(8000) + Streamlit(8501) 동시 실행 (개발 모드)"
+	@echo "    make db-init        Alembic 마이그레이션 실행 (upgrade head)"
+	@echo "    make test-scraper   어제 날짜 1일치 샘플 스크래핑 (dry-run)"
+	@echo "                        └ 날짜 지정: make test-scraper SCRAPE_DATE=2025-01-15"
+	@echo ""
+	@echo "  $(YELLOW)클라우드 배포$(NC)"
+	@echo "    make cloud-setup    전체 AWS 셋업 (인프라 → 시크릿 → GitHub 순서)"
 	@echo ""
 	@echo "  $(YELLOW)개별 단계$(NC)"
 	@echo "    make bootstrap      Terraform 상태 저장소만 생성 (S3 + DynamoDB)"
@@ -38,9 +66,71 @@ help:
 	@echo "    make destroy        인프라 전체 삭제 (위험)"
 	@echo "    make clean          로컬 Terraform 캐시 정리"
 	@echo ""
+	@echo "  $(CYAN)Docker$(NC)"
+	@echo "    make docker-dev     개발 스택 시작 (Hot Reload, override.yml 자동 병합)"
+	@echo "    make docker-build   프로덕션 이미지 빌드 (--no-cache)"
+	@echo "    make docker-up      프로덕션 스택 백그라운드 시작"
+	@echo "    make docker-down    모든 컨테이너 중지"
+	@echo "    make docker-logs    실시간 로그 (Ctrl+C 로 종료)"
+	@echo "    make docker-ps      컨테이너 상태 확인"
+	@echo "    make docker-clean   컨테이너 + 볼륨 완전 삭제 (위험)"
+	@echo ""
 
-# ── 최초 배포 전 전체 셋업 ─────────────────────────────────────
+# ── 로컬 개발: 가상환경 구축 ──────────────────────────────────
 setup:
+	@echo "$(GREEN)[setup]$(NC) 가상환경 생성 중..."
+	@python -m venv $(VENV)
+	@echo "$(GREEN)[setup]$(NC) 패키지 설치 중..."
+	@$(PIP) install --upgrade pip --quiet
+	@$(PIP) install -r requirements.txt
+	@echo ""
+	@echo "  $(GREEN)완료!$(NC) 아래 명령으로 가상환경을 활성화하세요:"
+	@echo "    Windows : .venv\\Scripts\\activate"
+	@echo "    macOS   : source .venv/bin/activate"
+	@echo ""
+	@echo "  이후 .env 파일에 DATABASE_URL, GEMINI_API_KEY 를 설정한 뒤"
+	@echo "  make db-init 으로 DB 스키마를 초기화하세요."
+
+# ── 로컬 개발: FastAPI + Streamlit 동시 실행 ──────────────────
+dev-web:
+	@echo "$(GREEN)[dev-web]$(NC) 개발 서버 시작..."
+	@echo "  FastAPI   → http://localhost:8000  (Swagger: /docs)"
+	@echo "  Streamlit → http://localhost:8501"
+	@echo "  종료: Ctrl+C"
+	@echo ""
+	@trap 'kill 0' EXIT; \
+	 $(PY) -m uvicorn web.api:app \
+	   --host localhost \
+	   --port 8000 \
+	   --reload \
+	   --log-level info & \
+	 $(PY) -m streamlit run web/app.py \
+	   --server.port 8501 \
+	   --server.address localhost \
+	   --server.headless false; \
+	 wait
+
+# ── 로컬 개발: DB 마이그레이션 ────────────────────────────────
+db-init:
+	@echo "$(GREEN)[db-init]$(NC) Alembic 마이그레이션 실행 (upgrade head)..."
+	@echo "  DATABASE_URL: $${DATABASE_URL:-(.env 파일에서 로드됩니다)}"
+	@$(PY) -m alembic upgrade head
+	@echo "$(GREEN)[db-init]$(NC) 마이그레이션 완료"
+
+# ── 로컬 개발: 스크래퍼 샘플 테스트 ──────────────────────────
+# 사용 예: make test-scraper SCRAPE_DATE=2025-01-15
+test-scraper:
+	@echo "$(GREEN)[test-scraper]$(NC) 샘플 스크래핑 시작 (날짜: $(SCRAPE_DATE), dry-run)"
+	@echo "  --dry-run: HTTP 요청·파싱은 수행하되 DB에 저장하지 않음"
+	@$(PY) -m scraper.engine scrape-range \
+	   --start $(SCRAPE_DATE) \
+	   --end   $(SCRAPE_DATE) \
+	   --batch-size 5 \
+	   --dry-run
+	@echo "$(GREEN)[test-scraper]$(NC) 테스트 완료 (DB에 저장 없음)"
+
+# ── 클라우드 배포 전 전체 셋업 ────────────────────────────────
+cloud-setup:
 	@chmod +x $(SCRIPTS_DIR)/setup.sh
 	@bash $(SCRIPTS_DIR)/setup.sh
 
@@ -130,3 +220,62 @@ clean:
 	@echo "$(GREEN)[clean]$(NC) 로컬 Terraform 캐시 정리..."
 	@rm -rf $(TERRAFORM_DIR)/.terraform $(TERRAFORM_DIR)/.terraform.lock.hcl $(TERRAFORM_DIR)/tfplan
 	@echo "  정리 완료"
+
+# =============================================================
+# Docker Compose 명령어
+# =============================================================
+
+# ── 개발 서버 (Hot Reload) ─────────────────────────────────────
+docker-dev:
+	@echo "$(GREEN)[docker-dev]$(NC) 개발 환경 시작 (Hot Reload)..."
+	@echo "  docker-compose.override.yml 자동 병합"
+	@echo "  DB  → localhost:5432"
+	@echo "  API → http://localhost:8000  (Swagger: /docs)"
+	@echo "  Web → http://localhost:3000"
+	@echo "  종료: Ctrl+C 후 'make docker-down'"
+	@echo ""
+	@if [ ! -f .env ]; then \
+	  echo "$(YELLOW)  ⚠ .env 파일이 없습니다. .env.docker 를 복사하세요:$(NC)"; \
+	  echo "    cp .env.docker .env"; \
+	  exit 1; \
+	fi
+	docker compose up
+
+# ── 프로덕션 이미지 빌드 ─────────────────────────────────────
+docker-build:
+	@echo "$(GREEN)[docker-build]$(NC) 프로덕션 이미지 빌드..."
+	@echo "  BUILD_DATE=$$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+	BUILD_DATE=$$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+	docker compose -f docker-compose.yml build --no-cache
+
+# ── 프로덕션 서버 시작 ───────────────────────────────────────
+docker-up:
+	@echo "$(GREEN)[docker-up]$(NC) 프로덕션 스택 시작..."
+	docker compose -f docker-compose.yml up -d
+	@echo ""
+	@echo "  API → http://localhost:$${API_PORT:-8000}"
+	@echo "  Web → http://localhost:$${WEB_PORT:-3000}"
+
+# ── 모든 컨테이너 중지 ──────────────────────────────────────
+docker-down:
+	@echo "$(GREEN)[docker-down]$(NC) 컨테이너 중지..."
+	docker compose down
+
+# ── 로그 실시간 확인 ─────────────────────────────────────────
+docker-logs:
+	docker compose logs -f --tail=100
+
+# ── 컨테이너 상태 확인 ──────────────────────────────────────
+docker-ps:
+	docker compose ps
+
+# ── 볼륨 포함 완전 삭제 ─────────────────────────────────────
+docker-clean:
+	@echo "$(YELLOW)[docker-clean]$(NC) 컨테이너 + 볼륨 모두 삭제합니다!"
+	@read -rp "  계속하시겠습니까? (y/N): " CONFIRM; \
+	if [[ "$$CONFIRM" == "y" || "$$CONFIRM" == "Y" ]]; then \
+	  docker compose down -v --remove-orphans; \
+	  echo "  완료"; \
+	else \
+	  echo "  취소됨"; \
+	fi

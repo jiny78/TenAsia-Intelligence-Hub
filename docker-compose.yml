@@ -1,0 +1,108 @@
+# =============================================================
+# TenAsia Intelligence Hub — Docker Compose
+#
+# 사용법:
+#   개발 (Hot Reload):  docker compose up
+#                       → docker-compose.override.yml 자동 병합
+#
+#   프로덕션 빌드:      docker compose -f docker-compose.yml up --build
+#
+#   개별 서비스:        docker compose up db api
+#   로그 확인:          docker compose logs -f api
+#   전체 종료:          docker compose down
+#   볼륨 포함 삭제:     docker compose down -v
+#
+# 로컬 퍼시스턴스 디렉터리 (자동 생성됨):
+#   data/pgdata/          ← PostgreSQL 데이터 파일
+#   static/thumbnails/    ← 수집된 썸네일 이미지
+# =============================================================
+
+name: tenasia-intelligence-hub
+
+services:
+
+  # ── PostgreSQL 15 ───────────────────────────────────────────
+  db:
+    image: postgres:15-alpine
+    container_name: tih-db
+    restart: always
+    environment:
+      POSTGRES_DB:       ${POSTGRES_DB:-tenasia}
+      POSTGRES_USER:     ${POSTGRES_USER:-tenasia}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required — copy .env.docker to .env}
+    volumes:
+      # 호스트 bind mount: 컨테이너가 내려가도 DB 데이터 보존
+      - ./data/pgdata:/var/lib/postgresql/data
+    networks:
+      - tenasia-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+
+  # ── FastAPI Backend ─────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+      args:
+        BUILD_DATE: ${BUILD_DATE:-unknown}
+    container_name: tih-api
+    restart: always
+    env_file:
+      # 시크릿(GEMINI_API_KEY, AWS 등)은 .env 파일에서 로드
+      - path: .env
+        required: false
+    environment:
+      # DB URL은 컨테이너 내부 네트워크 호스트명 사용
+      DATABASE_URL:            postgresql://${POSTGRES_USER:-tenasia}:${POSTGRES_PASSWORD:?}@db:5432/${POSTGRES_DB:-tenasia}
+      PYTHONUNBUFFERED:        "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    ports:
+      - "${API_PORT:-8000}:8000"
+    volumes:
+      # 썸네일 등 정적 파일을 호스트와 공유
+      # → http://localhost:8000/static/thumbnails/{파일명} 으로 접근
+      # → 컨테이너가 내려가도 static/ 폴더에 이미지 보존
+      - ./static:/app/static
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - tenasia-net
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ── Next.js Frontend ────────────────────────────────────────
+  web:
+    build:
+      context: ./web-next
+      dockerfile: Dockerfile
+      target: production
+      args:
+        # NEXT_PUBLIC_ 변수는 빌드 시 번들에 삽입됨
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+    container_name: tih-web
+    restart: always
+    environment:
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+    ports:
+      - "${WEB_PORT:-3000}:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - tenasia-net
+
+# ── Internal Network ────────────────────────────────────────
+networks:
+  tenasia-net:
+    driver: bridge
+    name: tih-network

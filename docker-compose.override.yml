@@ -1,0 +1,73 @@
+# =============================================================
+# TenAsia Intelligence Hub — Dev Override
+#
+# docker compose up 실행 시 이 파일이 docker-compose.yml 위에
+# 자동으로 병합됩니다 (프로덕션에선 -f 플래그로 제외).
+#
+# 주요 변경:
+#   - DB 포트 외부 노출 (로컬 DB 클라이언트 접속용)
+#   - api: dev 스테이지 + 소스 볼륨 마운트 + --reload
+#   - web: dev 스테이지 + 소스 볼륨 마운트 + next dev
+# =============================================================
+
+services:
+
+  # ── DB: 로컬 접속용 포트 노출 ────────────────────────────────
+  db:
+    ports:
+      - "${DB_PORT:-5432}:5432"     # DBeaver / pgAdmin / psql 접속용
+
+  # ── API: Hot Reload ──────────────────────────────────────────
+  api:
+    build:
+      target: dev                    # dev 스테이지 사용
+    command:
+      - uvicorn
+      - web.api:app
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8000"
+      - --reload                     # 파일 변경 시 자동 재시작
+      - --reload-dir
+      - /app
+      - --log-level
+      - debug
+    volumes:
+      # 전체 프로젝트 소스 마운트 → 저장 즉시 반영
+      - .:/app
+      # 컨테이너 내부 패키지 디렉터리는 host 로 덮어씌워지지 않도록 보호
+      - /app/.venv
+      - /app/__pycache__
+    environment:
+      ENV:             development
+      LOG_LEVEL:       debug
+      WATCHFILES_FORCE_POLLING: "true"   # WSL2 / Windows bind mount 파일 감지 보조
+
+  # ── Web: Hot Reload ──────────────────────────────────────────
+  web:
+    build:
+      target: dev                    # dev 스테이지 사용
+    command: ["npm", "run", "dev"]
+    volumes:
+      # web-next 소스 마운트 → 저장 즉시 반영
+      - ./web-next:/app
+      # node_modules 는 컨테이너 이미지의 것을 보존 (host 덮어씌움 방지)
+      # Docker는 named volume → bind mount 보다 우선순위가 높음
+      - tih_node_modules:/app/node_modules
+      # .next 빌드 캐시도 컨테이너 내부에 보존
+      - tih_next_cache:/app/.next
+    environment:
+      NODE_ENV:             development
+      NEXT_PUBLIC_API_URL:  http://localhost:8000
+      # Windows + Docker Desktop 에서의 파일 변경 감지 보조
+      WATCHPACK_POLLING:    "true"
+
+# ── Dev 전용 Named Volumes ────────────────────────────────────
+# node_modules / .next 를 컨테이너 내부에 격리하여
+# 호스트의 (없을 수도 있는) 디렉터리에 덮어씌워지는 것을 방지
+volumes:
+  tih_node_modules:
+    name: tih-node-modules
+  tih_next_cache:
+    name: tih-next-cache

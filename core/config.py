@@ -82,17 +82,67 @@ from __future__ import annotations
 import json
 import logging
 import os
-from dataclasses import dataclass, field
+import sys
 from functools import lru_cache
 from typing import Any, Optional
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
+
+# -------------------------------------------------------
+# ANSI 색상 (Windows 포함)
+# -------------------------------------------------------
+
+_RED    = "\033[91m"
+_YELLOW = "\033[93m"
+_GREEN  = "\033[92m"
+_CYAN   = "\033[96m"
+_BOLD   = "\033[1m"
+_RESET  = "\033[0m"
+
+
+def _activate_ansi() -> None:
+    """Windows 터미널에서 ANSI 이스케이프 코드를 활성화합니다."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+            kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
+        except Exception:
+            pass
+
+
+def _print_env_error_guide(missing: list[tuple[str, str]]) -> None:
+    """누락된 필수 환경 변수에 대해 색상 있는 안내 메시지를 출력합니다."""
+    _activate_ansi()
+    lines = [
+        f"\n{_BOLD}{_RED}[ TenAsia Intelligence Hub ] 필수 환경 변수 누락{_RESET}",
+        f"{_RED}{'─' * 60}{_RESET}",
+    ]
+    for key, desc in missing:
+        lines.append(f"  {_YELLOW}✗  {key}{_RESET}  —  {desc}")
+
+    lines += [
+        f"\n{_BOLD}해결 방법{_RESET}",
+        f"{_CYAN}  1. 로컬 개발{_RESET}",
+        "     python setup_env.py          # 대화형 .env 설정 마법사",
+        "     # 또는 .env 파일에 직접 추가:",
+        "     #   GEMINI_API_KEY=AIza...",
+        "     #   DATABASE_URL=postgresql://user:pass@localhost:5432/tih",
+        f"\n{_CYAN}  2. 프로덕션 (AWS Secrets Manager){_RESET}",
+        "     aws secretsmanager put-secret-value \\",
+        "       --secret-id tih/GEMINI_API_KEY \\",
+        "       --secret-string '{\"GEMINI_API_KEY\": \"AIza...\"}'",
+        f"\n{_CYAN}  3. 환경 변수 직접 설정{_RESET}",
+        "     export GEMINI_API_KEY=AIza...",
+        "     export DATABASE_URL=postgresql://user:pass@localhost:5432/tih",
+        f"\n{_RED}{'─' * 60}{_RESET}",
+        f"{_BOLD}참고{_RESET}: .env.example 파일에 모든 변수 목록이 있습니다.\n",
+    ]
+    print("\n".join(lines), file=sys.stderr)
+
 
 # -------------------------------------------------------
 # Secrets Manager 헬퍼
@@ -123,14 +173,28 @@ def _load_secrets(region: str) -> dict[str, Any]:
 
 
 # -------------------------------------------------------
-# 설정 데이터클래스
+# 설정 클래스 (pydantic-settings BaseSettings)
 # -------------------------------------------------------
 
-@dataclass(frozen=True)
-class Settings:
+class Settings(BaseSettings):
+    """
+    pydantic-settings 기반 통합 설정 클래스.
+
+    - .env 파일 자동 로드 (case_sensitive=True)
+    - 환경 변수로 모든 필드 오버라이드 가능
+    - 싱글톤: get_settings() 를 통해서만 접근
+    """
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        case_sensitive=True,
+        extra="ignore",
+        populate_by_name=True,
+    )
+
     # ── 민감 정보 ────────────────────────────────────────
-    GEMINI_API_KEY: str
-    DATABASE_URL: str
+    GEMINI_API_KEY: Optional[str] = None
+    DATABASE_URL: Optional[str]   = None
 
     # ── AWS ──────────────────────────────────────────────
     AWS_REGION: str      = "ap-northeast-2"
@@ -139,10 +203,14 @@ class Settings:
     # ── 배포 환경 ─────────────────────────────────────────
     ENVIRONMENT: str = "development"
 
-    # ── 모델 ──────────────────────────────────────────────
+    # ── Gemini 모델 ────────────────────────────────────────
+    GEMINI_MODEL: str   = "gemini-2.0-flash"
     ARTICLE_MODEL: str  = "gemini-2.0-flash"
     VIDEO_MODEL: str    = "gemini-1.5-flash"
     FALLBACK_MODEL: str = "gemini-1.5-flash"
+
+    # ── Gemini API 속도 제어 ──────────────────────────────
+    GEMINI_RPM_LIMIT: int = 60   # 분당 요청 수 (무료: 15, 유료: 2000)
 
     # ── API 동작 ──────────────────────────────────────────
     MAX_RETRIES: int    = 3
@@ -150,22 +218,22 @@ class Settings:
     BASE_WAIT_TIME: int = 2     # 지수 백오프 기본 대기(초)
 
     # ── 비디오 처리 ───────────────────────────────────────
-    MAX_FRAMES: int      = 10
-    FRAME_INTERVAL: int  = 5    # 초
+    MAX_FRAMES: int       = 10
+    FRAME_INTERVAL: int   = 5    # 초
     MAX_VIDEO_LENGTH: int = 300  # 초
 
     # ── SNS 플랫폼 문자 제한 ──────────────────────────────
-    PLATFORM_LIMITS: dict = field(default_factory=lambda: {
+    PLATFORM_LIMITS: dict = Field(default_factory=lambda: {
         "x":         {"max_chars": 280,  "recommended_min": 140, "recommended_max": 200},
         "instagram": {"max_chars": 2200, "recommended_min": 500, "hashtag_count": 10},
         "threads":   {"max_chars": 500,  "recommended_chars": 300},
     })
 
     # ── 언어 ──────────────────────────────────────────────
-    SUPPORTED_LANGUAGES: list = field(default_factory=lambda: ["kr", "en"])
+    SUPPORTED_LANGUAGES: list = Field(default_factory=lambda: ["kr", "en"])
 
     # ── 품질 검증 ─────────────────────────────────────────
-    QUALITY_CHECKPOINTS: list = field(default_factory=lambda: [
+    QUALITY_CHECKPOINTS: list = Field(default_factory=lambda: [
         "팩트 체크: 기사 본문의 정보와 100% 일치하는가?",
         "품격 유지: 브랜드 이미지에 맞는 고급스러운 어휘를 사용했는가?",
         "자연스러운 현지화: 번역투가 아닌 현지 인플루언서의 말투인가?",
@@ -174,6 +242,16 @@ class Settings:
     # ── 로깅 ──────────────────────────────────────────────
     LOG_LEVEL: str  = "INFO"
     LOG_FORMAT: str = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
+    # ── 워커 ──────────────────────────────────────────────
+    WORKER_POLL_INTERVAL: int   = 10   # 초
+    WORKER_ID: Optional[str]    = None  # 미설정 시 EC2 인스턴스 ID 자동 감지
+
+    # ── FastAPI 내부 포트 ──────────────────────────────────
+    FASTAPI_INTERNAL_PORT: int = 8000
+
+    # ── EC2 스크래퍼 인스턴스 ID ──────────────────────────
+    EC2_SCRAPER_INSTANCE_ID: Optional[str] = None
 
     # ── Gemini Kill Switch ─────────────────────────────────
     # SSM Parameter Store 경로 (Terraform main.tf 에서 생성)
@@ -205,26 +283,52 @@ def get_settings() -> Settings:
 
     - production: Secrets Manager 우선 → 환경 변수 fallback
     - 그 외: 환경 변수 / .env 만 사용
+    - 필수 값 누락 시: 색상 안내 출력 후 즉시 종료 (sys.exit(1))
     """
+    _activate_ansi()
+
     env    = os.getenv("ENVIRONMENT", "development")
     region = os.getenv("AWS_REGION", "ap-northeast-2")
 
-    secrets: dict[str, Any] = {}
+    # production: Secrets Manager → os.environ 에 주입 (BaseSettings 가 자동 읽음)
     if env == "production":
         logger.info("Secrets Manager에서 시크릿 로드 중...")
         secrets = _load_secrets(region)
+        for k, v in secrets.items():
+            if k not in os.environ:
+                os.environ[k] = str(v)
 
-    def resolve(key: str) -> str:
-        """환경 변수 → Secrets Manager 순으로 값 탐색"""
-        return os.getenv(key) or secrets.get(key, "")
+    # pydantic-settings 인스턴스화 (ValidationError 가 발생하면 즉시 종료)
+    try:
+        s = Settings()
+    except Exception as exc:
+        print(
+            f"\n{_BOLD}{_RED}[ TenAsia ] 설정 파싱 오류{_RESET}\n"
+            f"  {_YELLOW}{exc}{_RESET}\n"
+            f"  python setup_env.py 를 실행하여 .env 파일을 설정하세요.\n",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
-    return Settings(
-        GEMINI_API_KEY = resolve("GEMINI_API_KEY") or resolve("GOOGLE_API_KEY"),
-        DATABASE_URL   = resolve("DATABASE_URL"),
-        AWS_REGION     = region,
-        S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME", "tenasia-thumbnails"),
-        ENVIRONMENT    = env,
+    # 커스텀 필수값 검증 (fail-fast)
+    missing: list[tuple[str, str]] = []
+
+    if not s.GEMINI_API_KEY:
+        missing.append(("GEMINI_API_KEY", "Google Gemini API 키 (항상 필수)"))
+
+    if s.is_production and not s.DATABASE_URL:
+        missing.append(("DATABASE_URL", "PostgreSQL 접속 URL (프로덕션 필수)"))
+
+    if missing:
+        _print_env_error_guide(missing)
+        sys.exit(1)
+
+    logger.info(
+        "설정 로드 완료 | env=%s | Gemini=OK | DB=%s",
+        s.ENVIRONMENT,
+        "OK" if s.DATABASE_URL else "미설정(개발 환경)",
     )
+    return s
 
 
 # 모듈 레벨 싱글톤
@@ -232,28 +336,20 @@ settings = get_settings()
 
 
 # -------------------------------------------------------
-# 시작 시 필수 값 검증
+# 시작 시 필수 값 검증 (진입점에서 명시적 호출용)
 # -------------------------------------------------------
 
 def validate_settings() -> None:
-    """앱 시작 시 호출하여 필수 설정이 모두 있는지 확인합니다."""
+    """
+    앱 시작 시 호출하여 필수 설정이 모두 있는지 확인합니다.
+
+    get_settings() 가 이미 fail-fast 검증을 수행하므로
+    이 함수는 추가적인 런타임 체크나 로그 확인 용도로 사용합니다.
+    """
     s = get_settings()
-    missing = []
-
-    if not s.GEMINI_API_KEY:
-        missing.append("GEMINI_API_KEY")
-    if s.is_production and not s.DATABASE_URL:
-        missing.append("DATABASE_URL")
-
-    if missing:
-        raise ValueError(
-            f"필수 시크릿 누락: {', '.join(missing)}\n"
-            "  운영: aws secretsmanager put-secret-value --secret-id tih/<KEY> ...\n"
-            "  로컬: .env 파일에 KEY=value 형식으로 추가"
-        )
 
     logger.info(
-        "설정 로드 완료 | env=%s | Gemini=%s | DB=%s",
+        "설정 검증 통과 | env=%s | Gemini=%s | DB=%s",
         s.ENVIRONMENT,
         "OK" if s.GEMINI_API_KEY else "MISSING",
         "OK" if s.DATABASE_URL   else "MISSING",
@@ -380,7 +476,7 @@ def record_gemini_usage(token_count: int) -> None:
     if current_total >= s.GEMINI_MONTHLY_TOKEN_LIMIT:
         _ssm_put(s.GEMINI_KILL_SWITCH_SSM, "true", s.AWS_REGION)
         logger.error(
-            "⚠️  Gemini 월 토큰 한도 초과! Kill Switch 활성화됨.\n"
+            "Gemini 월 토큰 한도 초과! Kill Switch 활성화됨.\n"
             "  누적: %d tokens / 한도: %d tokens\n"
             "  모든 Gemini API 호출이 중단됩니다.\n"
             "  재개하려면: aws ssm put-parameter "

@@ -304,39 +304,47 @@ def upsert_article(
     아티클을 삽입하거나 갱신합니다 (source_url 기준 UPSERT).
 
     data 키 (모두 Optional):
-        title_ko, title_en, body_ko, body_en,
-        summary_ko, summary_en,
+        title_ko, title_en,
+        content_ko,                  ← 원문(한국어) 전체 본문
+        summary_ko, summary_en,      ← 요약 (영어 전체 번역 미제공)
+        author,
         artist_name_ko, artist_name_en,
         global_priority, hashtags_ko, hashtags_en,
-        thumbnail_url, published_at, language
+        seo_hashtags,                ← AI SEO 해시태그 (JSONB, 메타데이터 포함)
+        thumbnail_url, published_at, language,
+        process_status
 
     Returns:
         articles.id (int)
     """
-    import psycopg2.extras as _extras
-
     with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO articles (
-                    source_url, language,
-                    title_ko, title_en,
-                    body_ko, body_en,
-                    summary_ko, summary_en,
+                    source_url,     language,
+                    title_ko,       title_en,
+                    content_ko,
+                    summary_ko,     summary_en,
+                    author,
                     artist_name_ko, artist_name_en,
                     global_priority,
-                    hashtags_ko, hashtags_en,
+                    hashtags_ko,    hashtags_en,
+                    seo_hashtags,
                     thumbnail_url,
-                    job_id, published_at
+                    process_status,
+                    job_id,         published_at
                 ) VALUES (
-                    %s, %s,
-                    %s, %s,
-                    %s, %s,
                     %s, %s,
                     %s, %s,
                     %s,
                     %s, %s,
+                    %s,
+                    %s, %s,
+                    %s,
+                    %s, %s,
+                    %s::jsonb,
+                    %s,
                     %s,
                     %s, %s
                 )
@@ -344,16 +352,18 @@ def upsert_article(
                     language        = EXCLUDED.language,
                     title_ko        = COALESCE(EXCLUDED.title_ko,        articles.title_ko),
                     title_en        = COALESCE(EXCLUDED.title_en,        articles.title_en),
-                    body_ko         = COALESCE(EXCLUDED.body_ko,         articles.body_ko),
-                    body_en         = COALESCE(EXCLUDED.body_en,         articles.body_en),
+                    content_ko      = COALESCE(EXCLUDED.content_ko,      articles.content_ko),
                     summary_ko      = COALESCE(EXCLUDED.summary_ko,      articles.summary_ko),
                     summary_en      = COALESCE(EXCLUDED.summary_en,      articles.summary_en),
+                    author          = COALESCE(EXCLUDED.author,          articles.author),
                     artist_name_ko  = COALESCE(EXCLUDED.artist_name_ko,  articles.artist_name_ko),
                     artist_name_en  = COALESCE(EXCLUDED.artist_name_en,  articles.artist_name_en),
                     global_priority = EXCLUDED.global_priority,
                     hashtags_ko     = EXCLUDED.hashtags_ko,
                     hashtags_en     = EXCLUDED.hashtags_en,
+                    seo_hashtags    = COALESCE(EXCLUDED.seo_hashtags,    articles.seo_hashtags),
                     thumbnail_url   = COALESCE(EXCLUDED.thumbnail_url,   articles.thumbnail_url),
+                    process_status  = EXCLUDED.process_status,
                     updated_at      = NOW()
                 RETURNING id
                 """,
@@ -362,16 +372,18 @@ def upsert_article(
                     data.get("language", "kr"),
                     data.get("title_ko"),
                     data.get("title_en"),
-                    data.get("body_ko"),
-                    data.get("body_en"),
+                    data.get("content_ko"),
                     data.get("summary_ko"),
                     data.get("summary_en"),
+                    data.get("author"),
                     data.get("artist_name_ko"),
                     data.get("artist_name_en"),
                     data.get("global_priority", False),
                     data.get("hashtags_ko") or [],
                     data.get("hashtags_en") or [],
+                    json.dumps(data.get("seo_hashtags")) if data.get("seo_hashtags") else None,
                     data.get("thumbnail_url"),
+                    data.get("process_status", "PROCESSED"),
                     job_id,
                     data.get("published_at"),
                 ),
@@ -429,3 +441,120 @@ def get_recent_articles(
                 [*params, limit],
             )
             return [dict(r) for r in cur.fetchall()]
+
+
+def get_latest_published_at() -> "Optional[datetime]":
+    """
+    articles 테이블에서 가장 최근 published_at 을 반환합니다.
+    check_latest() 에서 새 기사 감지 기준선으로 사용됩니다.
+
+    Returns:
+        timezone-aware datetime 또는 None (테이블이 비어있을 때)
+    """
+    from datetime import datetime as _dt, timezone as _tz
+
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT MAX(published_at) FROM articles WHERE published_at IS NOT NULL"
+            )
+            row = cur.fetchone()
+
+    value = row[0] if row else None
+    if value is not None and value.tzinfo is None:
+        value = value.replace(tzinfo=_tz.utc)
+    return value
+
+
+def get_articles_status_by_urls(urls: list) -> dict:
+    """
+    URL 목록에 대한 process_status 맵을 일괄 조회합니다.
+    scrape_batch() 의 상태 기반 중복 체크에 사용됩니다.
+
+    Returns:
+        {source_url: process_status} — DB에 없는 URL은 결과에 포함되지 않음
+    """
+    if not urls:
+        return {}
+
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT source_url, process_status
+                FROM   articles
+                WHERE  source_url = ANY(%s)
+                """,
+                (list(urls),),
+            )
+            rows = cur.fetchall()
+
+    return {row[0]: row[1] for row in rows}
+
+
+def upsert_article_image(
+    article_id:        int,
+    original_url:      str,
+    thumbnail_path:    Optional[str] = None,
+    is_representative: bool          = False,
+    alt_text:          Optional[str] = None,
+) -> int:
+    """
+    article_images 행을 UPSERT 합니다 (original_url 유니크 기준).
+
+    INSERT:
+        새 이미지 레코드를 생성합니다.
+
+    ON CONFLICT (original_url) DO UPDATE:
+        thumbnail_path    — 새 경로가 있으면 갱신, 없으면 기존 값 유지
+        is_representative — 항상 최신값으로 덮어씁니다
+        alt_text          — 새 텍스트가 있으면 갱신, 없으면 기존 값 유지
+        updated_at        — 자동 갱신
+
+    Args:
+        article_id:        소속 articles.id
+        original_url:      원본 이미지 URL (UNIQUE 키)
+        thumbnail_path:    생성된 썸네일 로컬 경로
+                           예) "static/thumbnails/42_3a8f.webp"
+        is_representative: True 면 기사 대표 이미지 (og:image 등)
+        alt_text:          HTML alt 속성 또는 AI 생성 대체 텍스트
+
+    Returns:
+        article_images.id (int)
+    """
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO article_images
+                    (article_id, original_url, thumbnail_path,
+                     is_representative, alt_text)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (original_url) DO UPDATE SET
+                    thumbnail_path    = COALESCE(
+                                            EXCLUDED.thumbnail_path,
+                                            article_images.thumbnail_path
+                                        ),
+                    is_representative = EXCLUDED.is_representative,
+                    alt_text          = COALESCE(
+                                            EXCLUDED.alt_text,
+                                            article_images.alt_text
+                                        ),
+                    updated_at        = NOW()
+                RETURNING id
+                """,
+                (
+                    article_id,
+                    original_url,
+                    thumbnail_path,
+                    is_representative,
+                    alt_text,
+                ),
+            )
+            img_id: int = cur.fetchone()[0]
+
+    logger.debug(
+        "article_image upsert | id=%d article_id=%d url=%.60s",
+        img_id, article_id, original_url,
+    )
+    return img_id
