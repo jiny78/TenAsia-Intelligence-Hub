@@ -648,6 +648,7 @@ class BaseScraper(abc.ABC):
         retry_error:     bool           = True,
         date_after:      Optional[datetime] = None,
         date_before:     Optional[datetime] = None,
+        dry_run:         bool           = False,
     ) -> BatchResult:
         """
         URL 목록을 배치로 스크래핑합니다.
@@ -667,6 +668,8 @@ class BaseScraper(abc.ABC):
             retry_error:     True 면 ERROR 기사 재시도 (기본 True)
             date_after:      이 날짜 이전 기사는 스킵 (포함 경계, None=필터 없음)
             date_before:     이 날짜 이후 기사는 스킵 (포함 경계, None=필터 없음)
+            dry_run:         True 면 HTTP 요청·파싱은 수행하되 DB 에 커밋하지 않음.
+                             [DRY RUN] 태그로 결과를 로그에 출력합니다.
 
         Returns:
             BatchResult(total, success, failed, skipped)
@@ -701,7 +704,10 @@ class BaseScraper(abc.ABC):
             to_scrape=len(to_scrape),
             skipped=len(status_skipped),
             job_id=job_id,
+            dry_run=dry_run,
         )
+        if dry_run:
+            self.log.info("[DRY RUN] DB 커밋 없이 스크래핑·파싱만 수행합니다.")
 
         for idx, url in enumerate(to_scrape, start=1):
             self.log.info(
@@ -746,24 +752,41 @@ class BaseScraper(abc.ABC):
                 data.setdefault("global_priority", global_priority)
                 data["process_status"] = "SCRAPED"
 
-                # 5. DB 즉시 커밋 (UPSERT)
-                article_id = upsert_article(url, data, job_id=job_id)
+                if dry_run:
+                    # [DRY RUN] DB 커밋 없이 수집 결과만 로그 출력
+                    result.success.append({
+                        "url":          url,
+                        "article_id":   None,
+                        "title_ko":     str(data.get("title_ko", ""))[:60],
+                        "published_at": str(data.get("published_at") or ""),
+                        "dry_run":      True,
+                    })
+                    self.log.info(
+                        "[DRY RUN] scraped_preview",
+                        url=url,
+                        title=str(data.get("title_ko", ""))[:50],
+                        content_len=len(data.get("content_ko") or ""),
+                        published_at=str(data.get("published_at") or ""),
+                    )
+                else:
+                    # 5. DB 즉시 커밋 (UPSERT)
+                    article_id = upsert_article(url, data, job_id=job_id)
 
-                # 6. 후처리 훅 (이미지 저장 등 — 서브클래스에서 구현)
-                self._on_article_saved(article_id, data)
+                    # 6. 후처리 훅 (이미지 저장 등 — 서브클래스에서 구현)
+                    self._on_article_saved(article_id, data)
 
-                result.success.append({
-                    "url":        url,
-                    "article_id": article_id,
-                    "title_ko":   str(data.get("title_ko", ""))[:60],
-                })
-                self.log.info(
-                    "scraped_ok",
-                    url=url,
-                    article_id=article_id,
-                    title=str(data.get("title_ko", ""))[:50],
-                    content_len=len(data.get("content_ko") or ""),
-                )
+                    result.success.append({
+                        "url":        url,
+                        "article_id": article_id,
+                        "title_ko":   str(data.get("title_ko", ""))[:60],
+                    })
+                    self.log.info(
+                        "scraped_ok",
+                        url=url,
+                        article_id=article_id,
+                        title=str(data.get("title_ko", ""))[:50],
+                        content_len=len(data.get("content_ko") or ""),
+                    )
 
             except ForbiddenError as exc:
                 # 403: 배치 전체 즉시 중단
@@ -1619,6 +1642,7 @@ class TenAsiaScraper(BaseScraper):
         language:       str           = "kr",
         max_pages:      int           = 10,
         skip_processed: bool          = True,
+        dry_run:        bool          = False,
     ) -> BatchResult:
         """
         특정 날짜 범위 [start_date, end_date] 의 기사만 수집합니다.
@@ -1682,6 +1706,7 @@ class TenAsiaScraper(BaseScraper):
                 retry_error=True,
                 date_after=_start,
                 date_before=_end,
+                dry_run=dry_run,
             )
             combined.success.extend(partial.success)
             combined.failed.extend(partial.failed)
@@ -1758,6 +1783,8 @@ def main() -> None:
                      help="연결된 job_queue.id")
     rng.add_argument("--force", action="store_true",
                      help="PROCESSED 기사도 재수집 (skip_processed=False)")
+    rng.add_argument("--dry-run", action="store_true",
+                     help="HTTP 요청·파싱은 수행하되 DB 에 저장하지 않음 (테스트 모드)")
 
     # ── check-latest ──────────────────────────────────────────
     chk = sub.add_parser(
@@ -1784,6 +1811,7 @@ def main() -> None:
             language=args.language,
             max_pages=args.max_pages,
             skip_processed=not args.force,
+            dry_run=args.dry_run,
         )
         print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2, default=str))
 

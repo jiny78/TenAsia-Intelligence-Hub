@@ -54,11 +54,18 @@ app.add_middleware(
 # ── 요청/응답 스키마 ─────────────────────────────────────────
 
 class CreateJobRequest(BaseModel):
-    source_url: str       = Field(..., description="스크래핑할 기사 URL")
-    language:   str       = Field("kr", description="언어 코드 (kr / en)")
-    platforms:  list[str] = Field(default_factory=list, description="배포 플랫폼 목록")
-    priority:   int       = Field(5, ge=1, le=10, description="우선순위 (높을수록 먼저)")
-    max_retries: int      = Field(3, ge=0, le=10)
+    source_url:  str       = Field(..., description="스크래핑할 기사 URL")
+    language:    str       = Field("kr", description="언어 코드 (kr / en)")
+    platforms:   list[str] = Field(default_factory=list, description="배포 플랫폼 목록")
+    priority:    int       = Field(5, ge=1, le=10, description="우선순위 (높을수록 먼저)")
+    max_retries: int       = Field(3, ge=0, le=10)
+    dry_run:     bool      = Field(
+        False,
+        description=(
+            "True 면 HTTP 스크래핑·파싱은 수행하되 DB 에 저장하지 않음 (테스트 모드). "
+            "결과는 [DRY RUN] 태그로 로그에 출력됩니다."
+        ),
+    )
 
 
 class SsmTriggerRequest(BaseModel):
@@ -96,6 +103,7 @@ def submit_job(req: CreateJobRequest) -> dict[str, Any]:
         "source_url": req.source_url,
         "language":   req.language,
         "platforms":  req.platforms,
+        "dry_run":    req.dry_run,
     }
     job_id = create_job(
         job_type="scrape",
@@ -103,8 +111,11 @@ def submit_job(req: CreateJobRequest) -> dict[str, Any]:
         priority=req.priority,
         max_retries=req.max_retries,
     )
-    logger.info("작업 생성 | job_id=%d url=%s", job_id, req.source_url)
-    return {"job_id": job_id, "status": "pending"}
+    logger.info(
+        "작업 생성 | job_id=%d url=%s dry_run=%s",
+        job_id, req.source_url, req.dry_run,
+    )
+    return {"job_id": job_id, "status": "pending", "dry_run": req.dry_run}
 
 
 @app.get("/jobs/stats")

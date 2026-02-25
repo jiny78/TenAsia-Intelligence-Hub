@@ -497,6 +497,46 @@ def _replace_entity_mappings(article_id: int, records: list[dict]) -> int:
     return len(records)
 
 
+def _read_pending_articles_dry(
+    limit: int = _BATCH_SIZE,
+    job_id: Optional[int] = None,
+) -> list[dict]:
+    """
+    [DRY RUN] PENDING 기사를 상태 변경 없이 읽기 전용으로 조회합니다.
+
+    _claim_pending_articles() 와 달리 SELECT FOR UPDATE 와 status → SCRAPED 업데이트를
+    수행하지 않습니다. 드라이 런에서 DB 에 아무런 흔적을 남기지 않습니다.
+    """
+    if job_id is not None:
+        sql = """
+            SELECT id, title_ko, content_ko, summary_ko,
+                   artist_name_ko, global_priority, language, source_url, job_id
+            FROM   articles
+            WHERE  process_status = 'PENDING'
+              AND  job_id = %(job_id)s
+            ORDER  BY created_at ASC
+            LIMIT  %(limit)s
+        """
+        params: dict = {"job_id": job_id, "limit": limit}
+    else:
+        sql = """
+            SELECT id, title_ko, content_ko, summary_ko,
+                   artist_name_ko, global_priority, language, source_url, job_id
+            FROM   articles
+            WHERE  process_status = 'PENDING'
+            ORDER  BY created_at ASC
+            LIMIT  %(limit)s
+        """
+        params = {"limit": limit}
+
+    with _conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+
+    return [dict(r) for r in rows]
+
+
 def _log_to_system(
     article_id: Optional[int],
     level: str,
@@ -920,17 +960,21 @@ class IntelligenceEngine:
 
     # ── 단일 기사 처리 ─────────────────────────────────────
 
-    def process_article(self, article: dict) -> ProcessingResult:
+    def process_article(self, article: dict, dry_run: bool = False) -> ProcessingResult:
         """
         [v2] 단일 기사를 처리합니다.
 
         처리 순서:
-            1. Gemini 추출 → (ArticleIntelligence, GeminiCallMetrics)
-            2. 컨텍스트 링킹 → entity_id 매칭
-            3. entity_mappings 교체
-            4. _decide_status() → PROCESSED / MANUAL_REVIEW (+ system_note)
-            5. DB 업데이트 (process_status, summary_ko, system_note)
-            6. system_logs 기록 (토큰·응답시간 포함)
+            1. Gemini 추출 → (ArticleIntelligence, GeminiCallMetrics)   [항상 실행]
+            2. 컨텍스트 링킹 → entity_id 매칭                           [항상 실행]
+            3. entity_mappings 교체                                     [dry_run=False 만]
+            4. _decide_status() → PROCESSED / MANUAL_REVIEW             [항상 실행]
+            5. DB 업데이트 (process_status, summary_ko, system_note)    [dry_run=False 만]
+            6. system_logs 기록 / [DRY RUN] JSON 미리보기 출력
+
+        Args:
+            dry_run: True 면 Gemini 호출·매핑 계산은 수행하되 DB 에 반영하지 않음.
+                     예상 매핑 결과를 JSON 으로 stdout 에 출력합니다.
         """
         article_id = article["id"]
         job_id     = article.get("job_id")
@@ -957,7 +1001,7 @@ class IntelligenceEngine:
                 }
                 for m in linked
             ]
-            if entity_records:
+            if not dry_run and entity_records:
                 saved = _replace_entity_mappings(article_id, entity_records)
                 log.debug(
                     "entity_mappings 저장 | article_id=%d count=%d", article_id, saved
@@ -967,60 +1011,89 @@ class IntelligenceEngine:
             final_status, system_note = self._decide_status(intelligence, linked)
 
             # ── 5. DB 업데이트 ───────────────────────────
-            _update_article_status(
-                article_id,
-                final_status,
-                topic_summary = intelligence.topic_summary or None,
-                system_note   = system_note,
-            )
+            if not dry_run:
+                _update_article_status(
+                    article_id,
+                    final_status,
+                    topic_summary = intelligence.topic_summary or None,
+                    system_note   = system_note,
+                )
 
             duration_ms = int((time.monotonic() - t_start) * 1000)
 
-            # ── 6. 성공 로그 (토큰 포함) ──────────────────
-            ambiguous_names = [
-                m["detected_name_ko"]
-                for m in linked
-                if m.get("is_ambiguous")
-            ]
-            low_conf_entities = [
-                f"{m['detected_name_ko']}({m['gemini_confidence']:.2f})"
-                for m in linked
-                if m.get("gemini_confidence", 1.0) < _ENTITY_CONFIDENCE_THRESHOLD
-            ]
-
-            _log_to_system(
-                article_id  = article_id,
-                level       = "INFO" if final_status == "PROCESSED" else "WARNING",
-                event       = f"entity_extract_{final_status.lower()}",
-                message     = (
-                    f"엔티티 추출 완료 ({final_status}) | "
-                    f"artists={len(linked)} "
-                    f"tokens={metrics.total_tokens} "
-                    f"time={metrics.response_time_ms}ms"
-                ),
-                details     = {
-                    "status":            final_status,
-                    "system_note":       system_note,
-                    "sentiment":         intelligence.sentiment,
-                    "relevance_score":   intelligence.relevance_score,
-                    "confidence":        intelligence.confidence,
-                    "main_category":     intelligence.main_category,
-                    # 엔티티 신뢰도 요약
-                    "entity_scores":     {
-                        m["detected_name_ko"]: m.get("gemini_confidence", 1.0)
-                        for m in linked
+            if dry_run:
+                # ── 6. [DRY RUN] JSON 미리보기 출력 ──────
+                preview = {
+                    "article_id":      article_id,
+                    "title_ko":        (article.get("title_ko") or "")[:80],
+                    "status_would_be": final_status,
+                    "system_note":     system_note,
+                    "intelligence": {
+                        "topic_summary":   intelligence.topic_summary,
+                        "sentiment":       intelligence.sentiment,
+                        "relevance_score": intelligence.relevance_score,
+                        "confidence":      intelligence.confidence,
+                        "main_category":   intelligence.main_category,
+                        "detected_artists": [
+                            a.model_dump() for a in intelligence.detected_artists
+                        ],
                     },
-                    "ambiguous_entities":  ambiguous_names,
-                    "low_conf_entities":   low_conf_entities,
-                    "linked_artist_ids":   [
-                        m["entity_id"] for m in linked if m["entity_id"] is not None
-                    ],
-                    # [v2] 비용 분석 데이터
-                    "token_metrics":    metrics.to_dict(),
-                },
-                duration_ms = duration_ms,
-                job_id      = job_id,
-            )
+                    "linked_artists":  linked,
+                    "entity_mappings": entity_records,
+                    "token_metrics":   metrics.to_dict(),
+                }
+                log.info(
+                    "[DRY RUN] article_id=%d → status_would_be=%s | "
+                    "artists=%d tokens=%d time=%dms",
+                    article_id, final_status, len(linked),
+                    metrics.total_tokens, metrics.response_time_ms,
+                )
+                print(f"\n[DRY RUN] article_id={article_id}")
+                print(json.dumps(preview, ensure_ascii=False, indent=2, default=str))
+            else:
+                # ── 6. 성공 로그 (토큰 포함) ──────────────
+                ambiguous_names = [
+                    m["detected_name_ko"]
+                    for m in linked
+                    if m.get("is_ambiguous")
+                ]
+                low_conf_entities = [
+                    f"{m['detected_name_ko']}({m['gemini_confidence']:.2f})"
+                    for m in linked
+                    if m.get("gemini_confidence", 1.0) < _ENTITY_CONFIDENCE_THRESHOLD
+                ]
+
+                _log_to_system(
+                    article_id  = article_id,
+                    level       = "INFO" if final_status == "PROCESSED" else "WARNING",
+                    event       = f"entity_extract_{final_status.lower()}",
+                    message     = (
+                        f"엔티티 추출 완료 ({final_status}) | "
+                        f"artists={len(linked)} "
+                        f"tokens={metrics.total_tokens} "
+                        f"time={metrics.response_time_ms}ms"
+                    ),
+                    details     = {
+                        "status":            final_status,
+                        "system_note":       system_note,
+                        "sentiment":         intelligence.sentiment,
+                        "relevance_score":   intelligence.relevance_score,
+                        "confidence":        intelligence.confidence,
+                        "main_category":     intelligence.main_category,
+                        "entity_scores":     {
+                            m["detected_name_ko"]: m.get("gemini_confidence", 1.0)
+                            for m in linked
+                        },
+                        "ambiguous_entities":  ambiguous_names,
+                        "low_conf_entities":   low_conf_entities,
+                        "linked_artist_ids":   [
+                            m["entity_id"] for m in linked if m["entity_id"] is not None
+                        ],
+                        "token_metrics":    metrics.to_dict(),
+                    },
+                    duration_ms = duration_ms,
+                    job_id      = job_id,
+                )
 
             return ProcessingResult(
                 article_id     = article_id,
@@ -1036,31 +1109,38 @@ class IntelligenceEngine:
             duration_ms = int((time.monotonic() - t_start) * 1000)
             error_msg   = f"{type(exc).__name__}: {exc}"
             log.exception(
-                "기사 처리 실패 | article_id=%d error=%s", article_id, error_msg
+                "기사 처리 실패 | article_id=%d dry_run=%s error=%s",
+                article_id, dry_run, error_msg,
             )
 
-            try:
-                _update_article_status(article_id, "ERROR")
-            except Exception as db_exc:
-                log.error(
-                    "ERROR 상태 업데이트 실패 | article_id=%d err=%r",
-                    article_id, db_exc,
+            if not dry_run:
+                try:
+                    _update_article_status(article_id, "ERROR")
+                except Exception as db_exc:
+                    log.error(
+                        "ERROR 상태 업데이트 실패 | article_id=%d err=%r",
+                        article_id, db_exc,
+                    )
+
+                _log_to_system(
+                    article_id  = article_id,
+                    level       = "ERROR",
+                    event       = "entity_extract_failed",
+                    message     = f"엔티티 추출 실패: {error_msg}",
+                    details     = {
+                        "error_type":   type(exc).__name__,
+                        "error_detail": str(exc),
+                        "title_ko":     article.get("title_ko", ""),
+                        "source_url":   article.get("source_url", ""),
+                    },
+                    duration_ms = duration_ms,
+                    job_id      = job_id,
                 )
-
-            _log_to_system(
-                article_id  = article_id,
-                level       = "ERROR",
-                event       = "entity_extract_failed",
-                message     = f"엔티티 추출 실패: {error_msg}",
-                details     = {
-                    "error_type":   type(exc).__name__,
-                    "error_detail": str(exc),
-                    "title_ko":     article.get("title_ko", ""),
-                    "source_url":   article.get("source_url", ""),
-                },
-                duration_ms = duration_ms,
-                job_id      = job_id,
-            )
+            else:
+                log.info(
+                    "[DRY RUN] 처리 실패 (DB 기록 없음) | article_id=%d error=%s",
+                    article_id, error_msg,
+                )
 
             return ProcessingResult(
                 article_id  = article_id,
@@ -1075,32 +1155,42 @@ class IntelligenceEngine:
         self,
         batch_size: Optional[int] = None,
         job_id: Optional[int] = None,
+        dry_run: bool = False,
     ) -> BatchResult:
         """
         PENDING 기사를 배치로 처리합니다.
 
         [v2] BatchResult 에 total_tokens 합계를 포함합니다.
+
+        Args:
+            dry_run: True 면 기사 상태를 SCRAPED(in-progress)로 변경하지 않고
+                     읽기 전용으로 조회한 뒤, Gemini 호출·매핑 계산 결과를
+                     JSON 미리보기로 출력합니다. DB 에 아무런 쓰기를 하지 않습니다.
         """
         limit  = batch_size if batch_size is not None else self.batch_size
         result = BatchResult()
 
-        articles = _claim_pending_articles(limit=limit, job_id=job_id)
+        if dry_run:
+            articles = _read_pending_articles_dry(limit=limit, job_id=job_id)
+        else:
+            articles = _claim_pending_articles(limit=limit, job_id=job_id)
         result.total = len(articles)
 
         if not articles:
             log.info(
-                "처리할 PENDING 기사 없음 | job_id=%s",
-                job_id if job_id is not None else "전체",
+                "처리할 PENDING 기사 없음 | job_id=%s dry_run=%s",
+                job_id if job_id is not None else "전체", dry_run,
             )
             return result
 
         log.info(
-            "배치 처리 시작 | count=%d job_id=%s model=%s threshold=%.2f",
+            "배치 처리 시작 | count=%d job_id=%s model=%s threshold=%.2f dry_run=%s",
             len(articles), job_id, self.model_name, _ENTITY_CONFIDENCE_THRESHOLD,
+            dry_run,
         )
 
         for i, article in enumerate(articles, start=1):
-            ar = self.process_article(article)
+            ar = self.process_article(article, dry_run=dry_run)
 
             # 토큰 합산
             if ar.token_metrics:
@@ -1177,6 +1267,11 @@ def main(argv: Optional[list[str]] = None) -> None:
         help=f"엔티티 신뢰도 임계값 (기본: {_ENTITY_CONFIDENCE_THRESHOLD}). "
              "이 값 미만 엔티티가 있으면 MANUAL_REVIEW",
     )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Gemini API 호출은 수행하되 DB 에 반영하지 않음. "
+             "예상 매핑 결과를 JSON 으로 출력합니다 (테스트 모드).",
+    )
     args = parser.parse_args(argv)
 
     _setup_logging()
@@ -1195,10 +1290,12 @@ def main(argv: Optional[list[str]] = None) -> None:
     result = engine.process_pending(
         batch_size = args.batch_size,
         job_id     = args.job_id,
+        dry_run    = args.dry_run,
     )
 
+    prefix = "[DRY RUN] " if args.dry_run else ""
     print(
-        f"\n처리 완료: total={result.total} "
+        f"\n{prefix}처리 완료: total={result.total} "
         f"processed={result.processed} "
         f"manual_review={result.manual_review} "
         f"failed={result.failed} "

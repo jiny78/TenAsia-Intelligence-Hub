@@ -104,7 +104,23 @@ with tab_queue:
 
         max_retries = st.number_input("최대 재시도 횟수", min_value=0, max_value=10, value=3)
 
-        submitted = st.form_submit_button("📥 큐에 추가", type="primary", use_container_width=True)
+        st.divider()
+        dry_run = st.toggle(
+            "드라이 런 (테스트 모드)",
+            value=False,
+            help=(
+                "켜면 실제 스크래핑·파싱은 수행하되 DB 에 저장하지 않습니다.\n"
+                "수집 결과(제목, 날짜 등)는 [DRY RUN] 태그로 로그에 출력됩니다."
+            ),
+        )
+        if dry_run:
+            st.info(
+                "**테스트 모드 활성화** — 기사를 스크래핑하지만 DB 에 저장되지 않습니다.",
+                icon="🧪",
+            )
+
+        btn_label = "🧪 드라이 런 시작" if dry_run else "📥 큐에 추가"
+        submitted = st.form_submit_button(btn_label, type="primary", use_container_width=True)
 
     if submitted:
         if not source_url.strip():
@@ -116,10 +132,20 @@ with tab_queue:
                 "platforms":   platforms,
                 "priority":    priority,
                 "max_retries": max_retries,
+                "dry_run":     dry_run,
             })
             if result:
-                st.success(f"✅ 작업 추가 완료! Job ID: **{result['job_id']}**")
-                st.info("EC2 워커가 자동으로 작업을 가져가 처리합니다.")
+                if dry_run:
+                    st.success(
+                        f"🧪 드라이 런 작업 추가 완료! Job ID: **{result['job_id']}** "
+                        f"(DB 저장 없음)"
+                    )
+                    st.info(
+                        "EC2 워커가 스크래핑·파싱을 수행하고 [DRY RUN] 로그를 출력합니다."
+                    )
+                else:
+                    st.success(f"✅ 작업 추가 완료! Job ID: **{result['job_id']}**")
+                    st.info("EC2 워커가 자동으로 작업을 가져가 처리합니다.")
                 time.sleep(1)
                 st.rerun()
 
@@ -218,16 +244,21 @@ with tab_history:
                     "cancelled": "🚫",
                 }.get(_status, "❓")
 
-                params  = job.get("params") or {}
-                url     = params.get("source_url", "—")
-                lang    = params.get("language", "—")
-                retries = job.get("retry_count", 0)
-                max_r   = job.get("max_retries", 3)
+                params   = job.get("params") or {}
+                url      = params.get("source_url", "—")
+                lang     = params.get("language", "—")
+                retries  = job.get("retry_count", 0)
+                max_r    = job.get("max_retries", 3)
+                is_dry   = params.get("dry_run", False)
+                dry_tag  = " 🧪" if is_dry else ""
 
                 with st.expander(
-                    f"{_icon} **#{job['id']}** | {_status.upper()} | {url[:60]}{'…' if len(url) > 60 else ''}",
+                    f"{_icon} **#{job['id']}** | {_status.upper()}{dry_tag} | {url[:60]}{'…' if len(url) > 60 else ''}",
                     expanded=False,
                 ):
+                    if is_dry:
+                        st.warning("🧪 드라이 런 작업 — DB 에 저장되지 않습니다.", icon="🧪")
+
                     c1, c2, c3 = st.columns(3)
                     c1.write(f"**언어**: {lang}")
                     c2.write(f"**우선순위**: {job.get('priority')}")

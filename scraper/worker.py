@@ -110,14 +110,17 @@ def _do_scrape(params: dict, job_id: Optional[int] = None) -> dict:
     language   = params.get("language",   "kr")
     platforms  = params.get("platforms",  [])
     batch_size = int(params.get("batch_size", 10))
+    dry_run    = bool(params.get("dry_run", False))
 
     logger.info(
-        "스크래핑 시작 | urls=%d lang=%s job_id=%s",
-        len(urls), language, job_id,
+        "스크래핑 시작 | urls=%d lang=%s job_id=%s dry_run=%s",
+        len(urls), language, job_id, dry_run,
     )
 
     scraper = TenAsiaScraper(batch_size=batch_size)
-    result  = scraper.scrape_batch(urls=urls, job_id=job_id, language=language)
+    result  = scraper.scrape_batch(
+        urls=urls, job_id=job_id, language=language, dry_run=dry_run
+    )
 
     # fatal 실패(403 차단) 감지 → ForbiddenError 재발생으로 재시도 방지
     fatal = [f for f in result.failed if f.get("fatal")]
