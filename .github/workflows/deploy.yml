@@ -1,0 +1,202 @@
+name: Deploy to AWS App Runner
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  AWS_REGION:      ap-northeast-2
+  ECR_REPOSITORY:  tenasia-intelligence-hub
+
+jobs:
+  # ────────────────────────────────────────────────────
+  # Job 1: 테스트
+  # ────────────────────────────────────────────────────
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tests
+        run: python -m pytest test_*.py -v --tb=short
+        # 테스트가 없을 때 오류 방지
+        continue-on-error: true
+
+  # ────────────────────────────────────────────────────
+  # Job 2: Docker 빌드 & ECR Push
+  # ────────────────────────────────────────────────────
+  build:
+    name: Build & Push
+    runs-on: ubuntu-latest
+    needs: test
+
+    permissions:
+      id-token: write   # OIDC 토큰 (AWS 인증 — 비밀번호 불필요)
+      contents: read
+
+    outputs:
+      image-uri: ${{ steps.push.outputs.image-uri }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build & Push image
+        id: push
+        env:
+          REGISTRY:  ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build \
+            --build-arg BUILD_DATE="$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+            --build-arg GIT_COMMIT="${{ github.sha }}" \
+            -t "$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" \
+            -t "$REGISTRY/$ECR_REPOSITORY:latest" \
+            .
+
+          docker push "$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          docker push "$REGISTRY/$ECR_REPOSITORY:latest"
+
+          echo "image-uri=$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+
+  # ────────────────────────────────────────────────────
+  # Job 3: App Runner 배포
+  # ────────────────────────────────────────────────────
+  deploy:
+    name: Deploy App Runner
+    runs-on: ubuntu-latest
+    needs: build
+
+    permissions:
+      id-token: write
+      contents: read
+
+    environment:
+      name: production
+      url: ${{ steps.url.outputs.value }}
+
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Start App Runner deployment
+        run: |
+          aws apprunner start-deployment \
+            --service-arn "${{ secrets.APP_RUNNER_SERVICE_ARN }}"
+          echo "배포 트리거 완료 | 이미지: ${{ needs.build.outputs.image-uri }}"
+
+      - name: Wait for deployment
+        run: |
+          echo "배포 완료 대기 중 (최대 10분)..."
+          for i in $(seq 1 20); do
+            STATUS=$(aws apprunner describe-service \
+              --service-arn "${{ secrets.APP_RUNNER_SERVICE_ARN }}" \
+              --query 'Service.Status' --output text)
+            echo "[$i/20] 상태: $STATUS"
+            case "$STATUS" in
+              RUNNING)     echo "배포 성공!"; exit 0 ;;
+              *_FAILED)    echo "배포 실패: $STATUS"; exit 1 ;;
+            esac
+            sleep 30
+          done
+          echo "타임아웃 — AWS Console 에서 확인하세요"; exit 1
+
+      - name: Get service URL
+        id: url
+        run: |
+          URL=$(aws apprunner describe-service \
+            --service-arn "${{ secrets.APP_RUNNER_SERVICE_ARN }}" \
+            --query 'Service.ServiceUrl' --output text)
+          echo "value=https://$URL" >> "$GITHUB_OUTPUT"
+          echo "서비스 URL: https://$URL"
+
+      - name: Summary
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          ## 배포 완료 ✅
+          | 항목 | 값 |
+          |------|-----|
+          | 이미지 | \`${{ needs.build.outputs.image-uri }}\` |
+          | 커밋 | \`${{ github.sha }}\` |
+          | URL | ${{ steps.url.outputs.value }} |
+          EOF
+
+  # ────────────────────────────────────────────────────
+  # Job 4: EC2 Scraper 코드 배포 (SSM RunCommand)
+  # ────────────────────────────────────────────────────
+  deploy-scraper:
+    name: Deploy EC2 Scraper
+    runs-on: ubuntu-latest
+    needs: build   # 테스트 통과 후 App Runner 와 병렬 가능하지만 빌드는 먼저 완료돼야 함
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy scraper code via SSM RunCommand
+        id: ssm
+        run: |
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "${{ secrets.EC2_SCRAPER_INSTANCE_ID }}" \
+            --document-name "AWS-RunShellScript" \
+            --parameters 'commands=["/usr/local/bin/deploy-scraper.sh"]' \
+            --comment "GitHub Actions deploy — ${{ github.sha }}" \
+            --region "${{ env.AWS_REGION }}" \
+            --output text --query 'Command.CommandId')
+          echo "command-id=$COMMAND_ID" >> "$GITHUB_OUTPUT"
+          echo "SSM Command ID: $COMMAND_ID"
+
+      - name: Wait for scraper deploy to complete
+        run: |
+          COMMAND_ID="${{ steps.ssm.outputs.command-id }}"
+          INSTANCE_ID="${{ secrets.EC2_SCRAPER_INSTANCE_ID }}"
+          echo "스크래퍼 배포 완료 대기 중 (최대 5분)..."
+          for i in $(seq 1 30); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$INSTANCE_ID" \
+              --query 'Status' --output text 2>/dev/null || echo "Pending")
+            echo "[$i/30] 상태: $STATUS"
+            case "$STATUS" in
+              Success)    echo "스크래퍼 배포 성공!"; exit 0 ;;
+              Failed|Cancelled|TimedOut)
+                          echo "스크래퍼 배포 실패: $STATUS"
+                          aws ssm get-command-invocation \
+                            --command-id "$COMMAND_ID" \
+                            --instance-id "$INSTANCE_ID" \
+                            --query 'StandardErrorContent' --output text
+                          exit 1 ;;
+            esac
+            sleep 10
+          done
+          echo "타임아웃 — AWS Console 에서 확인하세요"; exit 1

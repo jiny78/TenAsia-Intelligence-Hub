@@ -1,0 +1,24 @@
+# terraform.tfvars.example
+# 이 파일을 terraform.tfvars 로 복사 후 실제 값 입력
+# terraform.tfvars 는 절대 커밋하지 마세요 (.gitignore 에 추가)
+
+aws_region  = "ap-northeast-2"
+environment = "production"
+
+db_username = "tih_admin"
+db_name     = "tih"
+db_password = "STRONG_RANDOM_PASSWORD_HERE"  # 16자 이상, 특수문자 포함
+
+github_org  = "YOUR_GITHUB_USERNAME_OR_ORG"
+
+# 비용 관리
+budget_amount_usd = 50               # 월 예산 한도 (USD)
+alert_email       = "you@example.com"  # 알림 수신 이메일
+
+# 관리자 DB 접근
+# SSM Session Manager Host는 항상 생성됩니다 (인바운드 포트 없음 — 별도 설정 불필요)
+# Bastion Host는 필요할 때만 활성화하세요
+
+enable_bastion  = false                  # true 로 바꾸면 Bastion EC2 즉시 생성
+admin_ip_cidr   = "YOUR_IP/32"          # curl ifconfig.me 로 현재 IP 확인
+public_key_path = ""                     # "~/.ssh/tih-bastion.pub" (Bastion 사용 시)

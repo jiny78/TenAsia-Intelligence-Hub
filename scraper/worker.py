@@ -1,0 +1,240 @@
+"""
+scraper/worker.py — EC2 백그라운드 워커
+
+두 가지 실행 모드:
+  1. 루프 모드 (기본): python -m scraper.worker
+     - pending 작업을 계속 폴링하며 처리
+     - SIGTERM/SIGINT 수신 시 현재 작업 완료 후 종료
+
+  2. 단일 실행 모드 (SSM SendCommand 트리거용):
+     python -m scraper.worker --job-id <id>
+     - 지정한 작업 하나만 처리하고 즉시 종료
+
+환경 변수:
+  WORKER_POLL_INTERVAL   폴링 간격 (초, 기본 10)
+  WORKER_ID              워커 식별자 (기본: EC2 인스턴스 ID 또는 hostname)
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+import signal
+import socket
+import time
+from typing import Optional
+
+import requests
+
+from scraper.db import (
+    STATUS_FAILED,
+    create_db_tables,
+    get_job_by_id,
+    get_pending_job,
+    increment_retry,
+    update_job_status,
+)
+
+logger = logging.getLogger(__name__)
+
+# ── 설정 ────────────────────────────────────────────────────
+POLL_INTERVAL = int(os.getenv("WORKER_POLL_INTERVAL", "10"))
+
+
+def _get_worker_id() -> str:
+    """EC2 인스턴스 ID 또는 hostname을 워커 식별자로 사용합니다."""
+    env_id = os.getenv("WORKER_ID")
+    if env_id:
+        return env_id
+
+    # EC2 IMDSv2 에서 인스턴스 ID 조회
+    try:
+        # IMDSv2: 먼저 토큰 발급
+        token_resp = requests.put(
+            "http://169.254.169.254/latest/api/token",
+            headers={"X-aws-ec2-metadata-token-ttl-seconds": "21600"},
+            timeout=2,
+        )
+        token = token_resp.text
+        instance_id = requests.get(
+            "http://169.254.169.254/latest/meta-data/instance-id",
+            headers={"X-aws-ec2-metadata-token": token},
+            timeout=2,
+        ).text
+        return instance_id
+    except Exception:
+        return socket.gethostname()
+
+
+# ── 작업 처리 ────────────────────────────────────────────────
+
+def _do_scrape(params: dict) -> dict:
+    """
+    실제 스크래핑 로직을 실행합니다.
+
+    params 예시:
+        {
+            "source_url": "https://tenasia.hankyung.com/...",
+            "language":   "kr",
+            "platforms":  ["x", "instagram"],
+        }
+
+    Returns:
+        결과 딕셔너리 (job_queue.result 에 저장됨)
+    """
+    source_url = params.get("source_url", "")
+    language   = params.get("language", "kr")
+    platforms  = params.get("platforms", [])
+
+    logger.info("스크래핑 시작 | url=%s lang=%s platforms=%s", source_url, language, platforms)
+
+    # ────────────────────────────────────────────────────────
+    # TODO: 실제 스크래핑 엔진 호출로 교체하세요.
+    #
+    # 예시:
+    #   from engine import ScraperEngine
+    #   engine = ScraperEngine()
+    #   result = engine.run(source_url, language, platforms)
+    #   return result
+    # ────────────────────────────────────────────────────────
+
+    # 플레이스홀더 — 더미 결과 반환
+    return {
+        "source_url": source_url,
+        "language":   language,
+        "platforms":  platforms,
+        "articles_scraped": 0,
+        "note": "TODO: 실제 엔진 연결 필요",
+    }
+
+
+def process_job(job: dict) -> None:
+    """
+    단일 작업을 처리하고 결과를 DB에 기록합니다.
+    예외 발생 시 retry 로직을 적용합니다.
+    """
+    job_id   = job["id"]
+    job_type = job["job_type"]
+    params   = job.get("params") or {}
+
+    logger.info("작업 처리 시작 | id=%d type=%s", job_id, job_type)
+
+    try:
+        if job_type == "scrape":
+            result = _do_scrape(params)
+        else:
+            raise ValueError(f"알 수 없는 job_type: {job_type!r}")
+
+        update_job_status(job_id, "completed", result=result)
+        logger.info("작업 완료 | id=%d", job_id)
+
+    except Exception as exc:
+        error_msg = f"{type(exc).__name__}: {exc}"
+        logger.exception("작업 실패 | id=%d error=%s", job_id, error_msg)
+
+        new_retry = increment_retry(job_id)
+        max_retries = job.get("max_retries", 3)
+
+        if new_retry >= max_retries:
+            # increment_retry 내부에서 이미 'failed' 로 전환됨
+            update_job_status(job_id, STATUS_FAILED, error_msg=error_msg)
+            logger.warning("최대 재시도 초과, 작업 실패 처리 | id=%d retries=%d", job_id, new_retry)
+        else:
+            # 'pending' 으로 재귀 (increment_retry 가 이미 처리)
+            logger.info("재시도 예약 | id=%d retry=%d/%d", job_id, new_retry, max_retries)
+
+
+# ── 실행 모드 ────────────────────────────────────────────────
+
+class _ShutdownFlag:
+    """SIGTERM/SIGINT 를 받으면 running 을 False 로 전환합니다."""
+
+    def __init__(self) -> None:
+        self.running = True
+        signal.signal(signal.SIGTERM, self._handle)
+        signal.signal(signal.SIGINT,  self._handle)
+
+    def _handle(self, signum, frame) -> None:  # noqa: ANN001
+        logger.info("종료 신호 수신 (%d), 현재 작업 완료 후 종료합니다…", signum)
+        self.running = False
+
+
+def run_loop() -> None:
+    """
+    루프 모드: pending 작업을 계속 폴링하며 처리합니다.
+    SIGTERM 수신 시 현재 작업 완료 후 종료합니다.
+    """
+    worker_id = _get_worker_id()
+    flag = _ShutdownFlag()
+
+    logger.info("워커 루프 시작 | worker_id=%s poll_interval=%ds", worker_id, POLL_INTERVAL)
+
+    create_db_tables()  # 테이블이 없으면 생성 (멱등)
+
+    while flag.running:
+        job = get_pending_job(worker_id)
+
+        if job is None:
+            logger.debug("대기 중… (큐 비어있음)")
+            time.sleep(POLL_INTERVAL)
+            continue
+
+        process_job(job)
+        # 처리 직후 다음 작업 즉시 시도 (sleep 없음)
+
+    logger.info("워커 루프 종료")
+
+
+def run_single(job_id: int) -> None:
+    """
+    단일 실행 모드: 지정한 job_id 를 처리하고 종료합니다.
+    SSM SendCommand 트리거 시 사용합니다.
+    """
+    worker_id = _get_worker_id()
+    logger.info("단일 작업 모드 | job_id=%d worker_id=%s", job_id, worker_id)
+
+    create_db_tables()
+
+    job = get_job_by_id(job_id)
+    if job is None:
+        logger.error("job_id=%d 를 찾을 수 없습니다.", job_id)
+        return
+
+    if job["status"] != "pending":
+        logger.warning("job_id=%d 상태가 pending 이 아님: %s", job_id, job["status"])
+        return
+
+    process_job(job)
+
+
+# ── 진입점 ────────────────────────────────────────────────────
+
+def _setup_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S",
+    )
+
+
+def main(argv: Optional[list[str]] = None) -> None:
+    parser = argparse.ArgumentParser(description="TIH Scraper Worker")
+    parser.add_argument(
+        "--job-id",
+        type=int,
+        default=None,
+        help="특정 job_id 만 처리하고 종료 (SSM SendCommand 트리거용)",
+    )
+    args = parser.parse_args(argv)
+
+    _setup_logging()
+
+    if args.job_id is not None:
+        run_single(args.job_id)
+    else:
+        run_loop()
+
+
+if __name__ == "__main__":
+    main()
