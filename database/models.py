@@ -5,6 +5,7 @@ database/models.py — SQLAlchemy ORM 모델
     job_queue       — 분산 작업 큐 (SKIP LOCKED 패턴)
     artists         — 아티스트/그룹 마스터 데이터
     articles        — 수집·정제된 아티클 (다국어)
+    article_images  — 아티클 첨부 이미지 1:N (원본 URL + S3 썸네일 경로)
     entity_mappings — 아티클 ↔ 아티스트/그룹/이벤트 연결 (신뢰도 점수 포함)
     system_logs     — 스크래핑·AI 처리 이력 (append-only)
     glossary        — 한↔영 번역 용어 사전 (AI 번역 일관성 확보)
@@ -321,6 +322,9 @@ class Article(Base):
     )
 
     # ── 미디어 ────────────────────────────────────────────────
+    # thumbnail_url : 대표 이미지 원본 URL (비정규화, JOIN 없이 빠른 조회용)
+    #   article_images.is_representative=true 인 행과 동기화 권장
+    #   상세 이미지 목록은 article_images 관계를 사용할 것
     thumbnail_url: Mapped[Optional[str]] = mapped_column(Text)
 
     # ── FK ────────────────────────────────────────────────────
@@ -333,7 +337,13 @@ class Article(Base):
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, nullable=False, server_default=func.now())
 
     # ── 관계 ──────────────────────────────────────────────────
-    job:             Mapped[Optional["JobQueue"]]   = relationship(back_populates="articles")
+    job:             Mapped[Optional["JobQueue"]]    = relationship(back_populates="articles")
+    images:          Mapped[list["ArticleImage"]]    = relationship(
+        back_populates="article",
+        cascade="all, delete-orphan",
+        # 대표 이미지(is_representative=True)를 먼저, 이후 등록 순으로 정렬
+        order_by="ArticleImage.is_representative.desc(), ArticleImage.id.asc()",
+    )
     entity_mappings: Mapped[list["EntityMapping"]]  = relationship(
         back_populates="article",
         cascade="all, delete-orphan",
@@ -362,6 +372,112 @@ class Article(Base):
     def __repr__(self) -> str:
         title = str(self.title_ko or "")[:30]
         return f"<Article id={self.id} status={self.process_status!r} title_ko={title!r}>"
+
+
+# ═════════════════════════════════════════════════════════════
+# ArticleImage
+# ═════════════════════════════════════════════════════════════
+
+class ArticleImage(Base):
+    """
+    아티클 첨부 이미지 (articles 와 1:N).
+
+    한 기사에 여러 장의 이미지가 포함될 수 있습니다.
+    스크래퍼가 HTML에서 추출한 <img> 태그 URL을 원본 그대로 저장하고,
+    S3 업로드 완료 후 thumbnail_path 를 갱신합니다.
+
+    대표 이미지 규칙:
+        - is_representative=True 인 행은 기사당 최대 1개 권장
+        - Article.thumbnail_url 은 이 행의 original_url 을 비정규화한 값
+        - 쿼리 예: SELECT * FROM article_images
+                   WHERE article_id=? ORDER BY is_representative DESC, id ASC
+
+    original_url 유니크:
+        - 동일 이미지 URL 의 중복 처리를 방지합니다
+        - 여러 기사가 같은 이미지 URL 을 공유하는 경우는 없다고 가정
+          (아티스트 공식 사진 등은 S3 경로로 중복 관리할 것)
+
+    S3 경로 규칙 (thumbnail_path):
+        형식: {env}/{artist_name_en}/{article_id}/{image_id}_thumb.webp
+        예시: prod/BTS/1042/7_thumb.webp
+        NULL: S3 업로드 전(스크래핑 직후) 또는 업로드 실패 상태
+    """
+    __tablename__ = "article_images"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+
+    # ── FK ────────────────────────────────────────────────────
+    article_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("articles.id", ondelete="CASCADE"),
+        nullable=False,
+        comment="소속 아티클 (기사 삭제 시 이미지 레코드도 자동 삭제)",
+    )
+
+    # ── 이미지 경로 ────────────────────────────────────────────
+    original_url: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        comment="스크래퍼가 수집한 원본 이미지 URL (UNIQUE — 중복 처리 방지)",
+    )
+    thumbnail_path: Mapped[Optional[str]] = mapped_column(
+        Text,
+        nullable=True,
+        comment="S3 썸네일 저장 경로. NULL=업로드 전/실패 (예: prod/BTS/1042/7_thumb.webp)",
+    )
+
+    # ── 대표 이미지 여부 ───────────────────────────────────────
+    is_representative: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default=text("false"),
+        comment="True 인 행은 기사당 1개 권장 — Article.thumbnail_url 과 동기화",
+    )
+
+    # ── 접근성 ────────────────────────────────────────────────
+    alt_text: Mapped[Optional[str]] = mapped_column(
+        Text,
+        nullable=True,
+        comment="이미지 대체 텍스트 (웹 접근성 / SEO). HTML alt 속성 또는 AI 생성",
+    )
+
+    # ── 시간 ──────────────────────────────────────────────────
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMPTZ, nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMPTZ, nullable=False, server_default=func.now()
+    )
+
+    # ── 관계 ──────────────────────────────────────────────────
+    article: Mapped["Article"] = relationship(back_populates="images")
+
+    __table_args__ = (
+        # 동일 이미지 URL 중복 처리 방지 (핵심 제약)
+        UniqueConstraint("original_url", name="uq_article_images_url"),
+        # 기사별 이미지 전체 조회 (기본 접근 패턴)
+        Index("idx_ai_article_id", "article_id"),
+        # 기사별 대표 이미지 빠른 조회 (is_representative=true 행만 인덱스)
+        Index(
+            "idx_ai_representative",
+            "article_id",
+            postgresql_where=text("is_representative = true"),
+        ),
+        # S3 업로드 대기 이미지 배치 처리용 (thumbnail_path IS NULL 행만)
+        Index(
+            "idx_ai_pending_upload",
+            "article_id", "created_at",
+            postgresql_where=text("thumbnail_path IS NULL"),
+        ),
+    )
+
+    def __repr__(self) -> str:
+        flag = " [REP]" if self.is_representative else ""
+        return (
+            f"<ArticleImage id={self.id} article={self.article_id}"
+            f"{flag} url={str(self.original_url)[:50]!r}>"
+        )
 
 
 # ═════════════════════════════════════════════════════════════

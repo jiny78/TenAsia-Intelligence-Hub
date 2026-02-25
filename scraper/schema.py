@@ -232,6 +232,66 @@ CREATE INDEX IF NOT EXISTS idx_articles_seo_hashtags
     WHERE seo_hashtags IS NOT NULL;
 """
 
+# ─────────────────────────────────────────────────────────────
+# article_images 테이블 DDL
+# ─────────────────────────────────────────────────────────────
+
+_ARTICLE_IMAGES_DDL = """
+CREATE TABLE IF NOT EXISTS article_images (
+    id                SERIAL          PRIMARY KEY,
+
+    -- articles 와 1:N — 기사 삭제 시 이미지 레코드 자동 삭제
+    article_id        INTEGER         NOT NULL
+                                      REFERENCES articles(id) ON DELETE CASCADE,
+
+    -- 원본 이미지 URL (UNIQUE — 동일 이미지 중복 처리 방지)
+    original_url      TEXT            NOT NULL,
+
+    -- S3 썸네일 저장 경로 (업로드 전/실패 시 NULL)
+    -- 형식: {env}/{artist_name_en}/{article_id}/{image_id}_thumb.webp
+    thumbnail_path    TEXT,
+
+    -- 기사 대표 이미지 여부 (기사당 1개 권장)
+    -- Article.thumbnail_url 과 동기화 권장
+    is_representative BOOLEAN         NOT NULL DEFAULT false,
+
+    -- 이미지 대체 텍스트 (웹 접근성·SEO, HTML alt 속성 또는 AI 생성)
+    alt_text          TEXT,
+
+    created_at        TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    updated_at        TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT uq_article_images_url UNIQUE (original_url)
+);
+
+-- updated_at 자동 갱신 트리거 (trg_set_updated_at 함수 재사용)
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_trigger WHERE tgname = 'set_updated_at_article_images'
+    ) THEN
+        CREATE TRIGGER set_updated_at_article_images
+            BEFORE UPDATE ON article_images
+            FOR EACH ROW EXECUTE FUNCTION trg_set_updated_at();
+    END IF;
+END;
+$$;
+
+-- 기사별 전체 이미지 조회 (기본 1:N 접근 패턴)
+CREATE INDEX IF NOT EXISTS idx_ai_article_id
+    ON article_images (article_id);
+
+-- 대표 이미지 단건 조회 최적화 (is_representative=true 행만)
+CREATE INDEX IF NOT EXISTS idx_ai_representative
+    ON article_images (article_id)
+    WHERE is_representative = true;
+
+-- S3 업로드 대기 배치 처리 (thumbnail_path IS NULL 행만)
+CREATE INDEX IF NOT EXISTS idx_ai_pending_upload
+    ON article_images (article_id, created_at)
+    WHERE thumbnail_path IS NULL;
+"""
+
 
 # ─────────────────────────────────────────────────────────────
 # 공개 API
@@ -239,8 +299,14 @@ CREATE INDEX IF NOT EXISTS idx_articles_seo_hashtags
 
 def create_article_tables() -> None:
     """
-    articles 테이블과 모든 인덱스를 생성합니다 (멱등 — 이미 있으면 무시).
+    articles / article_images 테이블과 모든 인덱스를 생성합니다 (멱등).
     job_queue 테이블이 먼저 존재해야 합니다 (FK 참조).
+
+    실행 순서:
+        1. pg_trgm / unaccent 확장
+        2. articles 테이블 + 트리거
+        3. articles 인덱스 (FTS, Trigram, Array, B-tree, JSONB GIN)
+        4. article_images 테이블 + 트리거 + 인덱스
     """
     from scraper.db import _conn
 
@@ -249,10 +315,11 @@ def create_article_tables() -> None:
             cur.execute(_EXTENSIONS_DDL)
             cur.execute(_TABLE_DDL)
             cur.execute(_INDEXES_DDL)
+            cur.execute(_ARTICLE_IMAGES_DDL)
 
     logger.info(
-        "articles 테이블 초기화 완료 "
-        "(FTS×2, Trigram×7, GIN-array×2, B-tree×4)"
+        "articles / article_images 테이블 초기화 완료 "
+        "(FTS×2, Trigram×7, GIN-array×2, B-tree×4, JSONB-GIN×1 | images: UNIQUE+3 idx)"
     )
 
 
