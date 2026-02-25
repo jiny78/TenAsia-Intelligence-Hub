@@ -44,7 +44,7 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy import DateTime
-from sqlalchemy.dialects.postgresql import ARRAY, JSONB
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, TSVECTOR
 
 # PostgreSQL TIMESTAMP WITH TIME ZONE 편의 별칭
 TIMESTAMPTZ = DateTime(timezone=True)
@@ -59,10 +59,11 @@ from database.base import Base
 
 class ProcessStatus(str, enum.Enum):
     """아티클 처리 상태 — articles.process_status"""
-    PENDING   = "PENDING"    # 수집 대기
-    SCRAPED   = "SCRAPED"    # HTML 수집 완료, AI 처리 대기
-    PROCESSED = "PROCESSED"  # Gemini AI 정제 완료
-    ERROR     = "ERROR"      # 처리 실패 (system_logs 참조)
+    PENDING       = "PENDING"        # 수집 대기
+    SCRAPED       = "SCRAPED"        # HTML 수집 완료, AI 처리 대기
+    PROCESSED     = "PROCESSED"      # Gemini AI 정제 완료
+    ERROR         = "ERROR"          # 처리 실패 (system_logs 참조)
+    MANUAL_REVIEW = "MANUAL_REVIEW"  # AI 신뢰도 낮음 — 사람이 검토 필요
 
 
 class EntityType(str, enum.Enum):
@@ -230,9 +231,11 @@ class Artist(Base):
             "idx_artists_global_priority", "global_priority",
             postgresql_where=text("global_priority IS NOT NULL"),
         ),
-        # GIN Trigram 인덱스 (0002/0003 마이그레이션에서 op.execute()로 생성)
-        # idx_artists_trgm_name_ko, idx_artists_trgm_name_en
-        # idx_artists_trgm_bio_ko,  idx_artists_trgm_bio_en
+        # GIN Trigram 인덱스 (0002/0003/0006 마이그레이션에서 op.execute()로 생성)
+        # idx_artists_trgm_name_ko — 오타·부분 일치 검색 (LIKE '%검색어%', similarity())
+        # idx_artists_trgm_name_en — 영어명 부분 일치 검색
+        # idx_artists_trgm_bio_ko  — 소개글 검색
+        # idx_artists_trgm_bio_en  — 소개글 영어 검색
     )
 
     def __repr__(self) -> str:
@@ -283,6 +286,22 @@ class Article(Base):
     # ── 요약 / SNS 캡션 (다국어) ──────────────────────────────
     summary_ko: Mapped[Optional[str]] = mapped_column(Text)
     summary_en: Mapped[Optional[str]] = mapped_column(Text)
+
+    # ── 전문 검색 벡터 (PostgreSQL TSVECTOR) ─────────────────
+    # trg_update_article_search_vector 트리거(INSERT/UPDATE)가 자동 갱신
+    # 검색 가중치 체계:
+    #   A (최고): title_ko, title_en     — 제목 정확 일치 최우선
+    #   B (중간): summary_ko, summary_en — 요약 부분 일치
+    #   C (낮음): content_ko             — 본문 (노이즈 대비 낮은 가중치)
+    # 활용 예:
+    #   WHERE   search_vector @@ plainto_tsquery('simple', '검색어')
+    #   ORDER BY ts_rank(search_vector, query) DESC
+    #   SELECT  ts_headline('simple', title_ko, query) AS highlight
+    search_vector: Mapped[Optional[str]] = mapped_column(
+        TSVECTOR,
+        nullable=True,
+        comment="다국어 FTS 벡터 (트리거 자동 갱신). GIN 인덱스: idx_articles_search_vector",
+    )
 
     # ── 저자 및 원문 메타 ─────────────────────────────────────
     author:       Mapped[Optional[str]] = mapped_column(String(200))
@@ -355,16 +374,23 @@ class Article(Base):
         # 처리 상태별 작업 조회 인덱스
         Index("idx_articles_process_status",      "process_status", "created_at"),
         Index("idx_articles_status_priority",     "process_status", "global_priority", "created_at"),
-        # 아티스트명 B-tree (트라이그램 GIN 은 0001_initial 마이그레이션에서 생성)
         Index("idx_articles_global_flag",         "global_priority", "created_at",
               postgresql_where=text("global_priority = true")),
         Index("idx_articles_language_date",       "language", "created_at"),
+        # MANUAL_REVIEW 검수 큐 — AI 신뢰도 낮은 아티클만 (부분 인덱스)
+        # 활용: SELECT * FROM articles WHERE process_status='MANUAL_REVIEW' ORDER BY created_at
+        Index(
+            "idx_articles_manual_review",
+            "created_at",
+            postgresql_where=text("process_status = 'MANUAL_REVIEW'"),
+        ),
     )
 
-    # ── GIN/Trigram 인덱스 현황 (0001, 0003, 0004 마이그레이션에서 op.execute()로 생성) ──
-    # FTS  GIN : title_ko + content_ko + summary_ko  (simple, 한국어)
-    # FTS  GIN : title_en + summary_en               (english, 영어)
-    # Trgm GIN : title_ko, title_en, content_ko, summary_ko, summary_en
+    # ── GIN/Trigram 인덱스 현황 (0001, 0003~0006 마이그레이션에서 op.execute()로 생성) ──
+    # TSVec GIN: search_vector (다국어 가중 FTS, 0006 마이그레이션에서 생성)
+    # FTS   GIN: title_ko + content_ko + summary_ko (simple, 한국어)
+    # FTS   GIN: title_en + summary_en              (english, 영어)
+    # Trgm  GIN: title_ko, title_en, content_ko, summary_ko, summary_en
     #            artist_name_ko, artist_name_en
     # Array GIN: hashtags_ko, hashtags_en
     # JSONB GIN: seo_hashtags  (0004 마이그레이션에서 생성)

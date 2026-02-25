@@ -69,6 +69,12 @@ CREATE TABLE IF NOT EXISTS articles (
     summary_ko      TEXT,
     summary_en      TEXT,
 
+    -- ── 전문 검색 벡터 (TSVECTOR — 트리거 자동 갱신) ───────────
+    -- trg_update_article_search_vector 가 INSERT/UPDATE 시 자동 계산
+    -- 가중치: A=제목, B=요약, C=본문(content_ko)
+    -- 검색: WHERE search_vector @@ plainto_tsquery('simple', '검색어')
+    search_vector   TSVECTOR,
+
     -- ── 아티스트 정보 ──────────────────────────────────────────
     artist_name_ko  VARCHAR(200),
     artist_name_en  VARCHAR(200),
@@ -94,7 +100,8 @@ CREATE TABLE IF NOT EXISTS articles (
     author          VARCHAR(200),
     process_status  VARCHAR(20)     NOT NULL DEFAULT 'PENDING'
                                     CHECK (process_status IN
-                                        ('PENDING','SCRAPED','PROCESSED','ERROR')),
+                                        ('PENDING','SCRAPED','PROCESSED','ERROR',
+                                         'MANUAL_REVIEW')),
 
     -- ── 연결 ──────────────────────────────────────────────────
     job_id          INTEGER         REFERENCES job_queue(id) ON DELETE SET NULL,
@@ -124,6 +131,37 @@ BEGIN
     END IF;
 END;
 $$;
+
+-- ── 전문 검색 벡터 자동 갱신 트리거 ─────────────────────────────
+-- 제목·요약·본문 컬럼 변경 시에만 발화하여 불필요한 재계산 방지
+CREATE OR REPLACE FUNCTION trg_update_article_search_vector()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    NEW.search_vector :=
+        setweight(to_tsvector('simple',  coalesce(NEW.title_ko,   '')), 'A') ||
+        setweight(to_tsvector('english', coalesce(NEW.title_en,   '')), 'A') ||
+        setweight(to_tsvector('simple',  coalesce(NEW.summary_ko, '')), 'B') ||
+        setweight(to_tsvector('english', coalesce(NEW.summary_en, '')), 'B') ||
+        setweight(to_tsvector('simple',  coalesce(NEW.content_ko, '')), 'C');
+    RETURN NEW;
+END;
+$$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_trigger WHERE tgname = 'update_article_search_vector'
+    ) THEN
+        CREATE TRIGGER update_article_search_vector
+            BEFORE INSERT OR UPDATE OF
+                title_ko, title_en,
+                summary_ko, summary_en,
+                content_ko
+            ON articles
+            FOR EACH ROW EXECUTE FUNCTION trg_update_article_search_vector();
+    END IF;
+END;
+$$;
 """
 
 # ─────────────────────────────────────────────────────────────
@@ -132,7 +170,16 @@ $$;
 
 _INDEXES_DDL = """
 -- ============================================================
--- 1. 전문 검색 (FTS) — GIN
+-- 0. TSVector 전문 검색 — GIN (다국어 가중 벡터, search_vector 컬럼)
+--    @@ 연산자, ts_rank(), ts_headline() 가속
+--    트리거(trg_update_article_search_vector)가 자동 갱신
+-- ============================================================
+
+CREATE INDEX IF NOT EXISTS idx_articles_search_vector
+    ON articles USING GIN (search_vector);
+
+-- ============================================================
+-- 1. 전문 검색 (FTS) — GIN (함수형 인덱스 — search_vector 의 보완)
 --    한국어: 'simple'  (언어 독립적 토큰화)
 --    영어  : 'english' (어간 추출 — run/runs/running → run)
 -- ============================================================
