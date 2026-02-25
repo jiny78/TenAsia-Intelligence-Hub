@@ -22,7 +22,10 @@ processor/gemini_engine.py — Phase 4: Gemini Entity Extraction Engine (v3)
        DB artists 테이블의 아티스트 ID와 매칭합니다.
 
     5. 조건부 상태 전환 (_decide_status)
-       ┌ PROCESSED     : 모든 엔티티 confidence_score ≥ 0.80
+       ┌ VERIFIED      : [Phase 4-B] 모든 PROCESSED 조건 충족
+       │                 AND overall confidence ≥ 0.95 (_AUTO_COMMIT_THRESHOLD)
+       │                 → 운영자 확인 없이 즉시 반영
+       ├ PROCESSED     : 모든 엔티티 confidence_score ≥ 0.80
        │                 AND 모호한 엔티티 없음 (is_ambiguous=False)
        │                 AND relevance_score ≥ 0.30
        │                 AND overall confidence ≥ 0.60
@@ -30,6 +33,14 @@ processor/gemini_engine.py — Phase 4: Gemini Entity Extraction Engine (v3)
        ├ MANUAL_REVIEW : 위 조건 중 하나라도 미충족
        │                 → system_note 에 AI 판단 모호 이유 기록
        └ ERROR         : Gemini 호출 실패 / JSON 파싱 실패 / DB 오류
+
+    6. [Phase 4-B] 자율형 데이터 정제 (Zero-Ops Logic)
+       Cross-Validation    : Gemini 추출 값 vs DB 기존 프로필 비교
+                             일치/비어있음 → 즉시 업데이트 + confidence 보정
+       Auto-Reconciliation : 상충 시 2차 Gemini 호출 → 더 정확한 값으로 자동 갱신
+                             (이전 값은 삭제 않고 data_update_logs 에 아카이빙)
+       Smart Glossary      : 미매핑 신규 엔티티 → glossary 에 Auto-Provisioned 즉시 등록
+       Auto-Commit         : (see 5. VERIFIED)
 
     6. 비용 분석 로그 (GeminiCallMetrics)
        Gemini API 호출마다 prompt_tokens, completion_tokens,
@@ -40,6 +51,7 @@ processor/gemini_engine.py — Phase 4: Gemini Entity Extraction Engine (v3)
     _ENTITY_CONFIDENCE_THRESHOLD = 0.80  엔티티별 자동승인 임계값
     _MIN_RELEVANCE               = 0.30  기사 관련도 최솟값
     _MIN_CONFIDENCE              = 0.60  전체 분석 신뢰도 최솟값
+    _AUTO_COMMIT_THRESHOLD       = 0.95  [Phase 4-B] VERIFIED 자동 승인 임계값
 
 CLI 사용 예:
     python -m processor.gemini_engine                        # PENDING 10건
@@ -90,6 +102,16 @@ _MIN_MATCH_SCORE: float = 0.35
 
 # 용어 사전(glossary) 캐시 TTL — 10분
 _GLOSSARY_CACHE_TTL: float = float(os.getenv("GLOSSARY_CACHE_TTL", "600"))
+
+# [Phase 4-B] Threshold-based Auto-Commit
+# intelligence.confidence 가 이 값 이상이면 운영자 확인 없이 VERIFIED 로 즉시 반영
+_AUTO_COMMIT_THRESHOLD: float = float(os.getenv("AUTO_COMMIT_THRESHOLD", "0.95"))
+
+# [Phase 4-B] 아티스트 필드 업데이트 화이트리스트 (SQL 인젝션 방지)
+_UPDATABLE_ARTIST_FIELDS: frozenset[str] = frozenset({
+    "name_en", "nationality_ko", "nationality_en",
+    "mbti", "blood_type", "height_cm", "weight_kg",
+})
 
 
 # ─────────────────────────────────────────────────────────────
@@ -347,6 +369,7 @@ class BatchResult:
 
     total:         int = 0
     processed:     int = 0
+    verified:      int = 0   # [Phase 4-B] confidence ≥ 0.95 자동 승인 건수
     manual_review: int = 0
     failed:        int = 0
     total_tokens:  int = 0   # [v2] 배치 전체 토큰 합계
@@ -355,6 +378,7 @@ class BatchResult:
         return {
             "total":         self.total,
             "processed":     self.processed,
+            "verified":      self.verified,
             "manual_review": self.manual_review,
             "failed":        self.failed,
             "total_tokens":  self.total_tokens,
@@ -724,13 +748,19 @@ def _claim_pending_articles(
 
 
 def _get_all_artists() -> list[dict]:
-    """artists 테이블 전체를 캐시용으로 조회합니다."""
+    """[v2] artists 테이블 전체를 캐시용으로 조회합니다.
+
+    v2 스키마 변경 반영: agency / official_tags 컬럼 제거.
+    stage_name_ko / stage_name_en 추가 (별명 매칭 지원).
+    """
     with _conn() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("""
-                SELECT id, name_ko, name_en, agency, official_tags, global_priority
+                SELECT id, name_ko, name_en,
+                       stage_name_ko, stage_name_en,
+                       global_priority, is_verified
                 FROM   artists
-                ORDER  BY global_priority DESC, id ASC
+                ORDER  BY global_priority ASC NULLS LAST, id ASC
             """)
             rows = cur.fetchall()
     return [dict(r) for r in rows]
@@ -868,6 +898,298 @@ def _read_pending_articles_dry(
             rows = cur.fetchall()
 
     return [dict(r) for r in rows]
+
+
+# ─────────────────────────────────────────────────────────────
+# Phase 4-B: DB 헬퍼 (증거 기반 업데이트 + Glossary 자동 등록)
+# ─────────────────────────────────────────────────────────────
+
+def _get_artist_profile_v2(artist_id: int) -> Optional[dict]:
+    """
+    [Phase 4-B] artists 테이블에서 단일 아티스트 프로필을 조회합니다.
+
+    Cross-Validation 에서 Gemini 추출 값과 비교하는 데 사용합니다.
+    조회 실패 시 None 을 반환하여 처리를 중단하지 않습니다.
+    """
+    try:
+        with _conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT id, name_ko, name_en, stage_name_ko, stage_name_en,
+                           nationality_ko, nationality_en, mbti, blood_type,
+                           height_cm, weight_kg, is_verified, global_priority
+                    FROM   artists
+                    WHERE  id = %s
+                    """,
+                    (artist_id,),
+                )
+                row = cur.fetchone()
+        return dict(row) if row else None
+    except Exception as exc:
+        log.warning(
+            "아티스트 프로필 조회 실패 | artist_id=%d err=%r", artist_id, exc
+        )
+        return None
+
+
+def _update_artist_field_v2(
+    artist_id:  int,
+    field:      str,
+    new_value:  Any,
+    old_value:  Any,
+    article_id: int,
+    updated_by: str = "ai_pipeline",
+) -> bool:
+    """
+    [Phase 4-B] artists 테이블의 단일 필드를 갱신하고 data_update_logs 에 기록합니다.
+
+    `field` 는 _UPDATABLE_ARTIST_FIELDS 화이트리스트에 있어야 합니다.
+    SQL 인젝션 방지를 위해 화이트리스트 체크를 통과한 필드명만 f-string 으로 사용합니다.
+
+    Returns:
+        True — 업데이트 및 로그 기록 성공
+        False — 화이트리스트 위반 또는 DB 오류
+    """
+    if field not in _UPDATABLE_ARTIST_FIELDS:
+        log.error(
+            "허용되지 않은 아티스트 필드 업데이트 시도 | field=%r (허용: %s)",
+            field, ", ".join(sorted(_UPDATABLE_ARTIST_FIELDS)),
+        )
+        return False
+
+    try:
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                # 1. 필드 갱신
+                cur.execute(
+                    f"UPDATE artists SET {field} = %s, updated_at = NOW() WHERE id = %s",
+                    (new_value, artist_id),
+                )
+                # 2. DataUpdateLog 기록 (The Core — 증거 기반 감사 로그)
+                cur.execute(
+                    """
+                    INSERT INTO data_update_logs
+                        (article_id, entity_type, entity_id, field_name,
+                         old_value_json, new_value_json, updated_by)
+                    VALUES (%s, 'ARTIST'::entity_type_enum, %s, %s,
+                            %s::jsonb, %s::jsonb, %s)
+                    """,
+                    (
+                        article_id,
+                        artist_id,
+                        field,
+                        json.dumps({"value": old_value}, ensure_ascii=False, default=str),
+                        json.dumps({"value": new_value}, ensure_ascii=False, default=str),
+                        updated_by,
+                    ),
+                )
+        log.info(
+            "[Phase4B] 아티스트 필드 자동 업데이트 | artist_id=%d field=%s %r → %r",
+            artist_id, field, old_value, new_value,
+        )
+        return True
+    except Exception as exc:
+        log.error(
+            "아티스트 필드 업데이트 실패 | artist_id=%d field=%s err=%r",
+            artist_id, field, exc,
+        )
+        return False
+
+
+def _glossary_enroll_auto(
+    term_ko:    str,
+    term_en:    str,
+    category:   str,
+    article_id: Optional[int],
+) -> bool:
+    """
+    [Phase 4-B] Smart Glossary Auto-Enroll.
+
+    glossary 테이블에 Auto-Provisioned 용어를 등록합니다.
+    ON CONFLICT (term_ko, category) DO NOTHING — 이미 존재하면 False 반환.
+
+    Returns:
+        True  — 신규 등록 성공
+        False — 이미 존재하거나 DB 오류
+    """
+    if not term_ko.strip() or not term_en.strip():
+        return False
+
+    try:
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO glossary
+                        (term_ko, term_en, category, description,
+                         is_auto_provisioned, source_article_id)
+                    VALUES (%s, %s, %s::glossary_category_enum,
+                            %s, TRUE, %s)
+                    ON CONFLICT (term_ko, category) DO NOTHING
+                    """,
+                    (
+                        term_ko.strip(),
+                        term_en.strip(),
+                        category,
+                        f"Auto-Provisioned (article #{article_id})",
+                        article_id,
+                    ),
+                )
+                enrolled = cur.rowcount > 0
+        if enrolled:
+            log.info(
+                "[Phase4B] Glossary 자동 등록 | term_ko=%r term_en=%r "
+                "category=%s article_id=%s",
+                term_ko, term_en, category, article_id,
+            )
+        return enrolled
+    except Exception as exc:
+        log.warning(
+            "Glossary 자동 등록 실패 | term_ko=%r err=%r", term_ko, exc
+        )
+        return False
+
+
+def _log_auto_resolution(
+    article_id:         Optional[int],
+    entity_type:        str,
+    entity_id:          int,
+    field_name:         str,
+    old_value:          Any,
+    new_value:          Any,
+    resolution_type:    str,
+    gemini_reasoning:   Optional[str] = None,
+    gemini_confidence:  Optional[float] = None,
+    source_reliability: float = 0.0,
+) -> None:
+    """
+    [Phase 2-D] auto_resolution_logs 에 AI 자율 결정 이력을 기록합니다.
+
+    resolution_type: "FILL" | "RECONCILE" | "ENROLL"
+    """
+    try:
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO auto_resolution_logs
+                        (article_id, entity_type, entity_id, field_name,
+                         old_value_json, new_value_json, resolution_type,
+                         gemini_reasoning, gemini_confidence, source_reliability)
+                    VALUES (%s, %s::entity_type_enum, %s, %s,
+                            %s::jsonb, %s::jsonb,
+                            %s::auto_resolution_type_enum,
+                            %s, %s, %s)
+                    """,
+                    (
+                        article_id,
+                        entity_type,
+                        entity_id,
+                        field_name,
+                        json.dumps({"value": old_value},  ensure_ascii=False, default=str),
+                        json.dumps({"value": new_value},  ensure_ascii=False, default=str),
+                        resolution_type,
+                        gemini_reasoning,
+                        gemini_confidence,
+                        max(0.0, min(1.0, source_reliability)),
+                    ),
+                )
+    except Exception as exc:
+        log.warning(
+            "auto_resolution_logs 기록 실패 | entity=%s:%d field=%s type=%s err=%r",
+            entity_type, entity_id, field_name, resolution_type, exc,
+        )
+
+
+def _log_conflict_flag(
+    article_id:        Optional[int],
+    entity_type:       str,
+    entity_id:         int,
+    field_name:        str,
+    existing_value:    Any,
+    conflicting_value: Any,
+    conflict_reason:   str,
+    conflict_score:    float = 0.5,
+) -> None:
+    """
+    [Phase 2-D] conflict_flags 에 자율 해결 불가 모순을 기록합니다.
+
+    conflict_score 가이드:
+        0.0 ~ 0.3 : 사소한 차이
+        0.3 ~ 0.7 : 중간 모순
+        0.7 ~ 1.0 : 심각한 모순 (이름이 완전히 다름 등)
+    """
+    try:
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO conflict_flags
+                        (article_id, entity_type, entity_id, field_name,
+                         existing_value_json, conflicting_value_json,
+                         conflict_reason, conflict_score)
+                    VALUES (%s, %s::entity_type_enum, %s, %s,
+                            %s::jsonb, %s::jsonb, %s, %s)
+                    """,
+                    (
+                        article_id,
+                        entity_type,
+                        entity_id,
+                        field_name,
+                        json.dumps({"value": existing_value},    ensure_ascii=False, default=str),
+                        json.dumps({"value": conflicting_value}, ensure_ascii=False, default=str),
+                        conflict_reason,
+                        max(0.0, min(1.0, conflict_score)),
+                    ),
+                )
+        log.warning(
+            "[Phase2D] ConflictFlag 기록 | entity=%s:%d field=%s score=%.2f | "
+            "existing=%r conflicting=%r",
+            entity_type, entity_id, field_name, conflict_score,
+            existing_value, conflicting_value,
+        )
+    except Exception as exc:
+        log.warning(
+            "conflict_flags 기록 실패 | entity=%s:%d field=%s err=%r",
+            entity_type, entity_id, field_name, exc,
+        )
+
+
+def _update_entity_verified_at(entity_type: str, entity_id: int) -> None:
+    """
+    [Phase 2-D] artists 또는 groups 의 last_verified_at 을 현재 시각으로 갱신합니다.
+
+    Cross-Validation 수행 후 호출하여 "마지막 재검증 시점"을 기록합니다.
+    """
+    # [보안] f-string 금지 — 테이블명을 화이트리스트 dict 로 결정하여
+    # SQL Injection 원천 차단. 매핑에 없는 entity_type 은 조기 반환.
+    _TABLE_MAP: dict[str, str] = {"ARTIST": "artists", "GROUP": "groups"}
+    table = _TABLE_MAP.get(entity_type)
+    if table is None:
+        log.warning(
+            "last_verified_at 갱신 스킵 — 허용되지 않은 entity_type | entity_type=%r",
+            entity_type,
+        )
+        return
+    try:
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                if table == "artists":
+                    cur.execute(
+                        "UPDATE artists SET last_verified_at = NOW() WHERE id = %s",
+                        (entity_id,),
+                    )
+                else:
+                    cur.execute(
+                        "UPDATE groups SET last_verified_at = NOW() WHERE id = %s",
+                        (entity_id,),
+                    )
+    except Exception as exc:
+        log.warning(
+            "last_verified_at 갱신 실패 | entity=%s:%d err=%r",
+            entity_type, entity_id, exc,
+        )
 
 
 def _get_glossary_from_db() -> list[dict]:
@@ -1178,59 +1500,60 @@ class IntelligenceEngine:
         candidate: dict,
     ) -> float:
         """
-        탐지된 아티스트와 DB 후보 사이의 매칭 신뢰도 점수를 계산합니다.
+        [v2] 탐지된 아티스트와 DB 후보 사이의 매칭 신뢰도 점수를 계산합니다.
+
+        v2 스키마 변경 반영: agency / official_tags 제거.
+        무대명(stage_name_ko / stage_name_en) 매칭 추가.
 
         이 점수는 DB 매칭용(entity_mappings.confidence_score)이며,
         DetectedArtist.confidence_score(Gemini 자체 평가)와 별개입니다.
+
+        점수 체계 (최대 1.0):
+            +0.50  name_ko 완전 일치
+            +0.30  name_ko 부분 포함
+            +0.50  stage_name_ko 완전 일치   (name_ko 와 중복 적용 가능, max 1.0)
+            +0.25  stage_name_ko 부분 포함
+            +0.20  name_en 완전 일치
+            +0.10  name_en 부분 포함
+            +0.20  stage_name_en 완전 일치
+            +0.10  stage_name_en 부분 포함
         """
         score = 0.0
 
-        name_ko = detected.name_ko.strip()
-        cand_ko = (candidate.get("name_ko") or "").strip()
+        name_ko   = detected.name_ko.strip()
+        cand_ko   = (candidate.get("name_ko")       or "").strip()
+        stage_ko  = (candidate.get("stage_name_ko") or "").strip()
 
+        # ── 한국어 이름 매칭 ─────────────────────────────────
         if name_ko and cand_ko:
             if name_ko == cand_ko:
                 score += 0.50
             elif name_ko in cand_ko or cand_ko in name_ko:
                 score += 0.30
 
-        name_en = (detected.name_en or "").strip().lower()
-        cand_en = (candidate.get("name_en") or "").strip().lower()
+        # ── 한국어 무대명 매칭 (본명과 다를 때 별도 가점) ────
+        if name_ko and stage_ko and stage_ko != cand_ko:
+            if name_ko == stage_ko:
+                score += 0.50
+            elif name_ko in stage_ko or stage_ko in name_ko:
+                score += 0.25
+
+        # ── 영어 이름 매칭 ───────────────────────────────────
+        name_en  = (detected.name_en or "").strip().lower()
+        cand_en  = (candidate.get("name_en")       or "").strip().lower()
+        stage_en = (candidate.get("stage_name_en") or "").strip().lower()
+
         if name_en and cand_en:
             if name_en == cand_en:
                 score += 0.20
             elif name_en in cand_en or cand_en in name_en:
                 score += 0.10
 
-        hints  = [h.lower() for h in detected.context_hints if h.strip()]
-        agency = (candidate.get("agency") or "").lower()
-        if agency:
-            for hint in hints:
-                if hint and (hint in agency or agency in hint):
-                    score += 0.15
-                    break
-
-        tags_raw  = candidate.get("official_tags") or {}
-        tag_words: set[str] = set()
-        if isinstance(tags_raw, dict):
-            for v in tags_raw.values():
-                if isinstance(v, list):
-                    tag_words.update(str(x).lower() for x in v)
-                elif isinstance(v, str):
-                    tag_words.add(v.lower())
-
-        if tag_words:
-            hint_bonus = 0
-            for hint in hints:
-                if not hint:
-                    continue
-                for tw in tag_words:
-                    if hint in tw or tw in hint:
-                        score += 0.10
-                        hint_bonus += 1
-                        break
-                if hint_bonus >= 3:
-                    break
+        if name_en and stage_en and stage_en != cand_en:
+            if name_en == stage_en:
+                score += 0.20
+            elif name_en in stage_en or stage_en in name_en:
+                score += 0.10
 
         return min(score, 1.0)
 
@@ -1365,7 +1688,339 @@ class IntelligenceEngine:
             )
             return "MANUAL_REVIEW", note
 
+        # ── [Phase 4-B] Threshold-based Auto-Commit ───────────
+        # 모든 PROCESSED 조건 충족 + confidence ≥ 0.95 → VERIFIED (운영자 확인 불필요)
+        if intelligence.confidence >= _AUTO_COMMIT_THRESHOLD:
+            note = (
+                f"Auto-Commit: confidence={intelligence.confidence:.4f} "
+                f"≥ {_AUTO_COMMIT_THRESHOLD} threshold"
+            )
+            log.info(
+                "VERIFIED 자동 승인 | confidence=%.4f threshold=%.2f",
+                intelligence.confidence, _AUTO_COMMIT_THRESHOLD,
+            )
+            return "VERIFIED", note
+
+        # confidence < 0.95 — PROCESSED 로 처리하되 예외 로그 기록
+        log.info(
+            "PROCESSED (신뢰도 임계값 미달) | confidence=%.4f < %.2f — 로그만 기록",
+            intelligence.confidence, _AUTO_COMMIT_THRESHOLD,
+        )
         return "PROCESSED", None
+
+    # ── [Phase 4-B] 자율형 데이터 정제 ────────────────────────
+
+    def _cross_validate_and_update(
+        self,
+        linked:       list[dict],
+        intelligence: "ArticleIntelligence",
+        article_id:   int,
+    ) -> list[dict]:
+        """
+        [Phase 4-B] Cross-Validation (상호 검증).
+
+        DB에 매핑된 각 아티스트의 현재 프로필을 조회하고,
+        Gemini 가 추출한 값과 비교합니다:
+
+            1. DB 값이 비어있고 Gemini 값이 있으면
+               → 즉시 업데이트 (Fill) + DataUpdateLog + confidence +0.05
+            2. DB 값과 Gemini 값이 일치하면
+               → confidence +0.05 (기존 데이터 신뢰도 강화)
+            3. DB 값과 Gemini 값이 상충하면
+               → _auto_reconcile() 로 Gemini 2차 판단 후 처리
+
+        현재 검증 대상 필드:
+            - name_en : DetectedArtist.name_en vs artists.name_en
+
+        Returns:
+            confidence_score 가 보정된 linked 리스트 (원본 변경 없음)
+        """
+        if not linked:
+            return linked
+
+        updated: list[dict] = []
+        # DetectedArtist 를 이름으로 빠르게 조회
+        detected_map: dict[str, "DetectedArtist"] = {
+            da.name_ko: da for da in intelligence.detected_artists
+        }
+
+        for m in linked:
+            entity_id = m.get("entity_id")
+
+            # 미링크 / GROUP / EVENT 엔티티는 Cross-Validation 대상 아님
+            if entity_id is None or m.get("entity_type") != "ARTIST":
+                updated.append(m)
+                continue
+
+            profile = _get_artist_profile_v2(entity_id)
+            if not profile:
+                updated.append(m)
+                continue
+
+            detected_obj = detected_map.get(m.get("detected_name_ko", ""))
+            if detected_obj is None:
+                updated.append(m)
+                continue
+
+            boost = 0.0
+
+            # ── name_en 교차검증 ──────────────────────────────
+            detected_en = (detected_obj.name_en or "").strip()
+            db_en       = (profile.get("name_en") or "").strip()
+
+            # [Phase 2-D] Cross-Validation 수행 후 last_verified_at 갱신
+            _update_entity_verified_at("ARTIST", entity_id)
+
+            if detected_en:
+                if not db_en:
+                    # DB 비어있음 → 즉시 보충 (FILL)
+                    ok = _update_artist_field_v2(
+                        artist_id  = entity_id,
+                        field      = "name_en",
+                        new_value  = detected_en,
+                        old_value  = None,
+                        article_id = article_id,
+                    )
+                    if ok:
+                        boost += 0.05
+                        # [Phase 2-D] AutoResolutionLog 기록
+                        _log_auto_resolution(
+                            article_id        = article_id,
+                            entity_type       = "ARTIST",
+                            entity_id         = entity_id,
+                            field_name        = "name_en",
+                            old_value         = None,
+                            new_value         = detected_en,
+                            resolution_type   = "FILL",
+                            gemini_confidence = detected_obj.confidence_score,
+                            source_reliability = intelligence.confidence,
+                        )
+                        log.info(
+                            "[Phase4B] name_en 자동 보충 | "
+                            "artist_id=%d name_en=%r",
+                            entity_id, detected_en,
+                        )
+                elif detected_en.lower() == db_en.lower():
+                    # 일치 → 신뢰도 강화
+                    boost += 0.05
+                    log.debug(
+                        "[Phase4B] name_en 일치 확인 | "
+                        "artist_id=%d name_en=%r boost=+0.05",
+                        entity_id, db_en,
+                    )
+                else:
+                    # 상충 → Auto-Reconciliation
+                    winner, reasoning = self._auto_reconcile(
+                        artist_id       = entity_id,
+                        article_id      = article_id,
+                        field           = "name_en",
+                        db_val          = db_en,
+                        detected_val    = detected_en,
+                        article_context = (intelligence.title_ko or ""),
+                    )
+                    if winner == "article":
+                        _update_artist_field_v2(
+                            artist_id  = entity_id,
+                            field      = "name_en",
+                            new_value  = detected_en,
+                            old_value  = db_en,
+                            article_id = article_id,
+                        )
+                        # [Phase 2-D] AutoResolutionLog 기록
+                        _log_auto_resolution(
+                            article_id        = article_id,
+                            entity_type       = "ARTIST",
+                            entity_id         = entity_id,
+                            field_name        = "name_en",
+                            old_value         = db_en,
+                            new_value         = detected_en,
+                            resolution_type   = "RECONCILE",
+                            gemini_reasoning  = reasoning,
+                            gemini_confidence = detected_obj.confidence_score,
+                            source_reliability = intelligence.confidence,
+                        )
+                    elif winner is None:
+                        # 판단 불가 → ConflictFlag 기록
+                        # 이름이 완전히 다르면 심각(high score), 일부 다르면 중간
+                        similarity = len(
+                            set(detected_en.lower()) & set(db_en.lower())
+                        ) / max(len(detected_en), len(db_en), 1)
+                        c_score = round(1.0 - similarity, 2)
+                        _log_conflict_flag(
+                            article_id        = article_id,
+                            entity_type       = "ARTIST",
+                            entity_id         = entity_id,
+                            field_name        = "name_en",
+                            existing_value    = db_en,
+                            conflicting_value = detected_en,
+                            conflict_reason   = "Auto-Reconcile 판단 불가: Gemini 응답 없음/형식 오류",
+                            conflict_score    = c_score,
+                        )
+
+            # confidence_score 보정 (최대 1.0)
+            new_score = min(m["confidence_score"] + boost, 1.0)
+            updated.append({**m, "confidence_score": round(new_score, 4)})
+
+        return updated
+
+    def _auto_reconcile(
+        self,
+        artist_id:       int,
+        article_id:      int,
+        field:           str,
+        db_val:          str,
+        detected_val:    str,
+        article_context: str,
+    ) -> tuple[Optional[str], Optional[str]]:
+        """
+        [Phase 4-B] Auto-Reconciliation (자율 모순 해결).
+
+        DB 기존 값과 Gemini 추출 값이 상충할 때,
+        Gemini 에게 어느 것이 더 최신이며 공신력이 있는지 물어봅니다.
+
+        2차 Gemini 호출을 수행합니다 (RPM 리미터 적용).
+
+        Returns:
+            (winner, reason) tuple:
+            winner: "article" — 현재 기사 값이 더 정확함 → DB 갱신 필요
+                    "db"      — 기존 DB 값이 더 정확함 → 변경 없음
+                    None      — 판단 불가 또는 Gemini 호출 실패
+            reason: Gemini 가 제공한 판단 이유 (None 이면 판단 불가)
+        """
+        prompt = (
+            "K-엔터테인먼트 데이터베이스에서 두 출처 간 정보 충돌이 발생했습니다.\n"
+            "어떤 값이 더 최신이며 공신력이 있는지 판단하고 JSON 으로만 응답하세요.\n\n"
+            f"필드명 : {field}\n"
+            f"DB 기존 값    : \"{db_val}\"\n"
+            f"현재 기사 추출: \"{detected_val}\"\n"
+            f"기사 제목/문맥: \"{article_context[:200]}\"\n\n"
+            "응답 형식 (JSON only, 다른 텍스트 금지):\n"
+            "{\"winner\": \"article\" | \"db\", "
+            "\"reason\": \"판단 이유 (30자 이내)\"}"
+        )
+
+        try:
+            raw, _ = self._call_gemini(prompt)
+            data   = self._parse_json(raw)
+            winner = data.get("winner")
+            reason = data.get("reason", "")
+
+            if winner not in ("article", "db"):
+                log.warning(
+                    "[Phase4B] Auto-Reconcile 판단 불가 | "
+                    "artist_id=%d field=%s winner=%r",
+                    artist_id, field, winner,
+                )
+                return (None, None)
+
+            log.info(
+                "[Phase4B] Auto-Reconcile 결정 | artist_id=%d field=%s "
+                "winner=%s reason=%r | db=%r article=%r",
+                artist_id, field, winner, reason, db_val, detected_val,
+            )
+            _log_to_system(
+                article_id = article_id,
+                level      = "INFO",
+                event      = "auto_reconcile",
+                message    = (
+                    f"[Phase4B] 모순 해결: field={field} winner={winner}"
+                ),
+                details    = {
+                    "artist_id":    artist_id,
+                    "field":        field,
+                    "db_val":       db_val,
+                    "detected_val": detected_val,
+                    "winner":       winner,
+                    "reason":       reason,
+                },
+            )
+            return (winner, reason)
+
+        except Exception as exc:
+            log.warning(
+                "[Phase4B] Auto-Reconcile Gemini 호출 실패 | "
+                "artist_id=%d field=%s err=%r",
+                artist_id, field, exc,
+            )
+            return (None, None)
+
+    def _auto_enroll_new_entities(
+        self,
+        detected_artists: list["DetectedArtist"],
+        linked:           list[dict],
+        article_id:       int,
+    ) -> int:
+        """
+        [Phase 4-B] Smart Glossary Auto-Enroll.
+
+        DB에 매핑되지 않은 신규 엔티티(entity_id=None)를
+        glossary 테이블에 Auto-Provisioned 상태로 즉시 등록합니다.
+
+        Gemini 가 이미 name_en 을 추론했으므로 추가 API 호출 없이 등록합니다.
+        등록 후 glossary 캐시를 무효화하여 다음 배치부터 반영됩니다.
+
+        Returns:
+            등록된 신규 용어 수
+        """
+        # DB에 이미 매핑된 이름 집합
+        linked_names: set[str] = {
+            m.get("detected_name_ko", "")
+            for m in linked
+            if m.get("entity_id") is not None
+        }
+
+        # entity_type → glossary category 매핑
+        category_map = {
+            "ARTIST": "ARTIST",
+            "GROUP":  "ARTIST",  # 그룹도 ARTIST 카테고리로 통합 관리
+            "EVENT":  "EVENT",
+        }
+
+        enrolled = 0
+        for da in detected_artists:
+            if da.name_ko in linked_names:
+                continue  # 이미 DB 에 매핑됨 → 등록 불필요
+
+            name_en = (da.name_en or "").strip()
+            if not name_en:
+                log.debug(
+                    "[Phase4B] 영문명 없음 — 자동 등록 스킵 | name_ko=%r",
+                    da.name_ko,
+                )
+                continue
+
+            category = category_map.get(da.entity_type, "ARTIST")
+            ok = _glossary_enroll_auto(
+                term_ko    = da.name_ko,
+                term_en    = name_en,
+                category   = category,
+                article_id = article_id,
+            )
+            if ok:
+                enrolled += 1
+                # [Phase 2-D] AutoResolutionLog: 신규 용어 자동 등록 기록
+                _log_auto_resolution(
+                    article_id        = article_id,
+                    entity_type       = da.entity_type,
+                    entity_id         = 0,           # 신규 용어: DB ID 미확정
+                    field_name        = "glossary_term",
+                    old_value         = None,
+                    new_value         = {"term_ko": da.name_ko, "term_en": name_en},
+                    resolution_type   = "ENROLL",
+                    gemini_reasoning  = f"Auto-Provisioned: {da.name_ko} → {name_en}",
+                    gemini_confidence = da.confidence_score,
+                    source_reliability = 0.0,
+                )
+
+        if enrolled:
+            # 용어 사전 캐시 무효화 — 다음 호출 시 DB 에서 재로드
+            self._glossary_loaded_at = 0.0
+            log.info(
+                "[Phase4B] 신규 용어 자동 등록 완료 | article_id=%d enrolled=%d",
+                article_id, enrolled,
+            )
+
+        return enrolled
 
     # ── Gemini 지식 추출 ───────────────────────────────────
 
@@ -1442,11 +2097,16 @@ class IntelligenceEngine:
         [v2] 단일 기사를 처리합니다.
 
         처리 순서:
-            1. Gemini 추출 → (ArticleIntelligence, GeminiCallMetrics)   [항상 실행]
-            2. 컨텍스트 링킹 → entity_id 매칭                           [항상 실행]
-            3. entity_mappings 교체                                     [dry_run=False 만]
-            4. _decide_status() → PROCESSED / MANUAL_REVIEW             [항상 실행]
-            5. DB 업데이트 (process_status, summary_ko, system_note)    [dry_run=False 만]
+            1. Gemini 추출 → (ArticleIntelligence, GeminiCallMetrics)       [항상 실행]
+            2. 컨텍스트 링킹 → entity_id 매칭                               [항상 실행]
+            2a. [Phase 4-B] Cross-Validation + Auto-Reconciliation           [dry_run=False 만]
+                - DB 프로필과 Gemini 추출 값 비교 → Fill / Boost / Reconcile
+            2b. [Phase 4-B] Smart Glossary Auto-Enroll                       [dry_run=False 만]
+                - 미매핑 엔티티 glossary 자동 등록 (Auto-Provisioned)
+            3. entity_mappings 교체                                          [dry_run=False 만]
+            4. _decide_status() → VERIFIED / PROCESSED / MANUAL_REVIEW      [항상 실행]
+                - confidence ≥ 0.95 → VERIFIED (운영자 확인 불필요)
+            5. DB 업데이트 (process_status, summary_ko, system_note)        [dry_run=False 만]
             6. system_logs 기록 / [DRY RUN] JSON 미리보기 출력
 
         Args:
@@ -1478,6 +2138,22 @@ class IntelligenceEngine:
 
             # ── 2. 컨텍스트 링킹 ────────────────────────
             linked = self._contextual_link(intelligence.detected_artists)
+
+            # ── 2a. [Phase 4-B] Cross-Validation + Auto-Reconciliation ──
+            if not dry_run:
+                linked = self._cross_validate_and_update(
+                    linked       = linked,
+                    intelligence = intelligence,
+                    article_id   = article_id,
+                )
+
+            # ── 2b. [Phase 4-B] Smart Glossary Auto-Enroll ──────────────
+            if not dry_run:
+                self._auto_enroll_new_entities(
+                    detected_artists = intelligence.detected_artists,
+                    linked           = linked,
+                    article_id       = article_id,
+                )
 
             # ── 3. entity_mappings 저장 ──────────────────
             entity_records = [
@@ -1720,7 +2396,9 @@ class IntelligenceEngine:
                 f" | note: {ar.system_note[:60]}..." if ar.system_note else "",
             )
 
-            if ar.status == "PROCESSED":
+            if ar.status == "VERIFIED":
+                result.verified += 1
+            elif ar.status == "PROCESSED":
                 result.processed += 1
             elif ar.status == "MANUAL_REVIEW":
                 result.manual_review += 1
@@ -1728,10 +2406,10 @@ class IntelligenceEngine:
                 result.failed += 1
 
         log.info(
-            "배치 처리 완료 | total=%d processed=%d manual_review=%d failed=%d "
-            "total_tokens=%d",
-            result.total, result.processed, result.manual_review, result.failed,
-            result.total_tokens,
+            "배치 처리 완료 | total=%d verified=%d processed=%d "
+            "manual_review=%d failed=%d total_tokens=%d",
+            result.total, result.verified, result.processed,
+            result.manual_review, result.failed, result.total_tokens,
         )
         return result
 
@@ -1782,6 +2460,11 @@ def main(argv: Optional[list[str]] = None) -> None:
              "이 값 미만 엔티티가 있으면 MANUAL_REVIEW",
     )
     parser.add_argument(
+        "--auto-commit-threshold", type=float, default=None, metavar="FLOAT",
+        help=f"[Phase 4-B] Auto-Commit 임계값 (기본: {_AUTO_COMMIT_THRESHOLD}). "
+             "전체 신뢰도가 이 값 이상이면 VERIFIED 로 즉시 반영",
+    )
+    parser.add_argument(
         "--dry-run", action="store_true",
         help="Gemini API 호출은 수행하되 DB 에 반영하지 않음. "
              "예상 매핑 결과를 JSON 으로 출력합니다 (테스트 모드).",
@@ -1795,6 +2478,13 @@ def main(argv: Optional[list[str]] = None) -> None:
         global _ENTITY_CONFIDENCE_THRESHOLD
         _ENTITY_CONFIDENCE_THRESHOLD = args.threshold
         log.info("엔티티 신뢰도 임계값 오버라이드: %.2f", _ENTITY_CONFIDENCE_THRESHOLD)
+
+    if args.auto_commit_threshold is not None:
+        global _AUTO_COMMIT_THRESHOLD
+        _AUTO_COMMIT_THRESHOLD = args.auto_commit_threshold
+        log.info(
+            "[Phase4B] Auto-Commit 임계값 오버라이드: %.2f", _AUTO_COMMIT_THRESHOLD
+        )
 
     engine = IntelligenceEngine(
         model_name = args.model,
@@ -1810,6 +2500,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     prefix = "[DRY RUN] " if args.dry_run else ""
     print(
         f"\n{prefix}처리 완료: total={result.total} "
+        f"verified={result.verified} "
         f"processed={result.processed} "
         f"manual_review={result.manual_review} "
         f"failed={result.failed} "

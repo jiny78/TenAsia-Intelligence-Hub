@@ -1,15 +1,63 @@
-.git/
-.gitignore
+# =============================================================
+# TenAsia Intelligence Hub — Backend .dockerignore
+# =============================================================
+
+# ── Python 캐시 ──────────────────────────────────────────────
 __pycache__/
 *.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# ── 가상환경 ─────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── 테스트 ───────────────────────────────────────────────────
 .pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# ── 프론트엔드 (별도 빌드 컨텍스트) ────────────────────────────
+web-next/
+
+# ── Docker / Infra ────────────────────────────────────────────
+docker-compose*.yml
+Dockerfile*
+.dockerignore
+terraform/
+.terraform/
+*.tfstate
+
+# ── Git ──────────────────────────────────────────────────────
+.git/
+.gitignore
+.gitattributes
+
+# ── 환경 설정 (시크릿) ──────────────────────────────────────
 .env
 .env.*
-venv/
-.venv/
+!.env.example
 .streamlit/secrets.toml
-terraform/
-.vscode/
+
+# ── 에디터 / OS ──────────────────────────────────────────────
 .idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# ── 로그 / 임시 파일 ────────────────────────────────────────
+logs/
 *.log
 *.bak
+*.tmp
+
+# ── 문서 ─────────────────────────────────────────────────────
+*.md
+README*
