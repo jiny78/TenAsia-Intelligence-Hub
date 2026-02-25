@@ -49,6 +49,7 @@ CLI 사용 예:
 
 from __future__ import annotations
 
+import enum
 import json
 import logging
 import os
@@ -86,6 +87,31 @@ _MIN_CONFIDENCE: float = 0.60
 
 # 엔티티 DB 매칭 최소 점수 (이하이면 entity_id=None 으로 저장)
 _MIN_MATCH_SCORE: float = 0.35
+
+# 용어 사전(glossary) 캐시 TTL — 10분
+_GLOSSARY_CACHE_TTL: float = float(os.getenv("GLOSSARY_CACHE_TTL", "600"))
+
+
+# ─────────────────────────────────────────────────────────────
+# 번역 티어 (선택적 번역 — 비용 최적화)
+# ─────────────────────────────────────────────────────────────
+
+class TranslationTier(str, enum.Enum):
+    """
+    artists.global_priority 기반 선택적 번역 티어.
+
+    DB 매핑:
+        priority 1 (FULL)       : 제목 + 본문 요약 전체 번역 + SEO 해시태그
+                                   (글로벌 팬덤 아티스트 — BTS, BLACKPINK 등)
+        priority 2 (TITLE_ONLY) : 영문 제목 + 3문장 요약만 번역 + SEO 해시태그
+                                   (국내 인지도 있으나 글로벌 팬덤 제한)
+        priority 3 (KO_ONLY)    : 한국어 엔티티 추출만 — 번역·해시태그 없음
+                                   (신인 / 국내 소규모 아티스트)
+        NULL / 미분류           → FULL (누락 방지 기본값)
+    """
+    FULL       = "full"        # priority 1 — 전체 번역 + 해시태그
+    TITLE_ONLY = "title_only"  # priority 2 — 제목 + 3문장 요약 + 해시태그
+    KO_ONLY    = "ko_only"     # priority 3 — 한국어 엔티티 추출만
 
 
 # ─────────────────────────────────────────────────────────────
@@ -202,7 +228,18 @@ class ArticleIntelligence(BaseModel):
             "핵심 주제 영문 요약 (3문장 이내, K-POP 팬 친화적).\n"
             "  - 단순 직역 금지\n"
             "  - 역주행→'viral comeback', 대세돌→'trending it-idol' 등 현지화 적용\n"
-            "  - 비어있으면 → MANUAL_REVIEW 자동 라우팅"
+            "  - KO_ONLY 티어에서는 빈 문자열 허용\n"
+            "  - FULL/TITLE_ONLY 에서 비어있으면 → MANUAL_REVIEW 자동 라우팅"
+        ),
+    )
+    # ── v3: SEO 해시태그 (FULL/TITLE_ONLY 티어만) ────────────
+    seo_hashtags: list[str] = Field(
+        default_factory=list,
+        description=(
+            "글로벌 SEO 해시태그 (Tier 1/2만 생성, 5~10개).\n"
+            "  - 반드시 # 으로 시작\n"
+            "  - 북미/유럽 K-POP 팬이 X/Instagram에서 자주 쓰는 태그\n"
+            "  - KO_ONLY 티어에서는 빈 리스트"
         ),
     )
     sentiment: Literal["positive", "negative", "neutral", "mixed"] = Field(
@@ -239,6 +276,20 @@ class ArticleIntelligence(BaseModel):
     @classmethod
     def _clean_summary_en(cls, v: str) -> str:
         return v.strip()
+
+    @field_validator("seo_hashtags")
+    @classmethod
+    def _validate_hashtags(cls, v: list[str]) -> list[str]:
+        """# 접두어 정규화, 공백 제거, 최대 15개 제한."""
+        cleaned: list[str] = []
+        for tag in v:
+            tag = tag.strip()
+            if not tag:
+                continue
+            if not tag.startswith("#"):
+                tag = "#" + tag
+            cleaned.append(tag)
+        return cleaned[:15]
 
     @field_validator("detected_artists")
     @classmethod
@@ -311,26 +362,186 @@ class BatchResult:
 
 
 # ─────────────────────────────────────────────────────────────
-# Gemini 프롬프트 (v3 — 이중 언어 추출 + K-POP 문화 현지화)
+# Gemini 프롬프트 빌더 (v3 — 번역 티어별 동적 생성)
 # ─────────────────────────────────────────────────────────────
 
-_INTELLIGENCE_PROMPT = textwrap.dedent("""\
-    당신은 K-엔터테인먼트 전문 AI 분석가이자 글로벌 K-POP 콘텐츠 번역가입니다.
-    아래 기사를 분석하고, 정확히 다음 JSON 형식으로만 응답하세요.
-    JSON 외 다른 텍스트(설명, 주석, 마크다운 코드블록 등)는 절대 포함하지 마세요.
+# 공통: 엔티티 분석 규칙 블록 (모든 티어에 포함)
+_ENTITY_RULES = textwrap.dedent("""\
+    ─────────────────────────────────────────────────────────────
+    ▶ 엔티티 분석 규칙 (모든 티어 공통)
+    ─────────────────────────────────────────────────────────────
+    detected_artists: 기사에 직접 언급된 모든 가수·그룹·배우·MC를 포함하세요.
+      - context_hints: 소속사(YG, SM, HYBE 등), 그룹명, 브랜드, 드라마/앨범 제목
+      - entity_type: ARTIST(솔로), GROUP(그룹/팀), EVENT(시상식/행사)
 
-    === 기사 ===
-    제목: {title}
-    본문:
-    {content}
-    === 끝 ===
+    confidence_score (0.0~1.0): 해당 아티스트 탐지의 신뢰도를 직접 평가하세요.
+      - 0.9~1.0: 이름과 문맥이 명확하여 특정 아티스트임을 확신
+      - 0.7~0.9: 대부분 확신하나 일부 모호함
+      - 0.5~0.7: 동명이인이나 문맥 부족으로 불확실
+      - 0.0~0.5: 매우 모호하거나 본문에 직접적인 증거 없음
 
-    응답 JSON 형식:
-    {{
-      "title_ko": "한국어 기사 제목 (원문 또는 요약 정제 형태, 50자 이내)",
-      "title_en": "K-POP Fan-Friendly English Title (NOT a literal translation, max 100 chars)",
-      "detected_artists": [
-        {{
+    is_ambiguous: 동명이인이나 문맥 모호로 정확한 아티스트 특정이 어려우면 true
+      예: '지수' → JISOO(블랙핑크)인지 다른 지수인지 모호하면 true
+      예: '뷔' → BTS V가 명확하면 false
+
+    ambiguity_reason: is_ambiguous=true일 때 모호한 이유 한 문장으로 설명
+
+    sentiment: positive | negative | neutral | mixed
+    relevance_score: K-팝·K-드라마 등 K-엔터 관련도 (0.0~1.0)
+    confidence: 분석 전체 신뢰도 (정보 충분→높게, 부족→낮게)
+    main_category: music|drama|film|fashion|entertainment|award|other
+""")
+
+# 공통: 번역 가이드 블록 (FULL / TITLE_ONLY 티어만)
+_TRANSLATION_RULES = textwrap.dedent("""\
+    ─────────────────────────────────────────────────────────────
+    ▶ 이중 언어 번역 규칙 (CRITICAL — 반드시 준수)
+    ─────────────────────────────────────────────────────────────
+    title_en: 영어 제목은 단순 직역이 아닌, 글로벌 K-POP 팬이 트위터·레딧에서
+      쓸 법한 자연스러운 표현으로 작성하세요. 아티스트 영어명을 우선 사용하세요.
+      예: "방탄소년단, 신곡 공개" → "BTS Drops New Single"
+      예: "블랙핑크 제니, 솔로 컴백 확정" → "BLACKPINK's Jennie Confirms Solo Comeback"
+
+    topic_summary_en: 영어 요약도 단순 직역 금지. 3문장 이내, 글로벌 K-POP 팬
+      커뮤니티(트위터/레딧)에서 사용하는 표현을 활용하세요.
+
+    title_en 과 topic_summary_en 은 반드시 비어있지 않아야 합니다.
+    영어 번역이 어려운 경우에도 최선의 영어 표현을 반드시 제공하세요.
+
+    ─────────────────────────────────────────────────────────────
+    ▶ 한국어 K-엔터 고유 표현 → 영어 변환 가이드 (Localization)
+    ─────────────────────────────────────────────────────────────
+    아래 표현이 기사에 등장하면 괄호 안의 영어 표현으로 번역하세요:
+      역주행        → "viral comeback" / "reverse chart surge"
+      대세돌        → "trending it-idol" / "breakout star"
+      컴백          → "comeback"
+      음방          → "music show performance" / "music show stage"
+      초동          → "first-week sales"
+      더블타이틀    → "double title track"
+      완전체        → "full group lineup" / "all-member"
+      선공개        → "pre-released track" / "pre-release"
+      뮤뱅/뮤직뱅크 → "Music Bank"
+      인기가요      → "Inkigayo"
+      엠카운트다운  → "M Countdown"
+      음원          → "digital single" / "streaming release"
+      차트인         → "chart entry" / "charted on"
+      솔로          → "solo debut" / "solo release"
+      팬미팅        → "fan meeting"
+      월드투어      → "world tour"
+      데뷔          → "debut"
+      타이틀곡      → "title track"
+      수록곡        → "b-side track" / "album track"
+      팬덤          → "fandom"
+      스밍          → "streaming"
+""")
+
+# 공통: SEO 해시태그 규칙 (FULL / TITLE_ONLY 티어만)
+_HASHTAG_RULES_FULL = textwrap.dedent("""\
+    ─────────────────────────────────────────────────────────────
+    ▶ 글로벌 SEO 해시태그 생성 규칙 (seo_hashtags)
+    ─────────────────────────────────────────────────────────────
+    북미/유럽 K-POP 팬들이 X(트위터)·Instagram에서 가장 많이 쓰는 영어 해시태그
+    5~10개를 생성하세요.
+      - 반드시 # 으로 시작 (예: #KPOP, #BTS)
+      - 아티스트 공식 영어명 태그 포함 (예: #BTS, #BLACKPINK)
+      - 장르·트렌드 태그 포함 (예: #KPOP, #KPOPTwitter, #KPOPNews)
+      - 이벤트·앨범 관련 태그 포함 (예: #NewMusic, #Comeback, #MusicVideo)
+      - 팬덤명 태그 포함 시 우선 (예: #ARMY, #BLINK)
+      - 예시: ["#KPOP", "#BTS", "#ARMY", "#NewSingle", "#KPOPTwitter"]
+""")
+
+_HASHTAG_RULES_TITLE_ONLY = textwrap.dedent("""\
+    ─────────────────────────────────────────────────────────────
+    ▶ SEO 해시태그 생성 규칙 (seo_hashtags — 5~7개)
+    ─────────────────────────────────────────────────────────────
+    아티스트명 + 장르 + 이벤트 관련 영어 해시태그 5~7개를 생성하세요.
+      - 반드시 # 으로 시작
+      - 예시: ["#KPOP", "#ArtistName", "#NewMusic", "#Comeback", "#KPOPNews"]
+""")
+
+
+def _build_glossary_section(glossary: list[dict]) -> str:
+    """
+    DB glossary 데이터를 프롬프트 삽입용 문자열로 변환합니다.
+
+    카테고리별로 그룹화하여 아티스트 → 소속사 → 공연/방송 순으로 출력합니다.
+    glossary 가 비어있으면 빈 문자열을 반환합니다.
+    """
+    if not glossary:
+        return ""
+
+    by_cat: dict[str, list[dict]] = {}
+    for entry in glossary:
+        cat = entry.get("category", "OTHER")
+        by_cat.setdefault(cat, []).append(entry)
+
+    cat_labels = {
+        "ARTIST": "아티스트/그룹명",
+        "AGENCY": "소속사명",
+        "EVENT":  "공연·방송·시상식명",
+    }
+
+    lines = [
+        "─────────────────────────────────────────────────────────────",
+        "▶ 필수 영문 표기 가이드 (Glossary — 반드시 준수)",
+        "─────────────────────────────────────────────────────────────",
+        "아래 한국어 표현은 반드시 지정된 영어 표기를 사용하세요:",
+    ]
+    for cat_key in ("ARTIST", "AGENCY", "EVENT"):
+        entries = by_cat.get(cat_key, [])
+        if not entries:
+            continue
+        lines.append(f"\n  [{cat_labels.get(cat_key, cat_key)}]")
+        for e in entries:
+            ko = e.get("term_ko", "")
+            en = e.get("term_en", "")
+            if ko and en:
+                desc = e.get("description", "")
+                suffix = f"  ({desc})" if desc else ""
+                lines.append(f"    {ko} → {en}{suffix}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _build_prompt(
+    title: str,
+    content: str,
+    tier: TranslationTier,
+    glossary: Optional[list[dict]] = None,
+) -> str:
+    """
+    번역 티어 + 용어 사전을 기반으로 Gemini 프롬프트를 동적으로 생성합니다.
+
+    Tier별 차이:
+        FULL       : 전체 이중 언어 분석 + 용어 사전 + SEO 해시태그 (5~10개)
+        TITLE_ONLY : 영문 제목 + 3문장 요약 + 용어 사전 + SEO 해시태그 (5~7개)
+        KO_ONLY    : 한국어 엔티티 추출만 (번역·사전·해시태그 없음)
+    """
+    glossary = glossary or []
+
+    # ── 공통: 시스템 역할 선언 ─────────────────────────────
+    if tier == TranslationTier.KO_ONLY:
+        role_line = (
+            "당신은 K-엔터테인먼트 전문 AI 분석가입니다.\n"
+            "아래 기사에서 한국어 엔티티만 추출하세요. 영어 번역은 불필요합니다."
+        )
+    else:
+        role_line = (
+            "당신은 K-엔터테인먼트 전문 AI 분석가이자 글로벌 K-POP 콘텐츠 번역가입니다.\n"
+            "아래 기사를 분석하고 이중 언어 데이터를 생성하세요."
+        )
+
+    # ── 공통: 기사 본문 ───────────────────────────────────
+    article_block = (
+        f"=== 기사 ===\n"
+        f"제목: {title}\n"
+        f"본문:\n{content}\n"
+        f"=== 끝 ==="
+    )
+
+    # ── 티어별 JSON 응답 형식 ─────────────────────────────
+    artist_schema = textwrap.dedent("""\
+        {
           "name_ko": "한국어 아티스트명",
           "name_en": "English name or null",
           "context_hints": ["소속사", "그룹명", "브랜드"],
@@ -340,82 +551,89 @@ _INTELLIGENCE_PROMPT = textwrap.dedent("""\
           "confidence_score": 0.95,
           "is_ambiguous": false,
           "ambiguity_reason": null
-        }}
-      ],
-      "topic_summary": "핵심 주제 요약 (3문장 이내, 한국어)",
-      "topic_summary_en": "Key summary in English (max 3 sentences, K-POP fan-friendly tone)",
-      "sentiment": "positive",
-      "relevance_score": 0.95,
-      "main_category": "music",
-      "confidence": 0.88
-    }}
+        }""")
 
-    ─────────────────────────────────────────────────────────────
-    ▶ 이중 언어 번역 규칙 (CRITICAL — 반드시 준수)
-    ─────────────────────────────────────────────────────────────
-    1. title_en: 영어 제목은 단순 직역이 아닌, 글로벌 K-POP 팬이 트위터·레딧에서
-       쓸 법한 자연스러운 표현으로 작성하세요. 아티스트 영어명을 우선 사용하세요.
-       예: "방탄소년단, 신곡 공개" → "BTS Drops New Single"
-       예: "블랙핑크 제니, 솔로 컴백 확정" → "BLACKPINK's Jennie Confirms Solo Comeback"
+    if tier == TranslationTier.KO_ONLY:
+        json_schema = textwrap.dedent(f"""\
+            응답 JSON 형식 (한국어 엔티티 추출 — 영어 필드 제외):
+            {{{{
+              "detected_artists": [
+                {artist_schema}
+              ],
+              "topic_summary": "핵심 주제 요약 (2문장 이내, 한국어)",
+              "sentiment": "positive",
+              "relevance_score": 0.95,
+              "main_category": "music",
+              "confidence": 0.88
+            }}}}""")
+    elif tier == TranslationTier.TITLE_ONLY:
+        json_schema = textwrap.dedent(f"""\
+            응답 JSON 형식 (영문 제목 + 3문장 요약 번역):
+            {{{{
+              "title_ko": "한국어 기사 제목 (50자 이내)",
+              "title_en": "K-POP Fan-Friendly English Title (max 100 chars)",
+              "detected_artists": [
+                {artist_schema}
+              ],
+              "topic_summary": "핵심 주제 요약 (2문장 이내, 한국어)",
+              "topic_summary_en": "Key summary in English (max 3 sentences, K-POP fan-friendly)",
+              "seo_hashtags": ["#KPOP", "#ArtistName", "#NewMusic"],
+              "sentiment": "positive",
+              "relevance_score": 0.95,
+              "main_category": "music",
+              "confidence": 0.88
+            }}}}""")
+    else:  # FULL
+        json_schema = textwrap.dedent(f"""\
+            응답 JSON 형식 (전체 이중 언어 번역):
+            {{{{
+              "title_ko": "한국어 기사 제목 (50자 이내)",
+              "title_en": "K-POP Fan-Friendly English Title (NOT a literal translation, max 100 chars)",
+              "detected_artists": [
+                {artist_schema}
+              ],
+              "topic_summary": "핵심 주제 요약 (3문장 이내, 한국어)",
+              "topic_summary_en": "Key summary in English (max 3 sentences, K-POP fan-friendly tone)",
+              "seo_hashtags": ["#KPOP", "#BTS", "#NewMusic", "#KPOPTwitter"],
+              "sentiment": "positive",
+              "relevance_score": 0.95,
+              "main_category": "music",
+              "confidence": 0.88
+            }}}}""")
 
-    2. topic_summary_en: 영어 요약도 단순 직역 금지. 3문장 이내, 글로벌 K-POP 팬
-       커뮤니티(트위터/레딧)에서 사용하는 표현을 활용하세요.
+    # ── 부가 규칙 섹션 조합 ───────────────────────────────
+    sections: list[str] = []
 
-    3. title_en 과 topic_summary_en 은 반드시 비어있지 않아야 합니다.
-       영어 번역이 어려운 경우에도 최선의 영어 표현을 반드시 제공하세요.
+    # 용어 사전 주입 (FULL / TITLE_ONLY 만)
+    if tier != TranslationTier.KO_ONLY:
+        glossary_section = _build_glossary_section(glossary)
+        if glossary_section:
+            sections.append(glossary_section)
 
-    ─────────────────────────────────────────────────────────────
-    ▶ 한국어 K-엔터 고유 표현 → 영어 변환 가이드 (Localization)
-    ─────────────────────────────────────────────────────────────
-    아래 표현이 기사에 등장하면 괄호 안의 영어 표현으로 번역하세요:
-      역주행         → "viral comeback" / "reverse chart surge"
-      대세돌         → "trending it-idol" / "breakout star"
-      컴백           → "comeback"
-      음방           → "music show performance" / "music show stage"
-      초동           → "first-week sales"
-      더블타이틀     → "double title track"
-      완전체         → "full group lineup" / "all-member"
-      선공개         → "pre-released track" / "pre-release"
-      뮤뱅/뮤직뱅크  → "Music Bank"
-      인기가요       → "Inkigayo"
-      엠카운트다운   → "M Countdown"
-      음원           → "digital single" / "streaming release"
-      차트인          → "chart entry" / "charted on"
-      솔로           → "solo debut" / "solo release"
-      팬미팅         → "fan meeting"
-      월드투어       → "world tour"
-      데뷔           → "debut"
-      타이틀곡       → "title track"
-      수록곡         → "b-side track" / "album track"
-      팬덤           → "fandom"
-      스밍           → "streaming"
+    # 번역 규칙 (FULL / TITLE_ONLY 만)
+    if tier != TranslationTier.KO_ONLY:
+        sections.append(_TRANSLATION_RULES)
 
-    ─────────────────────────────────────────────────────────────
-    ▶ 엔티티 분석 규칙
-    ─────────────────────────────────────────────────────────────
-    4. detected_artists: 기사에 직접 언급된 모든 가수·그룹·배우·MC를 포함하세요.
-       - context_hints: 소속사(YG, SM, HYBE 등), 그룹명, 브랜드, 드라마/앨범 제목
-       - entity_type: ARTIST(솔로), GROUP(그룹/팀), EVENT(시상식/행사)
+    # SEO 해시태그 규칙
+    if tier == TranslationTier.FULL:
+        sections.append(_HASHTAG_RULES_FULL)
+    elif tier == TranslationTier.TITLE_ONLY:
+        sections.append(_HASHTAG_RULES_TITLE_ONLY)
 
-    5. confidence_score (0.0~1.0): 해당 아티스트 탐지의 신뢰도를 직접 평가하세요.
-       - 0.9~1.0: 이름과 문맥이 명확하여 특정 아티스트임을 확신
-       - 0.7~0.9: 대부분 확신하나 일부 모호함
-       - 0.5~0.7: 동명이인이나 문맥 부족으로 불확실
-       - 0.0~0.5: 매우 모호하거나 본문에 직접적인 증거 없음
+    # 엔티티 분석 규칙 (모든 티어)
+    sections.append(_ENTITY_RULES)
 
-    6. is_ambiguous: 동명이인이나 문맥 모호로 정확한 아티스트 특정이 어려우면 true
-       예시:
-         - '지수' → 블랙핑크 지수(JISOO)인지 다른 지수인지 모호하면 true
-         - '뷔' → BTS 뷔(V)가 명확하면 false
-         - '로제' → 블랙핑크 로제가 명확하면 false
-
-    7. ambiguity_reason: is_ambiguous=true일 때 모호한 이유를 한 문장으로 설명
-
-    8. sentiment: positive | negative | neutral | mixed
-    9. relevance_score: K-팝·K-드라마 등 K-엔터 관련도 (0.0~1.0)
-    10. confidence: 분석 전체 신뢰도 (정보 충분→높게, 부족→낮게)
-    11. main_category: music|drama|film|fashion|entertainment|award|other
-""")
+    prompt_parts = [
+        role_line,
+        "JSON 외 다른 텍스트(설명, 주석, 마크다운 코드블록 등)는 절대 포함하지 마세요.",
+        "",
+        article_block,
+        "",
+        json_schema,
+        "",
+        *sections,
+    ]
+    return "\n".join(prompt_parts)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -522,18 +740,18 @@ def _update_article_status(
     article_id: int,
     status: str,
     topic_summary: Optional[str] = None,
-    system_note: Optional[str] = None,    # [v2]
-    title_en: Optional[str] = None,       # [v3] K-POP 팬 친화적 영문 제목
-    summary_en: Optional[str] = None,     # [v3] 영문 요약
+    system_note: Optional[str] = None,         # [v2]
+    title_en: Optional[str] = None,            # [v3] K-POP 팬 친화적 영문 제목
+    summary_en: Optional[str] = None,          # [v3] 영문 요약
+    hashtags_en: Optional[list[str]] = None,   # [v3] SEO 해시태그 단순 배열
+    seo_hashtags: Optional[dict] = None,       # [v3] SEO 해시태그 JSONB (메타데이터 포함)
 ) -> None:
     """
     기사 process_status 를 갱신합니다.
 
-    [v2] system_note: MANUAL_REVIEW 사유. 기존 노트를 덮어씁니다.
-         NULL 을 전달하면 system_note 는 변경하지 않습니다 (COALESCE 방식으로 보존).
-         빈 문자열을 전달하면 명시적으로 NULL 로 초기화합니다.
-
-    [v3] title_en / summary_en: NULL 전달 시 기존 값 유지. 값 전달 시 갱신.
+    [v2] system_note: MANUAL_REVIEW 사유. NULL → 기존 유지, '' → 명시적 NULL 초기화.
+    [v3] title_en / summary_en / hashtags_en / seo_hashtags:
+         NULL 전달 시 기존 값 유지. 값 전달 시 갱신.
     """
     with _conn() as conn:
         with conn.cursor() as cur:
@@ -547,6 +765,8 @@ def _update_article_status(
                                        ),
                        title_en      = CASE WHEN %s IS NOT NULL THEN %s ELSE title_en END,
                        summary_en    = CASE WHEN %s IS NOT NULL THEN %s ELSE summary_en END,
+                       hashtags_en   = CASE WHEN %s IS NOT NULL THEN %s ELSE hashtags_en END,
+                       seo_hashtags  = CASE WHEN %s IS NOT NULL THEN %s::jsonb ELSE seo_hashtags END,
                        system_note   = CASE
                                            WHEN %s = '' THEN NULL
                                            WHEN %s IS NOT NULL THEN %s
@@ -557,14 +777,18 @@ def _update_article_status(
                 """,
                 (
                     status,
-                    topic_summary or None,    # summary_ko fallback
-                    title_en,                 # CASE: title_en IS NOT NULL → update
-                    title_en,                 # SET title_en
-                    summary_en,               # CASE: summary_en IS NOT NULL → update
-                    summary_en,               # SET summary_en
-                    system_note or "",        # CASE: empty string → NULL
-                    system_note,              # CASE: not null → update
-                    system_note,              # SET value
+                    topic_summary or None,       # summary_ko fallback
+                    title_en,                    # CASE: title_en IS NOT NULL → update
+                    title_en,                    # SET title_en
+                    summary_en,                  # CASE: summary_en IS NOT NULL → update
+                    summary_en,                  # SET summary_en
+                    hashtags_en,                 # CASE: hashtags_en IS NOT NULL → update
+                    hashtags_en,                 # SET hashtags_en (TEXT[])
+                    json.dumps(seo_hashtags, ensure_ascii=False) if seo_hashtags else None,
+                    json.dumps(seo_hashtags, ensure_ascii=False) if seo_hashtags else None,
+                    system_note or "",           # CASE: empty string → NULL
+                    system_note,                 # CASE: not null → update
+                    system_note,                 # SET value
                     article_id,
                 ),
             )
@@ -644,6 +868,41 @@ def _read_pending_articles_dry(
             rows = cur.fetchall()
 
     return [dict(r) for r in rows]
+
+
+def _get_glossary_from_db() -> list[dict]:
+    """
+    glossary 테이블에서 용어 사전을 조회합니다.
+
+    term_ko / term_en / category / description 을 반환합니다.
+    테이블이 없거나 오류 발생 시 빈 리스트를 반환하여 정상 진행을 보장합니다.
+    """
+    try:
+        with _conn() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT term_ko, term_en, category, description
+                    FROM   glossary
+                    WHERE  term_en IS NOT NULL
+                    ORDER  BY
+                        CASE category
+                            WHEN 'ARTIST' THEN 1
+                            WHEN 'AGENCY' THEN 2
+                            WHEN 'EVENT'  THEN 3
+                            ELSE 4
+                        END,
+                        term_ko
+                    LIMIT 300
+                """)
+                rows = cur.fetchall()
+        result = [dict(r) for r in rows]
+        log.debug("glossary 로드 | count=%d", len(result))
+        return result
+    except Exception as exc:
+        log.warning(
+            "glossary 테이블 조회 실패 — 용어 사전 없이 진행 | err=%r", exc
+        )
+        return []
 
 
 def _log_to_system(
@@ -733,6 +992,10 @@ class IntelligenceEngine:
         self._genai_model = None
         self._artists_cache: list[dict] = []
         self._cache_loaded_at: float = 0.0
+
+        # [v3] 용어 사전 캐시 (TTL: _GLOSSARY_CACHE_TTL)
+        self._glossary_cache: list[dict] = []
+        self._glossary_loaded_at: float = 0.0
 
         log.info(
             "IntelligenceEngine v3 초기화 | model=%s batch_size=%d "
@@ -835,6 +1098,77 @@ class IntelligenceEngine:
             self._cache_loaded_at = now
             log.debug("아티스트 캐시 갱신 | count=%d", len(self._artists_cache))
         return self._artists_cache
+
+    def _get_glossary(self, force: bool = False) -> list[dict]:
+        """
+        [v3] 용어 사전을 메모리 캐시에서 반환 (TTL: _GLOSSARY_CACHE_TTL, 기본 10분).
+
+        glossary 테이블 조회 실패 시 빈 리스트를 반환합니다.
+        """
+        now = time.monotonic()
+        if (
+            force
+            or not self._glossary_cache
+            or (now - self._glossary_loaded_at) > _GLOSSARY_CACHE_TTL
+        ):
+            self._glossary_cache = _get_glossary_from_db()
+            self._glossary_loaded_at = now
+            log.debug("용어 사전 캐시 갱신 | count=%d", len(self._glossary_cache))
+        return self._glossary_cache
+
+    def _get_translation_tier(self, article: dict) -> TranslationTier:
+        """
+        [v3] 기사의 아티스트 global_priority 를 조회하여 번역 티어를 결정합니다.
+
+        article["artist_name_ko"] 를 artists 캐시에서 검색하여 best priority(최솟값)를
+        찾습니다. 여러 아티스트가 매칭되면 가장 높은 우선순위(가장 작은 숫자)를 사용합니다.
+
+        매핑:
+            priority 1   → TranslationTier.FULL        (전체 번역)
+            priority 2   → TranslationTier.TITLE_ONLY  (제목+요약만)
+            priority 3   → TranslationTier.KO_ONLY     (한국어만)
+            NULL / 미발견 → TranslationTier.FULL        (기본값, 누락 방지)
+        """
+        artist_name = (article.get("artist_name_ko") or "").strip()
+        if not artist_name:
+            log.debug("artist_name_ko 없음 — FULL 티어 기본값 적용")
+            return TranslationTier.FULL
+
+        artists = self._get_artists()
+        best_priority: Optional[int] = None
+
+        for artist in artists:
+            cand_ko = (artist.get("name_ko") or "").strip()
+            if not cand_ko:
+                continue
+            if (
+                artist_name == cand_ko
+                or artist_name in cand_ko
+                or cand_ko in artist_name
+            ):
+                prio = artist.get("global_priority")
+                if prio is not None:
+                    if best_priority is None or prio < best_priority:
+                        best_priority = prio
+
+        if best_priority is None:
+            log.debug(
+                "artist_name_ko=%r — priority 미분류(NULL/미발견) → FULL 티어",
+                artist_name,
+            )
+            return TranslationTier.FULL
+        elif best_priority <= 1:
+            log.debug("artist_name_ko=%r — priority=1 → FULL 티어", artist_name)
+            return TranslationTier.FULL
+        elif best_priority <= 2:
+            log.debug("artist_name_ko=%r — priority=2 → TITLE_ONLY 티어", artist_name)
+            return TranslationTier.TITLE_ONLY
+        else:
+            log.debug(
+                "artist_name_ko=%r — priority=%d → KO_ONLY 티어",
+                artist_name, best_priority,
+            )
+            return TranslationTier.KO_ONLY
 
     # ── 매칭 점수 계산 ─────────────────────────────────────
 
@@ -962,20 +1296,23 @@ class IntelligenceEngine:
         self,
         intelligence: ArticleIntelligence,
         linked: list[dict],
+        tier: TranslationTier = TranslationTier.FULL,    # [v3]
     ) -> tuple[str, Optional[str]]:
         """
-        [v2] 처리 결과를 기반으로 최종 상태와 system_note 를 결정합니다.
+        [v3] 처리 결과를 기반으로 최종 상태와 system_note 를 결정합니다.
 
         PROCESSED 조건 (모두 충족):
             1. 모든 DetectedArtist.confidence_score ≥ _ENTITY_CONFIDENCE_THRESHOLD(0.80)
             2. 모든 DetectedArtist.is_ambiguous == False
             3. relevance_score ≥ _MIN_RELEVANCE (0.30)
             4. overall confidence ≥ _MIN_CONFIDENCE (0.60)
+            5. [v3 FULL/TITLE_ONLY] title_en + topic_summary_en 모두 비어있지 않음
 
         MANUAL_REVIEW 조건 (하나라도 해당):
             - 엔티티 confidence_score < 0.80
             - is_ambiguous = True (동명이인/문맥 모호)
             - relevance_score 또는 overall confidence 임계값 미달
+            - [v3 FULL/TITLE_ONLY] 영문 번역 필드 누락
 
         Returns:
             (status, system_note)
@@ -1009,11 +1346,16 @@ class IntelligenceEngine:
                 f"({intelligence.confidence:.2f} < {_MIN_CONFIDENCE:.2f})"
             )
 
-        # ── 3. [v3] 영문 번역 검증 ───────────────────────
-        if not (intelligence.title_en or "").strip():
-            reasons.append("영문 제목(title_en) 누락 — Gemini 번역 미생성")
-        if not (intelligence.topic_summary_en or "").strip():
-            reasons.append("영문 요약(topic_summary_en) 누락 — Gemini 번역 미생성")
+        # ── 3. [v3] 영문 번역 검증 (FULL / TITLE_ONLY 티어만) ──
+        if tier != TranslationTier.KO_ONLY:
+            if not (intelligence.title_en or "").strip():
+                reasons.append(
+                    f"영문 제목(title_en) 누락 — Gemini 번역 미생성 (tier={tier.value})"
+                )
+            if not (intelligence.topic_summary_en or "").strip():
+                reasons.append(
+                    f"영문 요약(topic_summary_en) 누락 — Gemini 번역 미생성 (tier={tier.value})"
+                )
 
         if reasons:
             note = "MANUAL_REVIEW 사유: " + "; ".join(reasons)
@@ -1031,9 +1373,13 @@ class IntelligenceEngine:
         self,
         title_ko:   Optional[str],
         content_ko: Optional[str],
+        tier: TranslationTier = TranslationTier.FULL,       # [v3]
+        glossary: Optional[list[dict]] = None,              # [v3]
     ) -> tuple[ArticleIntelligence, GeminiCallMetrics]:
         """
-        [v2] Gemini API 를 호출하여 기사의 엔티티/지식을 추출합니다.
+        [v3] Gemini API 를 호출하여 기사의 엔티티/지식을 추출합니다.
+
+        tier 에 따라 동적으로 프롬프트를 생성하고 용어 사전을 주입합니다.
 
         Returns:
             (ArticleIntelligence, GeminiCallMetrics)
@@ -1046,7 +1392,16 @@ class IntelligenceEngine:
         if not content:
             log.warning("content_ko 없음 — 제목만으로 분석 (신뢰도 낮을 수 있음)")
 
-        prompt = _INTELLIGENCE_PROMPT.format(title=title, content=content)
+        prompt = _build_prompt(
+            title=title,
+            content=content,
+            tier=tier,
+            glossary=glossary,
+        )
+        log.debug(
+            "Gemini 프롬프트 생성 | tier=%s glossary=%d chars=%d",
+            tier.value, len(glossary or []), len(prompt),
+        )
         raw, metrics = self._call_gemini(prompt)
         data   = self._parse_json(raw)
         result = ArticleIntelligence.model_validate(data)
@@ -1103,10 +1458,22 @@ class IntelligenceEngine:
         t_start    = time.monotonic()
 
         try:
+            # ── 0. [v3] 번역 티어 결정 + 용어 사전 로드 ──
+            tier     = self._get_translation_tier(article)
+            glossary = self._get_glossary() if tier != TranslationTier.KO_ONLY else []
+            log.info(
+                "번역 티어 결정 | article_id=%d tier=%s artist=%r glossary=%d",
+                article_id, tier.value,
+                (article.get("artist_name_ko") or "")[:30],
+                len(glossary),
+            )
+
             # ── 1. Gemini 추출 ───────────────────────────
             intelligence, metrics = self._extract_intelligence(
                 title_ko   = article.get("title_ko"),
                 content_ko = article.get("content_ko"),
+                tier       = tier,       # [v3]
+                glossary   = glossary,   # [v3]
             )
 
             # ── 2. 컨텍스트 링킹 ────────────────────────
@@ -1130,7 +1497,18 @@ class IntelligenceEngine:
                 )
 
             # ── 4. 조건부 상태 결정 ──────────────────────
-            final_status, system_note = self._decide_status(intelligence, linked)
+            final_status, system_note = self._decide_status(intelligence, linked, tier)
+
+            # ── 4b. [v3] SEO 해시태그 JSONB 구성 ────────
+            seo_hashtags_dict: Optional[dict] = None
+            if intelligence.seo_hashtags and tier != TranslationTier.KO_ONLY:
+                seo_hashtags_dict = {
+                    "tags":         intelligence.seo_hashtags,
+                    "model":        self.model_name,
+                    "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "confidence":   round(intelligence.confidence, 4),
+                    "tier":         tier.value,
+                }
 
             # ── 5. DB 업데이트 ───────────────────────────
             if not dry_run:
@@ -1139,8 +1517,10 @@ class IntelligenceEngine:
                     final_status,
                     topic_summary = intelligence.topic_summary or None,
                     system_note   = system_note,
-                    title_en      = intelligence.title_en or None,   # [v3]
+                    title_en      = intelligence.title_en or None,          # [v3]
                     summary_en    = intelligence.topic_summary_en or None,  # [v3]
+                    hashtags_en   = intelligence.seo_hashtags or None,      # [v3]
+                    seo_hashtags  = seo_hashtags_dict,                      # [v3]
                 )
 
             duration_ms = int((time.monotonic() - t_start) * 1000)
@@ -1150,6 +1530,7 @@ class IntelligenceEngine:
                 preview = {
                     "article_id":      article_id,
                     "title_ko":        (article.get("title_ko") or "")[:80],
+                    "translation_tier": tier.value,                          # [v3]
                     "status_would_be": final_status,
                     "system_note":     system_note,
                     "intelligence": {
@@ -1157,6 +1538,7 @@ class IntelligenceEngine:
                         "title_en":          intelligence.title_en,          # [v3]
                         "topic_summary":     intelligence.topic_summary,
                         "topic_summary_en":  intelligence.topic_summary_en,  # [v3]
+                        "seo_hashtags":      intelligence.seo_hashtags,      # [v3]
                         "sentiment":         intelligence.sentiment,
                         "relevance_score":   intelligence.relevance_score,
                         "confidence":        intelligence.confidence,
@@ -1165,9 +1547,10 @@ class IntelligenceEngine:
                             a.model_dump() for a in intelligence.detected_artists
                         ],
                     },
-                    "linked_artists":  linked,
-                    "entity_mappings": entity_records,
-                    "token_metrics":   metrics.to_dict(),
+                    "linked_artists":    linked,
+                    "entity_mappings":   entity_records,
+                    "seo_hashtags_dict": seo_hashtags_dict,                  # [v3]
+                    "token_metrics":     metrics.to_dict(),
                 }
                 log.info(
                     "[DRY RUN] article_id=%d → status_would_be=%s | "
@@ -1203,8 +1586,10 @@ class IntelligenceEngine:
                     details     = {
                         "status":             final_status,
                         "system_note":        system_note,
+                        "translation_tier":   tier.value,                    # [v3]
                         "title_en":           intelligence.title_en,          # [v3]
                         "topic_summary_en":   intelligence.topic_summary_en,  # [v3]
+                        "seo_hashtags":       intelligence.seo_hashtags,      # [v3]
                         "sentiment":          intelligence.sentiment,
                         "relevance_score":    intelligence.relevance_score,
                         "confidence":         intelligence.confidence,
