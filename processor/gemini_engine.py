@@ -1,25 +1,37 @@
 """
-processor/gemini_engine.py — Phase 4: Gemini Entity Extraction Engine (v2)
+processor/gemini_engine.py — Phase 4: Gemini Entity Extraction Engine (v3)
 
 역할:
     1. Structured Output (엔티티별 신뢰도 포함)
        ArticleIntelligence Pydantic 모델로 Gemini 응답 형식을 강제합니다.
        DetectedArtist 에 confidence_score / is_ambiguous / ambiguity_reason 추가.
 
-    2. Contextual Linking
+    2. 이중 언어 추출 (v3 신규)
+       한 번의 Gemini 호출로 한국어 + 영어 제목·요약을 동시에 생성합니다.
+         - title_ko / topic_summary      : 한국어 (원문 기반)
+         - title_en / topic_summary_en   : 영어 (K-POP 팬 친화적, 직역 금지)
+       영문 필드 누락 시 → MANUAL_REVIEW 자동 라우팅.
+
+    3. K-POP 문화 현지화 (v3 신규)
+       한국어 K-엔터 고유 표현('역주행', '대세돌' 등)을 영어권 팬이 이해하는
+       표현('viral comeback', 'trending it-idol' 등)으로 변환하도록 Gemini 를
+       가이드합니다.
+
+    4. Contextual Linking
        탐지된 아티스트명의 문맥(소속사, 그룹, 브랜드 등)을 분석하여
        DB artists 테이블의 아티스트 ID와 매칭합니다.
 
-    3. 조건부 상태 전환 (_decide_status)
+    5. 조건부 상태 전환 (_decide_status)
        ┌ PROCESSED     : 모든 엔티티 confidence_score ≥ 0.80
        │                 AND 모호한 엔티티 없음 (is_ambiguous=False)
        │                 AND relevance_score ≥ 0.30
        │                 AND overall confidence ≥ 0.60
+       │                 AND title_en / topic_summary_en 모두 비어있지 않음 (v3)
        ├ MANUAL_REVIEW : 위 조건 중 하나라도 미충족
        │                 → system_note 에 AI 판단 모호 이유 기록
        └ ERROR         : Gemini 호출 실패 / JSON 파싱 실패 / DB 오류
 
-    4. 비용 분석 로그 (GeminiCallMetrics)
+    6. 비용 분석 로그 (GeminiCallMetrics)
        Gemini API 호출마다 prompt_tokens, completion_tokens,
        total_tokens, response_time_ms 를 측정하여
        system_logs.details 에 기록합니다.
@@ -145,13 +157,34 @@ class DetectedArtist(BaseModel):
 
 class ArticleIntelligence(BaseModel):
     """
-    processor/gemini_engine.py 전용 Gemini 구조화 응답 모델 (v2).
+    processor/gemini_engine.py 전용 Gemini 구조화 응답 모델 (v3).
 
     scraper/gemini_engine.py 의 ArticleExtracted 와 별개:
       - ArticleExtracted:    스크래핑 시 제목/본문/해시태그 추출 (Phase 3)
       - ArticleIntelligence: 저장된 기사의 엔티티/지식 추출   (Phase 4)
+
+    v3 신규 필드:
+      - title_ko         : 한국어 기사 제목 (Gemini 확인/정제)
+      - title_en         : K-POP 팬 친화적 영어 제목 (직역 금지)
+      - topic_summary_en : 핵심 주제 영문 요약 (3문장 이내, K-POP 팬 친화적)
     """
 
+    # ── v3: 이중 언어 제목 ───────────────────────────────────
+    title_ko: str = Field(
+        "",
+        max_length=300,
+        description="한국어 기사 제목 (Gemini 확인/정제, 원문 기반)",
+    )
+    title_en: str = Field(
+        "",
+        max_length=300,
+        description=(
+            "K-POP 팬 친화적 영어 제목 (직역 금지).\n"
+            "  - 아티스트 영어명 우선 사용\n"
+            "  - 글로벌 SNS 에서 통용되는 K-POP 표현 활용\n"
+            "  - 비어있으면 → MANUAL_REVIEW 자동 라우팅"
+        ),
+    )
     detected_artists: list[DetectedArtist] = Field(
         default_factory=list,
         description="기사에 등장하는 모든 아티스트/그룹/행사",
@@ -160,6 +193,17 @@ class ArticleIntelligence(BaseModel):
         "",
         max_length=300,
         description="핵심 주제 요약 (300자 이내, 한국어)",
+    )
+    # ── v3: 영문 요약 ────────────────────────────────────────
+    topic_summary_en: str = Field(
+        "",
+        max_length=500,
+        description=(
+            "핵심 주제 영문 요약 (3문장 이내, K-POP 팬 친화적).\n"
+            "  - 단순 직역 금지\n"
+            "  - 역주행→'viral comeback', 대세돌→'trending it-idol' 등 현지화 적용\n"
+            "  - 비어있으면 → MANUAL_REVIEW 자동 라우팅"
+        ),
     )
     sentiment: Literal["positive", "negative", "neutral", "mixed"] = Field(
         "neutral",
@@ -181,9 +225,19 @@ class ArticleIntelligence(BaseModel):
         description="전체 분석 신뢰도",
     )
 
+    @field_validator("title_ko", "title_en")
+    @classmethod
+    def _strip_title(cls, v: str) -> str:
+        return v.strip()
+
     @field_validator("topic_summary")
     @classmethod
     def _clean_summary(cls, v: str) -> str:
+        return v.strip()
+
+    @field_validator("topic_summary_en")
+    @classmethod
+    def _clean_summary_en(cls, v: str) -> str:
         return v.strip()
 
     @field_validator("detected_artists")
@@ -257,11 +311,11 @@ class BatchResult:
 
 
 # ─────────────────────────────────────────────────────────────
-# Gemini 프롬프트 (v2 — 엔티티별 신뢰도 포함)
+# Gemini 프롬프트 (v3 — 이중 언어 추출 + K-POP 문화 현지화)
 # ─────────────────────────────────────────────────────────────
 
 _INTELLIGENCE_PROMPT = textwrap.dedent("""\
-    당신은 K-엔터테인먼트 전문 AI 분석가입니다.
+    당신은 K-엔터테인먼트 전문 AI 분석가이자 글로벌 K-POP 콘텐츠 번역가입니다.
     아래 기사를 분석하고, 정확히 다음 JSON 형식으로만 응답하세요.
     JSON 외 다른 텍스트(설명, 주석, 마크다운 코드블록 등)는 절대 포함하지 마세요.
 
@@ -273,6 +327,8 @@ _INTELLIGENCE_PROMPT = textwrap.dedent("""\
 
     응답 JSON 형식:
     {{
+      "title_ko": "한국어 기사 제목 (원문 또는 요약 정제 형태, 50자 이내)",
+      "title_en": "K-POP Fan-Friendly English Title (NOT a literal translation, max 100 chars)",
       "detected_artists": [
         {{
           "name_ko": "한국어 아티스트명",
@@ -286,36 +342,79 @@ _INTELLIGENCE_PROMPT = textwrap.dedent("""\
           "ambiguity_reason": null
         }}
       ],
-      "topic_summary": "100자 이내 핵심 요약",
+      "topic_summary": "핵심 주제 요약 (3문장 이내, 한국어)",
+      "topic_summary_en": "Key summary in English (max 3 sentences, K-POP fan-friendly tone)",
       "sentiment": "positive",
       "relevance_score": 0.95,
       "main_category": "music",
       "confidence": 0.88
     }}
 
-    분석 규칙:
-    1. detected_artists: 기사에 직접 언급된 모든 가수·그룹·배우·MC를 포함하세요.
+    ─────────────────────────────────────────────────────────────
+    ▶ 이중 언어 번역 규칙 (CRITICAL — 반드시 준수)
+    ─────────────────────────────────────────────────────────────
+    1. title_en: 영어 제목은 단순 직역이 아닌, 글로벌 K-POP 팬이 트위터·레딧에서
+       쓸 법한 자연스러운 표현으로 작성하세요. 아티스트 영어명을 우선 사용하세요.
+       예: "방탄소년단, 신곡 공개" → "BTS Drops New Single"
+       예: "블랙핑크 제니, 솔로 컴백 확정" → "BLACKPINK's Jennie Confirms Solo Comeback"
+
+    2. topic_summary_en: 영어 요약도 단순 직역 금지. 3문장 이내, 글로벌 K-POP 팬
+       커뮤니티(트위터/레딧)에서 사용하는 표현을 활용하세요.
+
+    3. title_en 과 topic_summary_en 은 반드시 비어있지 않아야 합니다.
+       영어 번역이 어려운 경우에도 최선의 영어 표현을 반드시 제공하세요.
+
+    ─────────────────────────────────────────────────────────────
+    ▶ 한국어 K-엔터 고유 표현 → 영어 변환 가이드 (Localization)
+    ─────────────────────────────────────────────────────────────
+    아래 표현이 기사에 등장하면 괄호 안의 영어 표현으로 번역하세요:
+      역주행         → "viral comeback" / "reverse chart surge"
+      대세돌         → "trending it-idol" / "breakout star"
+      컴백           → "comeback"
+      음방           → "music show performance" / "music show stage"
+      초동           → "first-week sales"
+      더블타이틀     → "double title track"
+      완전체         → "full group lineup" / "all-member"
+      선공개         → "pre-released track" / "pre-release"
+      뮤뱅/뮤직뱅크  → "Music Bank"
+      인기가요       → "Inkigayo"
+      엠카운트다운   → "M Countdown"
+      음원           → "digital single" / "streaming release"
+      차트인          → "chart entry" / "charted on"
+      솔로           → "solo debut" / "solo release"
+      팬미팅         → "fan meeting"
+      월드투어       → "world tour"
+      데뷔           → "debut"
+      타이틀곡       → "title track"
+      수록곡         → "b-side track" / "album track"
+      팬덤           → "fandom"
+      스밍           → "streaming"
+
+    ─────────────────────────────────────────────────────────────
+    ▶ 엔티티 분석 규칙
+    ─────────────────────────────────────────────────────────────
+    4. detected_artists: 기사에 직접 언급된 모든 가수·그룹·배우·MC를 포함하세요.
        - context_hints: 소속사(YG, SM, HYBE 등), 그룹명, 브랜드, 드라마/앨범 제목
        - entity_type: ARTIST(솔로), GROUP(그룹/팀), EVENT(시상식/행사)
 
-    2. confidence_score (0.0~1.0): 해당 아티스트 탐지의 신뢰도를 직접 평가하세요.
+    5. confidence_score (0.0~1.0): 해당 아티스트 탐지의 신뢰도를 직접 평가하세요.
        - 0.9~1.0: 이름과 문맥이 명확하여 특정 아티스트임을 확신
        - 0.7~0.9: 대부분 확신하나 일부 모호함
        - 0.5~0.7: 동명이인이나 문맥 부족으로 불확실
        - 0.0~0.5: 매우 모호하거나 본문에 직접적인 증거 없음
 
-    3. is_ambiguous: 동명이인이나 문맥 모호로 정확한 아티스트 특정이 어려우면 true
+    6. is_ambiguous: 동명이인이나 문맥 모호로 정확한 아티스트 특정이 어려우면 true
        예시:
          - '지수' → 블랙핑크 지수(JISOO)인지 다른 지수인지 모호하면 true
          - '뷔' → BTS 뷔(V)가 명확하면 false
          - '로제' → 블랙핑크 로제가 명확하면 false
 
-    4. ambiguity_reason: is_ambiguous=true일 때 모호한 이유를 한 문장으로 설명
+    7. ambiguity_reason: is_ambiguous=true일 때 모호한 이유를 한 문장으로 설명
 
-    5. sentiment: positive | negative | neutral | mixed
-    6. relevance_score: K-팝·K-드라마 등 K-엔터 관련도 (0.0~1.0)
-    7. confidence: 분석 전체 신뢰도 (정보 충분→높게, 부족→낮게)
-    8. main_category: music|drama|film|fashion|entertainment|award|other
+    8. sentiment: positive | negative | neutral | mixed
+    9. relevance_score: K-팝·K-드라마 등 K-엔터 관련도 (0.0~1.0)
+    10. confidence: 분석 전체 신뢰도 (정보 충분→높게, 부족→낮게)
+    11. main_category: music|drama|film|fashion|entertainment|award|other
 """)
 
 
@@ -424,6 +523,8 @@ def _update_article_status(
     status: str,
     topic_summary: Optional[str] = None,
     system_note: Optional[str] = None,    # [v2]
+    title_en: Optional[str] = None,       # [v3] K-POP 팬 친화적 영문 제목
+    summary_en: Optional[str] = None,     # [v3] 영문 요약
 ) -> None:
     """
     기사 process_status 를 갱신합니다.
@@ -431,6 +532,8 @@ def _update_article_status(
     [v2] system_note: MANUAL_REVIEW 사유. 기존 노트를 덮어씁니다.
          NULL 을 전달하면 system_note 는 변경하지 않습니다 (COALESCE 방식으로 보존).
          빈 문자열을 전달하면 명시적으로 NULL 로 초기화합니다.
+
+    [v3] title_en / summary_en: NULL 전달 시 기존 값 유지. 값 전달 시 갱신.
     """
     with _conn() as conn:
         with conn.cursor() as cur:
@@ -442,6 +545,8 @@ def _update_article_status(
                                            NULLIF(trim(coalesce(summary_ko, '')), ''),
                                            %s
                                        ),
+                       title_en      = CASE WHEN %s IS NOT NULL THEN %s ELSE title_en END,
+                       summary_en    = CASE WHEN %s IS NOT NULL THEN %s ELSE summary_en END,
                        system_note   = CASE
                                            WHEN %s = '' THEN NULL
                                            WHEN %s IS NOT NULL THEN %s
@@ -453,6 +558,10 @@ def _update_article_status(
                 (
                     status,
                     topic_summary or None,    # summary_ko fallback
+                    title_en,                 # CASE: title_en IS NOT NULL → update
+                    title_en,                 # SET title_en
+                    summary_en,               # CASE: summary_en IS NOT NULL → update
+                    summary_en,               # SET summary_en
                     system_note or "",        # CASE: empty string → NULL
                     system_note,              # CASE: not null → update
                     system_note,              # SET value
@@ -585,7 +694,7 @@ def _log_to_system(
 
 class IntelligenceEngine:
     """
-    Gemini 기반 Phase 4 지식 추출 엔진 (v2).
+    Gemini 기반 Phase 4 지식 추출 엔진 (v3).
 
     v2 주요 변경:
         1. DetectedArtist 에 confidence_score / is_ambiguous / ambiguity_reason 추가
@@ -595,6 +704,13 @@ class IntelligenceEngine:
         3. _call_gemini(): (text, GeminiCallMetrics) 튜플 반환
            - prompt_tokens, completion_tokens, total_tokens, response_time_ms 측정
         4. system_logs.details 에 token_metrics 포함 → 비용 분석 가능
+
+    v3 주요 변경:
+        5. 이중 언어 추출: 한 번의 Gemini 호출로 title_en + topic_summary_en 생성
+           - K-POP 팬 친화적 영문 제목/요약 (직역 금지)
+           - 한국어 고유 표현(역주행, 대세돌 등) → 영어 현지화 가이드 프롬프트
+        6. _decide_status() v3: title_en / topic_summary_en 누락 시 MANUAL_REVIEW
+        7. _update_article_status() v3: title_en / summary_en DB 저장 (articles 테이블)
 
     Contextual Linking 점수 체계 (최대 1.0):
         +0.50  이름(name_ko) 완전 일치
@@ -619,7 +735,7 @@ class IntelligenceEngine:
         self._cache_loaded_at: float = 0.0
 
         log.info(
-            "IntelligenceEngine v2 초기화 | model=%s batch_size=%d "
+            "IntelligenceEngine v3 초기화 | model=%s batch_size=%d "
             "entity_threshold=%.2f",
             model_name, batch_size, _ENTITY_CONFIDENCE_THRESHOLD,
         )
@@ -893,6 +1009,12 @@ class IntelligenceEngine:
                 f"({intelligence.confidence:.2f} < {_MIN_CONFIDENCE:.2f})"
             )
 
+        # ── 3. [v3] 영문 번역 검증 ───────────────────────
+        if not (intelligence.title_en or "").strip():
+            reasons.append("영문 제목(title_en) 누락 — Gemini 번역 미생성")
+        if not (intelligence.topic_summary_en or "").strip():
+            reasons.append("영문 요약(topic_summary_en) 누락 — Gemini 번역 미생성")
+
         if reasons:
             note = "MANUAL_REVIEW 사유: " + "; ".join(reasons)
             log.info(
@@ -1017,6 +1139,8 @@ class IntelligenceEngine:
                     final_status,
                     topic_summary = intelligence.topic_summary or None,
                     system_note   = system_note,
+                    title_en      = intelligence.title_en or None,   # [v3]
+                    summary_en    = intelligence.topic_summary_en or None,  # [v3]
                 )
 
             duration_ms = int((time.monotonic() - t_start) * 1000)
@@ -1029,11 +1153,14 @@ class IntelligenceEngine:
                     "status_would_be": final_status,
                     "system_note":     system_note,
                     "intelligence": {
-                        "topic_summary":   intelligence.topic_summary,
-                        "sentiment":       intelligence.sentiment,
-                        "relevance_score": intelligence.relevance_score,
-                        "confidence":      intelligence.confidence,
-                        "main_category":   intelligence.main_category,
+                        "title_ko":          intelligence.title_ko,          # [v3]
+                        "title_en":          intelligence.title_en,          # [v3]
+                        "topic_summary":     intelligence.topic_summary,
+                        "topic_summary_en":  intelligence.topic_summary_en,  # [v3]
+                        "sentiment":         intelligence.sentiment,
+                        "relevance_score":   intelligence.relevance_score,
+                        "confidence":        intelligence.confidence,
+                        "main_category":     intelligence.main_category,
                         "detected_artists": [
                             a.model_dump() for a in intelligence.detected_artists
                         ],
@@ -1074,13 +1201,15 @@ class IntelligenceEngine:
                         f"time={metrics.response_time_ms}ms"
                     ),
                     details     = {
-                        "status":            final_status,
-                        "system_note":       system_note,
-                        "sentiment":         intelligence.sentiment,
-                        "relevance_score":   intelligence.relevance_score,
-                        "confidence":        intelligence.confidence,
-                        "main_category":     intelligence.main_category,
-                        "entity_scores":     {
+                        "status":             final_status,
+                        "system_note":        system_note,
+                        "title_en":           intelligence.title_en,          # [v3]
+                        "topic_summary_en":   intelligence.topic_summary_en,  # [v3]
+                        "sentiment":          intelligence.sentiment,
+                        "relevance_score":    intelligence.relevance_score,
+                        "confidence":         intelligence.confidence,
+                        "main_category":      intelligence.main_category,
+                        "entity_scores":      {
                             m["detected_name_ko"]: m.get("gemini_confidence", 1.0)
                             for m in linked
                         },
@@ -1248,7 +1377,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="TIH Gemini Intelligence Engine v2 — Phase 4 Entity Extraction",
+        description="TIH Gemini Intelligence Engine v3 — Phase 4 Bilingual Entity Extraction",
     )
     parser.add_argument(
         "--batch-size", type=int, default=_BATCH_SIZE, metavar="N",
