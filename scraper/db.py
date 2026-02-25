@@ -441,3 +441,52 @@ def get_recent_articles(
                 [*params, limit],
             )
             return [dict(r) for r in cur.fetchall()]
+
+
+def get_latest_published_at() -> "Optional[datetime]":
+    """
+    articles 테이블에서 가장 최근 published_at 을 반환합니다.
+    check_latest() 에서 새 기사 감지 기준선으로 사용됩니다.
+
+    Returns:
+        timezone-aware datetime 또는 None (테이블이 비어있을 때)
+    """
+    from datetime import datetime as _dt, timezone as _tz
+
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT MAX(published_at) FROM articles WHERE published_at IS NOT NULL"
+            )
+            row = cur.fetchone()
+
+    value = row[0] if row else None
+    if value is not None and value.tzinfo is None:
+        value = value.replace(tzinfo=_tz.utc)
+    return value
+
+
+def get_articles_status_by_urls(urls: list) -> dict:
+    """
+    URL 목록에 대한 process_status 맵을 일괄 조회합니다.
+    scrape_batch() 의 상태 기반 중복 체크에 사용됩니다.
+
+    Returns:
+        {source_url: process_status} — DB에 없는 URL은 결과에 포함되지 않음
+    """
+    if not urls:
+        return {}
+
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT source_url, process_status
+                FROM   articles
+                WHERE  source_url = ANY(%s)
+                """,
+                (list(urls),),
+            )
+            rows = cur.fetchall()
+
+    return {row[0]: row[1] for row in rows}

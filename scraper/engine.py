@@ -24,6 +24,26 @@ scraper/engine.py — 안정적 스크래핑 엔진 (Throttling & Queue)
         HTTP 5xx / 네트워크 오류 → ScraperError (지수 백오프 재시도)
         파싱 실패 → ParseError (해당 URL 건너뜀, 배치 계속)
 
+기간 필터링:
+    scrape_range(start_date, end_date) 으로 특정 날짜 구간의 기사만 수집합니다.
+    RSS 피드에서 날짜를 먼저 가져와 필터링하고, RSS 범위 초과 시 목록 페이지를
+    페이지네이션합니다. scrape_batch() 내부에서 parsed published_at 으로 이중 확인합니다.
+    CLI: python -m scraper.engine scrape-range --start 2026-02-01 --end 2026-02-25
+
+RSS / 최신 감지:
+    check_latest() 가 RSS 피드(또는 목록 첫 페이지)를 스캔하여 DB의 최신 published_at
+    보다 이후 기사를 감지하고, 자동으로 job_queue 에 일괄 등록합니다.
+    CLI: python -m scraper.engine check-latest [--no-queue]
+
+상태 기반 중복 체크:
+    scrape_batch() 호출 전 DB 를 일괄 조회하여 URL 을 분류합니다:
+        PROCESSED  → 스킵 (skip_processed=True, 기본값)
+        ERROR      → 재시도 (retry_error=True, 기본값)
+        SCRAPED    → 스킵 (이미 수집 완료, 처리 대기 중)
+        PENDING / MANUAL_REVIEW → 스킵
+        DB에 없음  → 신규 수집 대상
+    스킵된 URL 은 BatchResult.skipped 에 이유와 함께 기록됩니다.
+
 공개 클래스:
     BaseScraper      — 공통 Throttle·Backoff·배치 로직 (abstract)
     TenAsiaScraper   — tenasia.hankyung.com 특화 파서
@@ -38,24 +58,34 @@ scraper/engine.py — 안정적 스크래핑 엔진 (Throttling & Queue)
     from scraper.engine import TenAsiaScraper
 
     scraper = TenAsiaScraper(batch_size=10)
-    result  = scraper.scrape_batch(
-        urls=["https://tenasia.hankyung.com/article/123", ...],
-        job_id=42,
-        language="kr",
+
+    # 기본 배치
+    result = scraper.scrape_batch(urls=[...], job_id=42)
+
+    # 날짜 범위 수집
+    from datetime import datetime, timezone
+    result = scraper.scrape_range(
+        start_date=datetime(2026, 2, 1, tzinfo=timezone.utc),
+        end_date=datetime(2026, 2, 25, tzinfo=timezone.utc),
     )
-    print(result)
-    # {"success": [...], "failed": [...], "total": 10, "processed": 8}
+
+    # 최신 기사 감지 + 자동 큐 등록
+    check = scraper.check_latest(language="kr", auto_queue=True)
+    print(check.new_count)  # 새로 큐에 추가된 기사 수
 """
 
 from __future__ import annotations
 
 import abc
+import argparse
 import json
 import random
 import re
 import time
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime as _rfc2822_parse
 from typing import Any, Optional
 from urllib.parse import urljoin, urlparse
 
@@ -63,8 +93,46 @@ import requests
 import structlog
 from bs4 import BeautifulSoup, Tag
 
-from scraper.db import upsert_article
+from scraper.db import (
+    create_job,
+    get_articles_status_by_urls,
+    get_latest_published_at,
+    upsert_article,
+)
 from scraper.throttle import get_session
+
+
+# ─────────────────────────────────────────────────────────────
+# 모듈 레벨 유틸
+# ─────────────────────────────────────────────────────────────
+
+def _ensure_tz(dt: datetime) -> datetime:
+    """naive datetime 을 UTC timezone-aware 로 변환합니다."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _cli_parse_date(value: str, *, end_of_day: bool = False) -> datetime:
+    """
+    CLI 날짜 문자열 → UTC timezone-aware datetime.
+
+    지원 형식:
+        YYYY-MM-DD            → 00:00:00 UTC (또는 23:59:59 UTC if end_of_day)
+        YYYY-MM-DDTHH:MM:SS   → 지정 시각 UTC
+    """
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(value, fmt)
+            if end_of_day and fmt == "%Y-%m-%d":
+                from datetime import time as _t
+                dt = datetime.combine(dt.date(), _t(23, 59, 59))
+            return dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    raise ValueError(
+        f"날짜 형식 오류 (YYYY-MM-DD 또는 YYYY-MM-DDTHH:MM:SS): {value!r}"
+    )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -104,12 +172,22 @@ class ParseError(ScraperError):
 # ─────────────────────────────────────────────────────────────
 
 @dataclass
+class RSSEntry:
+    """RSS / 목록 페이지에서 수집한 기사 메타데이터."""
+
+    url:          str
+    title:        str                   = ""
+    published_at: Optional[datetime]    = None
+
+
+@dataclass
 class BatchResult:
     """scrape_batch() 반환 타입."""
 
     total:     int
     success:   list[dict[str, Any]] = field(default_factory=list)
     failed:    list[dict[str, Any]] = field(default_factory=list)
+    skipped:   list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def processed(self) -> int:
@@ -121,6 +199,27 @@ class BatchResult:
             "processed": self.processed,
             "success":   self.success,
             "failed":    self.failed,
+            "skipped":   self.skipped,
+        }
+
+
+@dataclass
+class CheckResult:
+    """check_latest() 반환 타입."""
+
+    new_count:    int
+    queued_urls:  list[str]          = field(default_factory=list)
+    job_id:       Optional[int]      = None
+    latest_db:    Optional[datetime] = None
+    latest_feed:  Optional[datetime] = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "new_count":   self.new_count,
+            "queued_urls": self.queued_urls,
+            "job_id":      self.job_id,
+            "latest_db":   self.latest_db.isoformat() if self.latest_db else None,
+            "latest_feed": self.latest_feed.isoformat() if self.latest_feed else None,
         }
 
 
@@ -449,6 +548,53 @@ class BaseScraper(abc.ABC):
         return None
 
     # ─────────────────────────────────────────────────────────
+    # 상태 기반 중복 체크
+    # ─────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _classify_urls(
+        urls:            list[str],
+        skip_processed:  bool = True,
+        retry_error:     bool = True,
+    ) -> tuple[list[str], list[dict[str, Any]]]:
+        """
+        URL 목록을 DB 의 process_status 에 따라 분류합니다.
+
+        분류 규칙:
+            DB에 없음      → 신규 (수집 대상)
+            PROCESSED      → skip_processed=True 면 스킵
+            ERROR          → retry_error=True 면 재시도 (수집 대상)
+            SCRAPED        → 이미 수집 완료, 스킵
+            PENDING        → 이미 큐에 있음, 스킵
+            MANUAL_REVIEW  → 검수 대기 중, 스킵
+
+        Returns:
+            (to_scrape, skipped_records)
+            to_scrape       : 실제 스크래핑할 URL 목록
+            skipped_records : 스킵된 URL 와 reason 딕셔너리 목록
+        """
+        statuses = get_articles_status_by_urls(urls)
+        to_scrape: list[str]           = []
+        skipped:   list[dict[str, Any]] = []
+
+        for url in urls:
+            status = statuses.get(url)          # None = 신규
+
+            if status is None:
+                to_scrape.append(url)
+            elif status == "PROCESSED" and skip_processed:
+                skipped.append({"url": url, "reason": "already_processed"})
+            elif status == "ERROR" and retry_error:
+                to_scrape.append(url)           # ERROR → 재시도
+            elif status in ("SCRAPED", "PENDING", "MANUAL_REVIEW"):
+                skipped.append({"url": url, "reason": f"status_{status.lower()}"})
+            else:
+                # skip_processed=False 또는 retry_error=False — 강제 수집
+                to_scrape.append(url)
+
+        return to_scrape, skipped
+
+    # ─────────────────────────────────────────────────────────
     # 추상 메서드 (서브클래스 구현 필수)
     # ─────────────────────────────────────────────────────────
 
@@ -481,11 +627,16 @@ class BaseScraper(abc.ABC):
         job_id:          Optional[int]  = None,
         language:        str            = "kr",
         global_priority: bool           = False,
+        skip_processed:  bool           = True,
+        retry_error:     bool           = True,
+        date_after:      Optional[datetime] = None,
+        date_before:     Optional[datetime] = None,
     ) -> BatchResult:
         """
         URL 목록을 배치로 스크래핑합니다.
 
         - 최대 batch_size 개의 URL 만 처리합니다.
+        - 호출 전 DB 에서 상태를 일괄 조회하여 중복 처리를 방지합니다.
         - 성공 시마다 DB 에 즉시 SCRAPED 상태로 커밋합니다.
         - ForbiddenError(403) 발생 시 배치 전체를 즉시 중단합니다.
         - 개별 URL 오류는 failed 에 기록하고 배치를 계속 진행합니다.
@@ -495,25 +646,51 @@ class BaseScraper(abc.ABC):
             job_id:          연결된 job_queue.id (없으면 None)
             language:        기사 언어 코드 ('kr' / 'en' / 'jp')
             global_priority: 글로벌 아티스트 여부 (True → 영어 추출 활성화)
+            skip_processed:  True 면 PROCESSED 기사 스킵 (기본 True)
+            retry_error:     True 면 ERROR 기사 재시도 (기본 True)
+            date_after:      이 날짜 이전 기사는 스킵 (포함 경계, None=필터 없음)
+            date_before:     이 날짜 이후 기사는 스킵 (포함 경계, None=필터 없음)
 
         Returns:
-            BatchResult(total, success, failed)
+            BatchResult(total, success, failed, skipped)
         """
         batch = urls[:self.batch_size]
-        result = BatchResult(total=len(urls))
+
+        # ── 상태 기반 중복 체크 ────────────────────────────────
+        to_scrape, status_skipped = self._classify_urls(
+            batch,
+            skip_processed=skip_processed,
+            retry_error=retry_error,
+        )
+        result = BatchResult(total=len(urls), skipped=list(status_skipped))
+
+        if status_skipped:
+            reason_counts: dict[str, int] = {}
+            for s in status_skipped:
+                reason_counts[s["reason"]] = reason_counts.get(s["reason"], 0) + 1
+            self.log.info("batch_status_skip", counts=reason_counts)
+
+        if not to_scrape:
+            self.log.info("batch_all_skipped", total_skipped=len(status_skipped))
+            return result
+
+        # ── 날짜 경계 UTC 변환 ─────────────────────────────────
+        _after  = _ensure_tz(date_after)  if date_after  else None
+        _before = _ensure_tz(date_before) if date_before else None
 
         self.log.info(
             "batch_start",
             total_urls=len(urls),
-            batch_size=len(batch),
+            to_scrape=len(to_scrape),
+            skipped=len(status_skipped),
             job_id=job_id,
         )
 
-        for idx, url in enumerate(batch, start=1):
+        for idx, url in enumerate(to_scrape, start=1):
             self.log.info(
                 "batch_item",
                 current=idx,
-                total=len(batch),
+                total=len(to_scrape),
                 url=url,
             )
 
@@ -522,16 +699,37 @@ class BaseScraper(abc.ABC):
                 resp = self._fetch(url)
 
                 # 2. HTML 파싱 — raw soup 을 _parse_article 에 전달
-                #    (서브클래스가 og:image 수집 후 _clean_soup 를 직접 호출)
                 soup = BeautifulSoup(resp.text, "html.parser")
                 data = self._parse_article(url, soup)
 
-                # 3. 공통 필드 병합
+                # 3. 날짜 범위 필터 ──────────────────────────────
+                if _after or _before:
+                    pub = data.get("published_at")
+                    if pub is not None:
+                        pa = _ensure_tz(pub)
+                        if _after and pa < _after:
+                            result.skipped.append({
+                                "url":          url,
+                                "reason":       "before_date_range",
+                                "published_at": pa.isoformat(),
+                            })
+                            self.log.debug("date_skip_early", url=url, pa=pa.isoformat())
+                            continue
+                        if _before and pa > _before:
+                            result.skipped.append({
+                                "url":          url,
+                                "reason":       "after_date_range",
+                                "published_at": pa.isoformat(),
+                            })
+                            self.log.debug("date_skip_late", url=url, pa=pa.isoformat())
+                            continue
+
+                # 4. 공통 필드 병합
                 data.setdefault("language",        language)
                 data.setdefault("global_priority", global_priority)
                 data["process_status"] = "SCRAPED"
 
-                # 4. DB 즉시 커밋 (UPSERT)
+                # 5. DB 즉시 커밋 (UPSERT)
                 article_id = upsert_article(url, data, job_id=job_id)
 
                 result.success.append({
@@ -548,7 +746,7 @@ class BaseScraper(abc.ABC):
                 )
 
             except ForbiddenError as exc:
-                # 403: 배치 전체 즉시 중단 — IP 차단은 계속 시도해도 의미 없음
+                # 403: 배치 전체 즉시 중단
                 self.log.error(
                     "forbidden_abort",
                     url=url,
@@ -584,6 +782,7 @@ class BaseScraper(abc.ABC):
             "batch_done",
             success=len(result.success),
             failed=len(result.failed),
+            skipped=len(result.skipped),
             total_processed=result.processed,
         )
         return result
@@ -867,3 +1066,553 @@ class TenAsiaScraper(BaseScraper):
             "published_at": published_at,
             "thumbnail_url": thumbnail_url,
         }
+
+    # ── RSS / 목록 페이지 ─────────────────────────────────────
+
+    # RSS 피드 URL — 환경·운영 정책에 따라 서브클래스에서 재정의 가능
+    _RSS_URL:       str = "https://tenasia.hankyung.com/rss/allnews.rss"
+    _LIST_BASE_URL: str = "https://tenasia.hankyung.com"
+    _LIST_PATH:     str = "/all"
+
+    # 목록 페이지에서 기사 링크를 찾기 위한 CSS 셀렉터 (우선순위 순)
+    _LIST_PAGE_SELECTORS: list[str] = [
+        "article.news-item a",
+        ".article-list a",
+        ".news_list li a",
+        "ul.list_news li a",
+        ".content_list .item a",
+        "div.list_area a",
+    ]
+
+    @classmethod
+    def _parse_rss_date(cls, raw: str) -> Optional[datetime]:
+        """
+        RFC 2822 pubDate (RSS 2.0) → datetime.
+        파싱 실패 시 _parse_datetime() 폴백.
+        """
+        if not raw:
+            return None
+        try:
+            return _rfc2822_parse(raw)
+        except (TypeError, ValueError):
+            return cls._parse_datetime(raw)
+
+    @classmethod
+    def _parse_rss_xml(cls, xml_text: str) -> list[RSSEntry]:
+        """
+        RSS 2.0 / Atom XML 을 파싱합니다.
+
+        - 네임스페이스 선언을 제거한 뒤 파싱해 네임스페이스 prefix 의존성을 없앱니다.
+        - root.iter() 로 깊이에 무관하게 <item> / <entry> 를 수집합니다.
+        """
+        try:
+            cleaned = re.sub(r'\s+xmlns(?::\w+)?="[^"]+"', "", xml_text, flags=re.I)
+            root = ET.fromstring(cleaned)
+        except ET.ParseError:
+            return []
+
+        entries: list[RSSEntry] = []
+
+        # RSS 2.0 — <item> 요소
+        for item in root.iter("item"):
+            url   = (item.findtext("link") or "").strip()
+            title = (item.findtext("title") or "").strip()
+            pub   = (item.findtext("pubDate") or "").strip()
+            if url:
+                entries.append(RSSEntry(
+                    url=url,
+                    title=title,
+                    published_at=cls._parse_rss_date(pub),
+                ))
+
+        # Atom — <entry> 요소 (RSS 가 없을 때)
+        if not entries:
+            for entry in root.iter("entry"):
+                link_tag = entry.find("link")
+                url = (
+                    link_tag.get("href", "") if link_tag is not None else ""
+                ).strip()
+                if not url:
+                    url = (entry.findtext("link") or "").strip()
+                title = (entry.findtext("title") or "").strip()
+                pub   = (
+                    entry.findtext("published")
+                    or entry.findtext("updated")
+                    or ""
+                ).strip()
+                if url:
+                    entries.append(RSSEntry(
+                        url=url,
+                        title=title,
+                        published_at=cls._parse_datetime(pub),
+                    ))
+
+        return entries
+
+    def _fetch_rss(self) -> list[RSSEntry]:
+        """
+        RSS 피드를 취득하여 파싱합니다.
+        Human delay 없이 ThrottledSession 으로 직접 GET 합니다.
+        실패 시 빈 리스트를 반환합니다.
+        """
+        if not self._RSS_URL:
+            return []
+        try:
+            resp = self._session.get(self._RSS_URL, timeout=self.timeout)
+            if not resp.ok:
+                self.log.warning(
+                    "rss_fetch_failed",
+                    url=self._RSS_URL,
+                    status=resp.status_code,
+                )
+                return []
+            entries = self._parse_rss_xml(resp.text)
+            self.log.info("rss_fetched", count=len(entries), url=self._RSS_URL)
+            return entries
+        except Exception as exc:
+            self.log.warning("rss_error", url=self._RSS_URL, error=str(exc))
+            return []
+
+    def _fetch_list_page(self, page: int = 1) -> list[RSSEntry]:
+        """
+        기사 목록 페이지에서 URL + 날짜를 추출합니다 (RSS 폴백).
+
+        - _LIST_PAGE_SELECTORS 의 셀렉터를 순서대로 시도합니다.
+        - 날짜는 링크 주변 <time datetime> 또는 .date / .time 클래스에서 탐색합니다.
+        - 아티클 URL 패턴(`/article` 또는 8자리 이상 숫자)을 기준으로 필터링합니다.
+        """
+        url = f"{self._LIST_BASE_URL}{self._LIST_PATH}"
+        if page > 1:
+            url = f"{url}?page={page}"
+
+        try:
+            resp = self._session.get(url, timeout=self.timeout)
+            if not resp.ok:
+                self.log.warning("list_page_failed", url=url, status=resp.status_code)
+                return []
+
+            soup = BeautifulSoup(resp.text, "html.parser")
+            entries: list[RSSEntry] = []
+            seen: set[str] = set()
+
+            def _extract_date_near(tag: Tag) -> Optional[datetime]:
+                """링크 태그 주변(최대 3단계 부모)에서 날짜를 탐색합니다."""
+                parent = tag.parent
+                for _ in range(3):
+                    if parent is None:
+                        break
+                    time_tag = parent.find("time")
+                    if time_tag:
+                        raw = time_tag.get("datetime") or time_tag.get_text(strip=True)
+                        return self._parse_datetime(str(raw)) if raw else None
+                    date_tag = parent.find(
+                        class_=re.compile(r"\bdate\b|\btime\b", re.I)
+                    )
+                    if date_tag:
+                        return self._parse_datetime(date_tag.get_text(strip=True))
+                    parent = parent.parent
+                return None
+
+            # CSS 셀렉터로 링크 탐색
+            for selector in self._LIST_PAGE_SELECTORS:
+                links = soup.select(selector)
+                if not links:
+                    continue
+                for a in links:
+                    href = a.get("href", "").strip()
+                    if not href:
+                        continue
+                    href = urljoin(self._LIST_BASE_URL, href)
+                    if href in seen:
+                        continue
+                    if not re.search(r"/article[s]?/|\d{8,}", href):
+                        continue
+                    seen.add(href)
+                    entries.append(RSSEntry(
+                        url=href,
+                        title=a.get_text(strip=True),
+                        published_at=_extract_date_near(a),
+                    ))
+                if entries:
+                    break   # 첫 번째 성공한 셀렉터 사용
+
+            # 폴백: 아티클 패턴이 있는 모든 <a>
+            if not entries:
+                for a in soup.find_all(
+                    "a", href=re.compile(r"/article[s]?/|\d{10,}")
+                ):
+                    href = urljoin(self._LIST_BASE_URL, a["href"])
+                    if href not in seen:
+                        seen.add(href)
+                        entries.append(RSSEntry(
+                            url=href,
+                            title=a.get_text(strip=True),
+                        ))
+
+            self.log.info("list_page_fetched", page=page, entries=len(entries))
+            return entries
+
+        except Exception as exc:
+            self.log.warning("list_page_error", url=url, error=str(exc))
+            return []
+
+    def _collect_feed_entries(
+        self,
+        start_date: Optional[datetime] = None,
+        end_date:   Optional[datetime] = None,
+        max_pages:  int                = 10,
+    ) -> list[RSSEntry]:
+        """
+        RSS + 목록 페이지 페이지네이션으로 기사 후보를 수집합니다.
+
+        1. RSS 를 먼저 취득합니다.
+        2. RSS 의 가장 오래된 항목이 start_date 보다 최신이면
+           (RSS 가 범위를 커버하지 못함) 목록 페이지를 추가 탐색합니다.
+        3. start_date / end_date 로 날짜 필터를 적용합니다.
+           published_at 이 없는 항목은 실제 스크래핑 후 확인을 위해 포함합니다.
+        """
+        entries: list[RSSEntry] = []
+        seen:    set[str]       = set()
+
+        # 1. RSS
+        for e in self._fetch_rss():
+            if e.url not in seen:
+                seen.add(e.url)
+                entries.append(e)
+
+        # 2. 목록 페이지 페이지네이션 필요 여부 판단
+        _start = _ensure_tz(start_date) if start_date else None
+        rss_oldest = min(
+            (_ensure_tz(e.published_at) for e in entries if e.published_at),
+            default=None,
+        )
+        need_list = _start is not None and (
+            not entries                            # RSS 없음
+            or (rss_oldest is not None and rss_oldest > _start)  # RSS 범위 부족
+        )
+
+        if need_list:
+            for page in range(1, max_pages + 1):
+                page_entries = self._fetch_list_page(page)
+                if not page_entries:
+                    break
+                added = False
+                for e in page_entries:
+                    if e.url not in seen:
+                        seen.add(e.url)
+                        entries.append(e)
+                        added = True
+                # 날짜가 있는 항목이 start_date 보다 오래됐으면 중단
+                dated = [e for e in page_entries if e.published_at]
+                if dated:
+                    page_oldest = min(_ensure_tz(e.published_at) for e in dated)
+                    if page_oldest < _start:
+                        break
+                if not added:
+                    break
+
+        # 3. 날짜 필터
+        _end = _ensure_tz(end_date) if end_date else None
+        if _start or _end:
+            filtered: list[RSSEntry] = []
+            for e in entries:
+                if e.published_at:
+                    pa = _ensure_tz(e.published_at)
+                    if _start and pa < _start:
+                        continue
+                    if _end and pa > _end:
+                        continue
+                # published_at 없는 항목은 포함 (scrape_batch 에서 이중 확인)
+                filtered.append(e)
+            entries = filtered
+
+        self.log.info(
+            "feed_entries_collected",
+            total=len(entries),
+            start=_start.isoformat() if _start else None,
+            end=_end.isoformat()   if _end   else None,
+        )
+        return entries
+
+    # ── 공개 고수준 API ───────────────────────────────────────
+
+    def check_latest(
+        self,
+        language:   str  = "kr",
+        auto_queue: bool = True,
+    ) -> CheckResult:
+        """
+        DB 의 최신 published_at 이후 기사를 RSS 에서 감지하고 자동으로 큐에 추가합니다.
+
+        동작:
+            1. DB 의 MAX(published_at) 를 기준선으로 조회
+            2. RSS 피드 취득 (실패 시 목록 첫 페이지 폴백)
+            3. published_at > 기준선인 항목 필터링
+            4. 상태 기반 중복 체크 — PROCESSED / SCRAPED 스킵
+            5. auto_queue=True 면 job_queue 에 일괄 등록 (priority=7)
+
+        Returns:
+            CheckResult(new_count, queued_urls, job_id, latest_db, latest_feed)
+        """
+        latest_db = get_latest_published_at()
+        self.log.info(
+            "check_latest_start",
+            latest_db=latest_db.isoformat() if latest_db else None,
+        )
+
+        # RSS 취득 → 실패 시 목록 첫 페이지 폴백
+        feed = self._fetch_rss() or self._fetch_list_page(page=1)
+
+        # 기준선 이후 기사 선별
+        if latest_db:
+            threshold = _ensure_tz(latest_db)
+            new_entries = [
+                e for e in feed
+                if e.published_at and _ensure_tz(e.published_at) > threshold
+            ]
+            # published_at 없는 항목도 신규 후보로 포함 (DB에 없는 URL 이면 수집)
+            new_entries += [e for e in feed if not e.published_at]
+        else:
+            new_entries = list(feed)   # DB 가 비어있으면 전체 수집
+
+        # 상태 기반 중복 체크
+        candidate_urls = [e.url for e in new_entries]
+        to_scrape, skipped = self._classify_urls(
+            candidate_urls, skip_processed=True, retry_error=True
+        )
+
+        latest_feed: Optional[datetime] = max(
+            (e.published_at for e in feed if e.published_at),
+            default=None,
+        )
+
+        if not to_scrape:
+            self.log.info(
+                "check_latest_nothing_new",
+                feed_count=len(feed),
+                already_skipped=len(skipped),
+            )
+            return CheckResult(
+                new_count=0,
+                latest_db=latest_db,
+                latest_feed=latest_feed,
+            )
+
+        self.log.info(
+            "check_latest_new_found",
+            new_count=len(to_scrape),
+            skipped=len(skipped),
+            latest_feed=latest_feed.isoformat() if latest_feed else None,
+        )
+
+        queued_job_id: Optional[int] = None
+        if auto_queue:
+            queued_job_id = create_job(
+                "scrape",
+                {
+                    "urls":       to_scrape,
+                    "language":   language,
+                    "batch_size": len(to_scrape),
+                },
+                priority=7,     # 최신 기사는 높은 우선순위
+            )
+            self.log.info(
+                "check_latest_queued",
+                job_id=queued_job_id,
+                url_count=len(to_scrape),
+            )
+
+        return CheckResult(
+            new_count=len(to_scrape),
+            queued_urls=to_scrape,
+            job_id=queued_job_id,
+            latest_db=latest_db,
+            latest_feed=latest_feed,
+        )
+
+    def scrape_range(
+        self,
+        start_date:     datetime,
+        end_date:       datetime,
+        job_id:         Optional[int] = None,
+        language:       str           = "kr",
+        max_pages:      int           = 10,
+        skip_processed: bool          = True,
+    ) -> BatchResult:
+        """
+        특정 날짜 범위 [start_date, end_date] 의 기사만 수집합니다.
+
+        동작:
+            1. RSS + 목록 페이지 페이지네이션으로 후보 URL 을 수집
+            2. 상태 기반 중복 체크
+            3. batch_size 단위로 scrape_batch() 를 반복 호출
+               scrape_batch 내부에서 parsed published_at 으로 날짜를 이중 확인
+
+        Args:
+            start_date:     수집 시작 날짜 (포함). naive 면 UTC 로 처리.
+            end_date:       수집 종료 날짜 (포함). naive 면 UTC 로 처리.
+            job_id:         연결된 job_queue.id
+            language:       기사 언어 코드
+            max_pages:      RSS 범위 부족 시 목록 페이지 최대 탐색 수
+            skip_processed: PROCESSED 기사 스킵 여부 (기본 True)
+
+        Returns:
+            BatchResult — 전체 구간의 누적 결과
+        """
+        _start = _ensure_tz(start_date)
+        _end   = _ensure_tz(end_date)
+
+        self.log.info(
+            "scrape_range_start",
+            start=_start.isoformat(),
+            end=_end.isoformat(),
+        )
+
+        # 1. 후보 URL 수집 (RSS + 필요 시 목록 페이지)
+        feed_entries = self._collect_feed_entries(
+            start_date=_start,
+            end_date=_end,
+            max_pages=max_pages,
+        )
+        if not feed_entries:
+            self.log.warning(
+                "scrape_range_no_candidates",
+                start=_start.isoformat(),
+                end=_end.isoformat(),
+            )
+            return BatchResult(total=0)
+
+        all_urls = [e.url for e in feed_entries]
+        self.log.info("scrape_range_candidates", count=len(all_urls))
+
+        # 2. batch_size 단위로 반복 처리 (누적 결과 병합)
+        combined  = BatchResult(total=len(all_urls))
+        remaining = list(all_urls)
+
+        while remaining:
+            chunk      = remaining[:self.batch_size]
+            remaining  = remaining[self.batch_size:]
+
+            partial = self.scrape_batch(
+                urls=chunk,
+                job_id=job_id,
+                language=language,
+                skip_processed=skip_processed,
+                retry_error=True,
+                date_after=_start,
+                date_before=_end,
+            )
+            combined.success.extend(partial.success)
+            combined.failed.extend(partial.failed)
+            combined.skipped.extend(partial.skipped)
+
+            # 403 차단이면 전체 중단
+            if any(f.get("fatal") for f in partial.failed):
+                self.log.error("scrape_range_abort_forbidden")
+                break
+
+        self.log.info(
+            "scrape_range_done",
+            success=len(combined.success),
+            failed=len(combined.failed),
+            skipped=len(combined.skipped),
+        )
+        return combined
+
+
+# ─────────────────────────────────────────────────────────────
+# CLI 진입점
+# ─────────────────────────────────────────────────────────────
+
+def main() -> None:
+    """
+    CLI 진입점.
+
+    사용 예:
+        # 날짜 범위 수집
+        python -m scraper.engine scrape-range --start 2026-02-01 --end 2026-02-25
+        python -m scraper.engine scrape-range --start 2026-02-01 --end 2026-02-25 \\
+            --batch-size 20 --max-pages 5 --force
+
+        # 최신 기사 감지 및 큐 등록
+        python -m scraper.engine check-latest
+        python -m scraper.engine check-latest --no-queue   # 감지만, 큐 등록 안 함
+        python -m scraper.engine check-latest --language en
+    """
+    import logging
+    import sys
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        stream=sys.stderr,
+    )
+
+    parser = argparse.ArgumentParser(
+        prog="python -m scraper.engine",
+        description="TenAsia 스크래퍼 CLI",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    # ── scrape-range ──────────────────────────────────────────
+    rng = sub.add_parser(
+        "scrape-range",
+        help="특정 날짜 범위의 기사를 수집합니다.",
+    )
+    rng.add_argument(
+        "--start", required=True,
+        help="수집 시작 날짜 (YYYY-MM-DD 또는 YYYY-MM-DDTHH:MM:SS, UTC 기준)",
+    )
+    rng.add_argument(
+        "--end", required=True,
+        help="수집 종료 날짜 (YYYY-MM-DD 또는 YYYY-MM-DDTHH:MM:SS, UTC 기준)",
+    )
+    rng.add_argument("--batch-size", type=int, default=10,
+                     help="한 번에 처리할 최대 URL 수 (기본 10)")
+    rng.add_argument("--max-pages", type=int, default=10,
+                     help="RSS 범위 부족 시 목록 페이지 최대 탐색 수 (기본 10)")
+    rng.add_argument("--language", default="kr",
+                     help="기사 언어 코드 (기본 kr)")
+    rng.add_argument("--job-id", type=int, default=None,
+                     help="연결된 job_queue.id")
+    rng.add_argument("--force", action="store_true",
+                     help="PROCESSED 기사도 재수집 (skip_processed=False)")
+
+    # ── check-latest ──────────────────────────────────────────
+    chk = sub.add_parser(
+        "check-latest",
+        help="DB 보다 새로운 기사를 감지하고 job_queue 에 등록합니다.",
+    )
+    chk.add_argument("--no-queue", action="store_true",
+                     help="큐 등록 없이 감지만 합니다.")
+    chk.add_argument("--language", default="kr",
+                     help="기사 언어 코드 (기본 kr)")
+
+    args = parser.parse_args()
+
+    scraper = TenAsiaScraper()
+
+    if args.command == "scrape-range":
+        scraper.batch_size = args.batch_size
+        start = _cli_parse_date(args.start)
+        end   = _cli_parse_date(args.end, end_of_day=True)
+        result = scraper.scrape_range(
+            start_date=start,
+            end_date=end,
+            job_id=args.job_id,
+            language=args.language,
+            max_pages=args.max_pages,
+            skip_processed=not args.force,
+        )
+        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2, default=str))
+
+    elif args.command == "check-latest":
+        check_result = scraper.check_latest(
+            language=args.language,
+            auto_queue=not args.no_queue,
+        )
+        print(json.dumps(check_result.to_dict(), ensure_ascii=False, indent=2, default=str))
+
+
+if __name__ == "__main__":
+    main()
