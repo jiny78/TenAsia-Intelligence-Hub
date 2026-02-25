@@ -304,39 +304,44 @@ def upsert_article(
     아티클을 삽입하거나 갱신합니다 (source_url 기준 UPSERT).
 
     data 키 (모두 Optional):
-        title_ko, title_en, body_ko, body_en,
-        summary_ko, summary_en,
+        title_ko, title_en,
+        content_ko,                  ← 원문(한국어) 전체 본문
+        summary_ko, summary_en,      ← 요약 (영어 전체 번역 미제공)
+        author,
         artist_name_ko, artist_name_en,
         global_priority, hashtags_ko, hashtags_en,
-        thumbnail_url, published_at, language
+        thumbnail_url, published_at, language,
+        process_status
 
     Returns:
         articles.id (int)
     """
-    import psycopg2.extras as _extras
-
     with _conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
                 INSERT INTO articles (
-                    source_url, language,
-                    title_ko, title_en,
-                    body_ko, body_en,
-                    summary_ko, summary_en,
+                    source_url,     language,
+                    title_ko,       title_en,
+                    content_ko,
+                    summary_ko,     summary_en,
+                    author,
                     artist_name_ko, artist_name_en,
                     global_priority,
-                    hashtags_ko, hashtags_en,
+                    hashtags_ko,    hashtags_en,
                     thumbnail_url,
-                    job_id, published_at
+                    process_status,
+                    job_id,         published_at
                 ) VALUES (
-                    %s, %s,
-                    %s, %s,
-                    %s, %s,
                     %s, %s,
                     %s, %s,
                     %s,
                     %s, %s,
+                    %s,
+                    %s, %s,
+                    %s,
+                    %s, %s,
+                    %s,
                     %s,
                     %s, %s
                 )
@@ -344,16 +349,17 @@ def upsert_article(
                     language        = EXCLUDED.language,
                     title_ko        = COALESCE(EXCLUDED.title_ko,        articles.title_ko),
                     title_en        = COALESCE(EXCLUDED.title_en,        articles.title_en),
-                    body_ko         = COALESCE(EXCLUDED.body_ko,         articles.body_ko),
-                    body_en         = COALESCE(EXCLUDED.body_en,         articles.body_en),
+                    content_ko      = COALESCE(EXCLUDED.content_ko,      articles.content_ko),
                     summary_ko      = COALESCE(EXCLUDED.summary_ko,      articles.summary_ko),
                     summary_en      = COALESCE(EXCLUDED.summary_en,      articles.summary_en),
+                    author          = COALESCE(EXCLUDED.author,          articles.author),
                     artist_name_ko  = COALESCE(EXCLUDED.artist_name_ko,  articles.artist_name_ko),
                     artist_name_en  = COALESCE(EXCLUDED.artist_name_en,  articles.artist_name_en),
                     global_priority = EXCLUDED.global_priority,
                     hashtags_ko     = EXCLUDED.hashtags_ko,
                     hashtags_en     = EXCLUDED.hashtags_en,
                     thumbnail_url   = COALESCE(EXCLUDED.thumbnail_url,   articles.thumbnail_url),
+                    process_status  = EXCLUDED.process_status,
                     updated_at      = NOW()
                 RETURNING id
                 """,
@@ -362,16 +368,17 @@ def upsert_article(
                     data.get("language", "kr"),
                     data.get("title_ko"),
                     data.get("title_en"),
-                    data.get("body_ko"),
-                    data.get("body_en"),
+                    data.get("content_ko"),
                     data.get("summary_ko"),
                     data.get("summary_en"),
+                    data.get("author"),
                     data.get("artist_name_ko"),
                     data.get("artist_name_en"),
                     data.get("global_priority", False),
                     data.get("hashtags_ko") or [],
                     data.get("hashtags_en") or [],
                     data.get("thumbnail_url"),
+                    data.get("process_status", "PROCESSED"),
                     job_id,
                     data.get("published_at"),
                 ),

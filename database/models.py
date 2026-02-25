@@ -176,6 +176,14 @@ class Artist(Base):
         comment="공식 확인된 아티스트 여부",
     )
 
+    # ── 소개글 (다국어) ───────────────────────────────────────
+    bio_ko: Mapped[Optional[str]] = mapped_column(
+        Text, comment="아티스트 소개글 (한국어)"
+    )
+    bio_en: Mapped[Optional[str]] = mapped_column(
+        Text, comment="아티스트 소개글 (영어)"
+    )
+
     # ── 시간 ──────────────────────────────────────────────────
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, nullable=False, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, nullable=False, server_default=func.now())
@@ -192,6 +200,9 @@ class Artist(Base):
         Index("idx_artists_name_en",     "name_en"),
         Index("idx_artists_agency",      "agency"),
         Index("idx_artists_is_verified", "is_verified"),
+        # GIN Trigram 인덱스 (0002/0003 마이그레이션에서 op.execute()로 생성)
+        # idx_artists_trgm_name_ko, idx_artists_trgm_name_en
+        # idx_artists_trgm_bio_ko,  idx_artists_trgm_bio_en
     )
 
     def __repr__(self) -> str:
@@ -234,9 +245,10 @@ class Article(Base):
     title_ko: Mapped[Optional[str]] = mapped_column(Text)
     title_en: Mapped[Optional[str]] = mapped_column(Text)
 
-    # ── 본문 (다국어) ─────────────────────────────────────────
-    body_ko: Mapped[Optional[str]] = mapped_column(Text)
-    body_en: Mapped[Optional[str]] = mapped_column(Text)
+    # ── 원문 (한국어 전문, 비용 효율상 영어 전체 번역 미제공) ──
+    content_ko: Mapped[Optional[str]] = mapped_column(
+        Text, comment="원문(한국어) 전체 본문"
+    )
 
     # ── 요약 / SNS 캡션 (다국어) ──────────────────────────────
     summary_ko: Mapped[Optional[str]] = mapped_column(Text)
@@ -291,6 +303,13 @@ class Article(Base):
               postgresql_where=text("global_priority = true")),
         Index("idx_articles_language_date",       "language", "created_at"),
     )
+
+    # ── GIN/Trigram 인덱스 현황 (0001, 0003 마이그레이션에서 op.execute()로 생성) ──
+    # FTS  GIN : title_ko + content_ko + summary_ko  (simple, 한국어)
+    # FTS  GIN : title_en + summary_en               (english, 영어)
+    # Trgm GIN : title_ko, title_en, content_ko, summary_ko, summary_en
+    #            artist_name_ko, artist_name_en
+    # Array GIN: hashtags_ko, hashtags_en
 
     def __repr__(self) -> str:
         title = str(self.title_ko or "")[:30]
