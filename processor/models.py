@@ -78,6 +78,11 @@ class ArticleExtracted(BaseModel):
     # 썸네일 (process_thumbnail 이후 S3 URL)
     thumbnail_url:   Optional[str]  = None
 
+    # AI 생성 SEO 해시태그 (메타데이터 포함 JSONB)
+    # 구조: {"tags": [...], "model": "...", "confidence": 0.95, "generated_at": "..."}
+    # hashtags_en(단순 배열)과의 차이: 생성 이력·신뢰도 추적 가능
+    seo_hashtags:    Optional[dict] = None
+
     model_config = {"str_strip_whitespace": True}
 
     # ── 유효성 검증 ──────────────────────────────────────────

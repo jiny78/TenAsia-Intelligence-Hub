@@ -21,6 +21,7 @@ scraper/schema.py — Articles 테이블 DDL 및 다국어 인덱스
   │ artist_name_en              GIN trgm    영어 아티스트명 검색        │
   │ hashtags_ko                 GIN array   한국어 해시태그 포함 검색  │
   │ hashtags_en                 GIN array   영어 SEO 해시태그 검색     │
+  │ seo_hashtags                GIN JSONB   AI SEO 태그 메타 검색 ★NEW│
   │ global_priority             B-tree      글로벌 아티스트 필터링     │
   │ language                    B-tree      언어 필터링               │
   └──────────────────────────────────────────────────────────────────┘
@@ -80,6 +81,11 @@ CREATE TABLE IF NOT EXISTS articles (
     -- ── SEO 해시태그 (배열) ───────────────────────────────────
     hashtags_ko     TEXT[]          NOT NULL DEFAULT '{}',
     hashtags_en     TEXT[]          NOT NULL DEFAULT '{}',
+
+    -- ── AI 생성 SEO 해시태그 (JSONB, 메타데이터 포함) ──────────
+    -- hashtags_en(단순 배열)과 달리 생성 모델·신뢰도·카테고리 정보를 함께 저장
+    -- 예: {"tags":["BTS","KPOP"],"model":"gemini-2.0-flash","confidence":0.95}
+    seo_hashtags    JSONB,
 
     -- ── 미디어 ───────────────────────────────────────────────
     thumbnail_url   TEXT,
@@ -215,6 +221,15 @@ CREATE INDEX IF NOT EXISTS idx_articles_artist_en_date
 
 CREATE INDEX IF NOT EXISTS idx_articles_process_status
     ON articles (process_status, created_at DESC);
+
+-- ============================================================
+-- 5. SEO 해시태그 — GIN (JSONB 키/값 검색)
+--    WHERE seo_hashtags @> '{"tags": ["BTS"]}'
+-- ============================================================
+
+CREATE INDEX IF NOT EXISTS idx_articles_seo_hashtags
+    ON articles USING GIN (seo_hashtags)
+    WHERE seo_hashtags IS NOT NULL;
 """
 
 

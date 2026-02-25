@@ -7,6 +7,7 @@ database/models.py — SQLAlchemy ORM 모델
     articles        — 수집·정제된 아티클 (다국어)
     entity_mappings — 아티클 ↔ 아티스트/그룹/이벤트 연결 (신뢰도 점수 포함)
     system_logs     — 스크래핑·AI 처리 이력 (append-only)
+    glossary        — 한↔영 번역 용어 사전 (AI 번역 일관성 확보)
 
 설계 원칙:
     - 모든 테이블에 created_at / updated_at (TIMESTAMPTZ)
@@ -85,6 +86,13 @@ class LogCategory(str, enum.Enum):
     DB_WRITE   = "DB_WRITE"    # DB UPSERT
     S3_UPLOAD  = "S3_UPLOAD"   # 이미지 S3 업로드
     API_CALL   = "API_CALL"    # 외부 API 호출 (일반)
+
+
+class GlossaryCategory(str, enum.Enum):
+    """용어 분류 — glossary.category"""
+    ARTIST = "ARTIST"  # 아티스트/그룹명    (예: 방탄소년단 → BTS)
+    AGENCY = "AGENCY"  # 소속사명          (예: 하이브 → HYBE)
+    EVENT  = "EVENT"   # 공연·방송·시상식명 (예: 뮤직뱅크 → Music Bank)
 
 
 # ═════════════════════════════════════════════════════════════
@@ -184,6 +192,18 @@ class Artist(Base):
         Text, comment="아티스트 소개글 (영어)"
     )
 
+    # ── 번역 우선순위 ───────────────────────────────────────────
+    # AI 번역 비용 통제 — 아티스트별 번역 정책 결정
+    #   1 : 최우선 — title_en + summary_en + hashtags_en 전체 번역 (글로벌 팬덤 아티스트)
+    #   2 : 요약만  — summary_en 만 번역 (국내 인지도 있으나 글로벌 팬덤 제한)
+    #   3 : 번역 제외 — 한국어 최소 추출만 (국내 아티스트 / 신인)
+    #   NULL: 미분류 (신규 아티스트 등록 시 초기 상태)
+    global_priority: Mapped[Optional[int]] = mapped_column(
+        Integer,
+        nullable=True,
+        comment="번역 우선순위: 1=전체번역, 2=요약만, 3=번역제외, NULL=미분류",
+    )
+
     # ── 시간 ──────────────────────────────────────────────────
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, nullable=False, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, nullable=False, server_default=func.now())
@@ -195,11 +215,20 @@ class Artist(Base):
     )
 
     __table_args__ = (
+        CheckConstraint(
+            "global_priority IS NULL OR global_priority IN (1, 2, 3)",
+            name="ck_artists_global_priority",
+        ),
         # 이름 검색용 B-tree (트라이그램 GIN 은 마이그레이션에서 op.execute()로 생성)
         Index("idx_artists_name_ko",     "name_ko"),
         Index("idx_artists_name_en",     "name_en"),
         Index("idx_artists_agency",      "agency"),
         Index("idx_artists_is_verified", "is_verified"),
+        # 번역 우선순위 필터 — NULL 제외 (NOT NULL 행만 인덱스)
+        Index(
+            "idx_artists_global_priority", "global_priority",
+            postgresql_where=text("global_priority IS NOT NULL"),
+        ),
         # GIN Trigram 인덱스 (0002/0003 마이그레이션에서 op.execute()로 생성)
         # idx_artists_trgm_name_ko, idx_artists_trgm_name_en
         # idx_artists_trgm_bio_ko,  idx_artists_trgm_bio_en
@@ -273,6 +302,24 @@ class Article(Base):
         ARRAY(Text), nullable=False, default=list, server_default=text("ARRAY[]::text[]"),
     )
 
+    # ── AI 생성 SEO 해시태그 (JSONB — 메타데이터 포함) ─────────
+    # 단순 배열(hashtags_en)과의 차이:
+    #   hashtags_en  : 기본 해시태그 배열 (SNS 게시 등 단순 활용)
+    #   seo_hashtags : 생성 모델·신뢰도·카테고리 등 메타데이터 포함 (SEO 전략 고도화)
+    # 구조 예시:
+    #   {
+    #     "tags":         ["BTS", "방탄소년단", "KPOP", "NewAlbum"],
+    #     "model":        "gemini-2.0-flash",
+    #     "generated_at": "2026-02-25T09:00:00Z",
+    #     "confidence":   0.95,
+    #     "categories":   {"brand": ["BTS"], "genre": ["KPOP"], "event": ["NewAlbum"]}
+    #   }
+    seo_hashtags: Mapped[Optional[dict]] = mapped_column(
+        JSONB,
+        nullable=True,
+        comment="AI 생성 영어 SEO 해시태그 (생성 모델·신뢰도·카테고리 메타데이터 포함)",
+    )
+
     # ── 미디어 ────────────────────────────────────────────────
     thumbnail_url: Mapped[Optional[str]] = mapped_column(Text)
 
@@ -304,12 +351,13 @@ class Article(Base):
         Index("idx_articles_language_date",       "language", "created_at"),
     )
 
-    # ── GIN/Trigram 인덱스 현황 (0001, 0003 마이그레이션에서 op.execute()로 생성) ──
+    # ── GIN/Trigram 인덱스 현황 (0001, 0003, 0004 마이그레이션에서 op.execute()로 생성) ──
     # FTS  GIN : title_ko + content_ko + summary_ko  (simple, 한국어)
     # FTS  GIN : title_en + summary_en               (english, 영어)
     # Trgm GIN : title_ko, title_en, content_ko, summary_ko, summary_en
     #            artist_name_ko, artist_name_en
     # Array GIN: hashtags_ko, hashtags_en
+    # JSONB GIN: seo_hashtags  (0004 마이그레이션에서 생성)
 
     def __repr__(self) -> str:
         title = str(self.title_ko or "")[:30]
@@ -487,4 +535,85 @@ class SystemLog(Base):
         return (
             f"<SystemLog id={self.id} [{self.level!r}] "
             f"{self.category!r}:{self.event!r}>"
+        )
+
+
+# ═════════════════════════════════════════════════════════════
+# Glossary
+# ═════════════════════════════════════════════════════════════
+
+class Glossary(Base):
+    """
+    한↔영 번역 용어 사전.
+
+    AI 번역 프롬프트에 삽입되어 고유명사 표기 일관성을 확보합니다.
+    예: "방탄소년단은 항상 BTS로 번역할 것"
+
+    category 별 활용:
+        ARTIST : 아티스트/그룹명 — AI 프롬프트 삽입으로 번역 통일
+                 예) 방탄소년단 → BTS, 블랙핑크 → BLACKPINK
+        AGENCY : 소속사명 — 공식 영문 표기 강제
+                 예) 하이브 → HYBE, SM엔터테인먼트 → SM Entertainment
+        EVENT  : 공연·방송·시상식명 — 현지화 vs 음역 결정
+                 예) 뮤직뱅크 → Music Bank, 멜론뮤직어워드 → Melon Music Awards
+
+    유니크 제약:
+        (term_ko, category) — 같은 카테고리 내 한국어 원어 중복 방지
+        → 동명이인 아티스트는 description 으로 구분
+
+    인덱스 (0004 마이그레이션에서 생성):
+        idx_glossary_trgm_ko  : term_ko 트라이그램 (부분 매칭 검색)
+        idx_glossary_trgm_en  : term_en 트라이그램 (영어 원어 역방향 검색)
+        idx_glossary_category : category B-tree (분류별 일괄 조회)
+    """
+    __tablename__ = "glossary"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+
+    term_ko: Mapped[str] = mapped_column(
+        String(300),
+        nullable=False,
+        comment="한국어 원어 (예: 방탄소년단, 하이브, 뮤직뱅크)",
+    )
+    term_en: Mapped[Optional[str]] = mapped_column(
+        String(300),
+        nullable=True,
+        comment="영어 공식 표기 (예: BTS, HYBE, Music Bank)",
+    )
+    category: Mapped[GlossaryCategory] = mapped_column(
+        SAEnum(GlossaryCategory, name="glossary_category_enum", create_type=False),
+        nullable=False,
+        comment="용어 분류 (ARTIST / AGENCY / EVENT)",
+    )
+    description: Mapped[Optional[str]] = mapped_column(
+        Text,
+        nullable=True,
+        comment="추가 설명 (예: '7인조 보이그룹, 2013년 데뷔', 동명이인 구분용)",
+    )
+
+    # ── 시간 ──────────────────────────────────────────────────
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMPTZ, nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMPTZ, nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        # 같은 카테고리 내 한국어 원어 중복 방지
+        UniqueConstraint("term_ko", "category", name="uq_glossary_term_category"),
+        # 분류별 일괄 조회 (프롬프트 구성 시 category='ARTIST' 전체 로드 등)
+        Index("idx_glossary_category", "category"),
+        # term_ko B-tree (일치 조회용 — 트라이그램은 마이그레이션에서 op.execute())
+        Index("idx_glossary_term_ko",  "term_ko"),
+        # GIN Trigram 인덱스 (0004 마이그레이션에서 op.execute()로 생성)
+        # idx_glossary_trgm_ko : term_ko 부분 매칭 검색
+        # idx_glossary_trgm_en : term_en 역방향 검색
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<Glossary id={self.id} "
+            f"{self.term_ko!r} → {self.term_en!r} "
+            f"[{self.category!r}]>"
         )

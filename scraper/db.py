@@ -310,6 +310,7 @@ def upsert_article(
         author,
         artist_name_ko, artist_name_en,
         global_priority, hashtags_ko, hashtags_en,
+        seo_hashtags,                ← AI SEO 해시태그 (JSONB, 메타데이터 포함)
         thumbnail_url, published_at, language,
         process_status
 
@@ -329,6 +330,7 @@ def upsert_article(
                     artist_name_ko, artist_name_en,
                     global_priority,
                     hashtags_ko,    hashtags_en,
+                    seo_hashtags,
                     thumbnail_url,
                     process_status,
                     job_id,         published_at
@@ -341,6 +343,7 @@ def upsert_article(
                     %s, %s,
                     %s,
                     %s, %s,
+                    %s::jsonb,
                     %s,
                     %s,
                     %s, %s
@@ -358,6 +361,7 @@ def upsert_article(
                     global_priority = EXCLUDED.global_priority,
                     hashtags_ko     = EXCLUDED.hashtags_ko,
                     hashtags_en     = EXCLUDED.hashtags_en,
+                    seo_hashtags    = COALESCE(EXCLUDED.seo_hashtags,    articles.seo_hashtags),
                     thumbnail_url   = COALESCE(EXCLUDED.thumbnail_url,   articles.thumbnail_url),
                     process_status  = EXCLUDED.process_status,
                     updated_at      = NOW()
@@ -377,6 +381,7 @@ def upsert_article(
                     data.get("global_priority", False),
                     data.get("hashtags_ko") or [],
                     data.get("hashtags_en") or [],
+                    json.dumps(data.get("seo_hashtags")) if data.get("seo_hashtags") else None,
                     data.get("thumbnail_url"),
                     data.get("process_status", "PROCESSED"),
                     job_id,
