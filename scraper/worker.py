@@ -35,6 +35,7 @@ from scraper.db import (
     increment_retry,
     update_job_status,
 )
+from scraper.engine import ForbiddenError, TenAsiaScraper
 
 logger = logging.getLogger(__name__)
 
@@ -69,44 +70,65 @@ def _get_worker_id() -> str:
 
 # ── 작업 처리 ────────────────────────────────────────────────
 
-def _do_scrape(params: dict) -> dict:
+def _do_scrape(params: dict, job_id: Optional[int] = None) -> dict:
     """
-    실제 스크래핑 로직을 실행합니다.
+    TenAsiaScraper 를 사용하여 실제 스크래핑을 실행합니다.
 
     params 예시:
         {
-            "source_url": "https://tenasia.hankyung.com/...",
+            "source_url": "https://tenasia.hankyung.com/article/123",  # 단일 URL
+            "urls":       ["https://...", "https://..."],              # 복수 URL (우선)
             "language":   "kr",
             "platforms":  ["x", "instagram"],
+            "batch_size": 10,   # 생략 시 기본값 10
         }
 
     Returns:
-        결과 딕셔너리 (job_queue.result 에 저장됨)
+        BatchResult.to_dict() 기반 딕셔너리 (job_queue.result 에 저장됨):
+            {
+                "total":     10,
+                "processed": 8,
+                "success":   [...],
+                "failed":    [...],
+                "platforms": [...],
+            }
+
+    Raises:
+        ForbiddenError: HTTP 403 차단 감지 — process_job 이 재시도 없이 즉시 실패 처리
+        ValueError:     params 에 URL 이 없을 때
     """
-    source_url = params.get("source_url", "")
-    language   = params.get("language", "kr")
-    platforms  = params.get("platforms", [])
+    # URL 목록: params["urls"] 우선, 없으면 source_url 단건 래핑
+    urls: list[str] = params.get("urls") or []
+    if not urls:
+        source_url = params.get("source_url", "").strip()
+        if source_url:
+            urls = [source_url]
 
-    logger.info("스크래핑 시작 | url=%s lang=%s platforms=%s", source_url, language, platforms)
+    if not urls:
+        raise ValueError("params 에 source_url 또는 urls 가 없습니다.")
 
-    # ────────────────────────────────────────────────────────
-    # TODO: 실제 스크래핑 엔진 호출로 교체하세요.
-    #
-    # 예시:
-    #   from engine import ScraperEngine
-    #   engine = ScraperEngine()
-    #   result = engine.run(source_url, language, platforms)
-    #   return result
-    # ────────────────────────────────────────────────────────
+    language   = params.get("language",   "kr")
+    platforms  = params.get("platforms",  [])
+    batch_size = int(params.get("batch_size", 10))
 
-    # 플레이스홀더 — 더미 결과 반환
-    return {
-        "source_url": source_url,
-        "language":   language,
-        "platforms":  platforms,
-        "articles_scraped": 0,
-        "note": "TODO: 실제 엔진 연결 필요",
-    }
+    logger.info(
+        "스크래핑 시작 | urls=%d lang=%s job_id=%s",
+        len(urls), language, job_id,
+    )
+
+    scraper = TenAsiaScraper(batch_size=batch_size)
+    result  = scraper.scrape_batch(urls=urls, job_id=job_id, language=language)
+
+    # fatal 실패(403 차단) 감지 → ForbiddenError 재발생으로 재시도 방지
+    fatal = [f for f in result.failed if f.get("fatal")]
+    if fatal:
+        raise ForbiddenError(
+            f"IP/UA 차단 감지 — 재시도 불필요: {fatal[0].get('url', '')}"
+        )
+
+    result_dict = result.to_dict()
+    result_dict["platforms"] = platforms
+    return result_dict
 
 
 def process_job(job: dict) -> None:
@@ -122,12 +144,21 @@ def process_job(job: dict) -> None:
 
     try:
         if job_type == "scrape":
-            result = _do_scrape(params)
+            result = _do_scrape(params, job_id=job_id)
         else:
             raise ValueError(f"알 수 없는 job_type: {job_type!r}")
 
         update_job_status(job_id, "completed", result=result)
         logger.info("작업 완료 | id=%d", job_id)
+
+    except ForbiddenError as exc:
+        # 403 IP/UA 차단: 재시도해도 의미 없으므로 즉시 실패 처리
+        error_msg = f"{type(exc).__name__}: {exc}"
+        logger.error(
+            "IP/UA 차단 — 재시도 없이 실패 처리 | id=%d error=%s",
+            job_id, error_msg,
+        )
+        update_job_status(job_id, STATUS_FAILED, error_msg=error_msg)
 
     except Exception as exc:
         error_msg = f"{type(exc).__name__}: {exc}"
