@@ -174,9 +174,11 @@ source .venv/bin/activate          # macOS/Linux
 # 3. 의존성 설치
 pip install -r requirements.txt
 
-# 4. 환경 변수 설정
-cp .env.example .env
-# .env 파일을 열어 GEMINI_API_KEY, DATABASE_URL 입력
+# 4. 환경 변수 설정 (대화형 마법사 사용 권장)
+python setup_env.py
+# 또는 수동으로:
+#   cp .env.example .env
+#   .env 파일을 열어 GEMINI_API_KEY, DATABASE_URL 입력
 
 # 5. 데이터베이스 마이그레이션
 alembic upgrade head
@@ -385,13 +387,59 @@ processor/cleaner.py
 
 ## 🤝 기여 가이드
 
-### 브랜치 전략
+### 브랜치 전략 (Git Flow)
 
 ```
-main          ← 프로덕션 (직접 push 금지)
-feat/*        ← 새 기능
-fix/*         ← 버그 수정
-chore/*       ← 설정, 의존성
+main
+ │  프로덕션 브랜치 (보호됨 — 직접 push 금지)
+ │  모든 배포는 여기서 시작됩니다.
+ │
+ ├── develop  ◄────────────────────────────────────────────┐
+ │    │  통합 브랜치 (일상 작업의 기준점)                  │
+ │    │                                                    │
+ │    ├── feature/기능명     새 기능 개발 → PR → develop   │
+ │    ├── fix/이슈번호       버그 수정    → PR → develop   │
+ │    └── chore/작업명       설정/의존성  → PR → develop   │
+ │                                                         │
+ ├── release/v1.x.0          develop → 검증 → main + tag ─┘
+ │    │  배포 준비 (버전 범프, CHANGELOG)
+ │    └── PR → main  (tag: v1.x.0)
+ │
+ └── hotfix/긴급수정명       main에서 분기 → PR → main + develop
+      긴급 프로덕션 패치 (일반 작업 흐름 우회)
+```
+
+#### 브랜치 설명
+
+| 브랜치 | 설명 | 소스 | 대상 |
+|--------|------|------|------|
+| `main` | 프로덕션 코드. 태그(`v*`) 기준 배포 | — | — |
+| `develop` | 다음 릴리스를 위한 통합 브랜치 | `main` | — |
+| `feature/*` | 새 기능 단위 작업 | `develop` | `develop` |
+| `fix/*` | 개발 중 버그 수정 | `develop` | `develop` |
+| `chore/*` | 설정·의존성·문서 변경 | `develop` | `develop` |
+| `release/*` | 배포 전 최종 검증 | `develop` | `main` + `develop` |
+| `hotfix/*` | 프로덕션 긴급 패치 | `main` | `main` + `develop` |
+
+#### 일반 작업 흐름
+
+```bash
+# 1. develop 브랜치를 최신 상태로 업데이트
+git checkout develop && git pull origin develop
+
+# 2. 기능 브랜치 생성
+git checkout -b feature/scraper-tenasia
+
+# 3. 작업 후 커밋
+git add scraper/sources/tenasia.py
+git commit -m "feat: add TenAsia article scraper"
+
+# 4. develop 으로 PR 생성
+git push origin feature/scraper-tenasia
+# → GitHub에서 develop 대상 PR 열기
+
+# 5. 리뷰 통과 후 Squash Merge → develop
+# 6. release/vX.Y.Z 브랜치에서 main 으로 PR → 배포
 ```
 
 ### 커밋 메시지 규칙 (Conventional Commits)
@@ -407,9 +455,9 @@ chore:    빌드, 설정, 의존성 변경
 
 ### Pull Request
 
-1. `feat/your-feature` 브랜치 생성
+1. `feature/your-feature` 또는 `fix/issue-번호` 브랜치 생성
 2. 변경사항 커밋 (위 규칙 준수)
-3. GitHub PR 생성 → `main` 대상
+3. GitHub PR 생성 → **`develop`** 대상 (긴급 패치는 `main`)
 4. GitHub Actions 테스트 통과 확인
 5. 리뷰 후 Squash Merge
 
