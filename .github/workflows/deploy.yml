@@ -6,9 +6,8 @@ on:
   workflow_dispatch:
 
 env:
-  AWS_REGION:           ap-northeast-1
-  ECR_REPO_API:         tenasia-intelligence-hub
-  ECR_REPO_FRONTEND:    tenasia-intelligence-hub-frontend
+  AWS_REGION:   ap-northeast-1
+  ECR_REPO:     tenasia-intelligence-hub   # API/Frontend 공용 (태그로 구분)
 
 jobs:
   # ────────────────────────────────────────────────────
@@ -70,14 +69,14 @@ jobs:
           docker build \
             --build-arg BUILD_DATE="$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
             --build-arg GIT_COMMIT="${{ github.sha }}" \
-            -t "$REGISTRY/$ECR_REPO_API:$IMAGE_TAG" \
-            -t "$REGISTRY/$ECR_REPO_API:latest" \
+            -t "$REGISTRY/$ECR_REPO:api-$IMAGE_TAG" \
+            -t "$REGISTRY/$ECR_REPO:api-latest" \
             .
 
-          docker push "$REGISTRY/$ECR_REPO_API:$IMAGE_TAG"
-          docker push "$REGISTRY/$ECR_REPO_API:latest"
+          docker push "$REGISTRY/$ECR_REPO:api-$IMAGE_TAG"
+          docker push "$REGISTRY/$ECR_REPO:api-latest"
 
-          echo "image-uri=$REGISTRY/$ECR_REPO_API:$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+          echo "image-uri=$REGISTRY/$ECR_REPO:api-$IMAGE_TAG" >> "$GITHUB_OUTPUT"
 
   # ────────────────────────────────────────────────────
   # Job 2-B: Next.js 이미지 빌드 & ECR Push
@@ -109,35 +108,24 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: ECR 레포지토리 생성 (없을 때만)
-        env:
-          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-        run: |
-          aws ecr describe-repositories --repository-names "$ECR_REPO_FRONTEND" \
-            --region "$AWS_REGION" > /dev/null 2>&1 || \
-          aws ecr create-repository \
-            --repository-name "$ECR_REPO_FRONTEND" \
-            --region "$AWS_REGION" \
-            --image-scanning-configuration scanOnPush=true \
-            --image-tag-mutability MUTABLE
-
       - name: Build & Push Frontend image
         id: push
         env:
           REGISTRY:  ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
+          # 기존 ECR 레포(tenasia-intelligence-hub)를 공유, frontend- 태그 접두어로 구분
           docker build \
             -f web-next/Dockerfile \
             --target production \
-            -t "$REGISTRY/$ECR_REPO_FRONTEND:$IMAGE_TAG" \
-            -t "$REGISTRY/$ECR_REPO_FRONTEND:latest" \
+            -t "$REGISTRY/$ECR_REPO:frontend-$IMAGE_TAG" \
+            -t "$REGISTRY/$ECR_REPO:frontend-latest" \
             web-next/
 
-          docker push "$REGISTRY/$ECR_REPO_FRONTEND:$IMAGE_TAG"
-          docker push "$REGISTRY/$ECR_REPO_FRONTEND:latest"
+          docker push "$REGISTRY/$ECR_REPO:frontend-$IMAGE_TAG"
+          docker push "$REGISTRY/$ECR_REPO:frontend-latest"
 
-          echo "image-uri=$REGISTRY/$ECR_REPO_FRONTEND:$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+          echo "image-uri=$REGISTRY/$ECR_REPO:frontend-$IMAGE_TAG" >> "$GITHUB_OUTPUT"
 
   # ────────────────────────────────────────────────────
   # Job 3: FastAPI App Runner 배포
