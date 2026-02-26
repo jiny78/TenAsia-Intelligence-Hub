@@ -6,8 +6,9 @@ on:
   workflow_dispatch:
 
 env:
-  AWS_REGION:      ap-northeast-1
-  ECR_REPOSITORY:  tenasia-intelligence-hub
+  AWS_REGION:           ap-northeast-1
+  ECR_REPO_API:         tenasia-intelligence-hub
+  ECR_REPO_FRONTEND:    tenasia-intelligence-hub-frontend
 
 jobs:
   # ────────────────────────────────────────────────────
@@ -30,19 +31,18 @@ jobs:
 
       - name: Run tests
         run: python -m pytest test_*.py -v --tb=short
-        # 테스트가 없을 때 오류 방지
         continue-on-error: true
 
   # ────────────────────────────────────────────────────
-  # Job 2: Docker 빌드 & ECR Push
+  # Job 2-A: FastAPI 이미지 빌드 & ECR Push
   # ────────────────────────────────────────────────────
-  build:
-    name: Build & Push
+  build-api:
+    name: Build & Push API
     runs-on: ubuntu-latest
     needs: test
 
     permissions:
-      id-token: write   # OIDC 토큰 (AWS 인증 — 비밀번호 불필요)
+      id-token: write
       contents: read
 
     outputs:
@@ -61,7 +61,7 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build & Push image
+      - name: Build & Push API image
         id: push
         env:
           REGISTRY:  ${{ steps.login-ecr.outputs.registry }}
@@ -70,22 +70,82 @@ jobs:
           docker build \
             --build-arg BUILD_DATE="$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
             --build-arg GIT_COMMIT="${{ github.sha }}" \
-            -t "$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" \
-            -t "$REGISTRY/$ECR_REPOSITORY:latest" \
+            -t "$REGISTRY/$ECR_REPO_API:$IMAGE_TAG" \
+            -t "$REGISTRY/$ECR_REPO_API:latest" \
             .
 
-          docker push "$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
-          docker push "$REGISTRY/$ECR_REPOSITORY:latest"
+          docker push "$REGISTRY/$ECR_REPO_API:$IMAGE_TAG"
+          docker push "$REGISTRY/$ECR_REPO_API:latest"
 
-          echo "image-uri=$REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+          echo "image-uri=$REGISTRY/$ECR_REPO_API:$IMAGE_TAG" >> "$GITHUB_OUTPUT"
 
   # ────────────────────────────────────────────────────
-  # Job 3: App Runner 배포
+  # Job 2-B: Next.js 이미지 빌드 & ECR Push
+  #   - NEXT_PUBLIC_API_URL 미설정 → /api 프록시 경유
+  #   - FASTAPI_URL 은 deploy-frontend 에서 런타임 주입
   # ────────────────────────────────────────────────────
-  deploy:
-    name: Deploy App Runner
+  build-frontend:
+    name: Build & Push Frontend
     runs-on: ubuntu-latest
-    needs: build
+    needs: test
+
+    permissions:
+      id-token: write
+      contents: read
+
+    outputs:
+      image-uri: ${{ steps.push.outputs.image-uri }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: ECR 레포지토리 생성 (없을 때만)
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          aws ecr describe-repositories --repository-names "$ECR_REPO_FRONTEND" \
+            --region "$AWS_REGION" > /dev/null 2>&1 || \
+          aws ecr create-repository \
+            --repository-name "$ECR_REPO_FRONTEND" \
+            --region "$AWS_REGION" \
+            --image-scanning-configuration scanOnPush=true \
+            --image-tag-mutability MUTABLE
+
+      - name: Build & Push Frontend image
+        id: push
+        env:
+          REGISTRY:  ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build \
+            -f web-next/Dockerfile \
+            --target production \
+            -t "$REGISTRY/$ECR_REPO_FRONTEND:$IMAGE_TAG" \
+            -t "$REGISTRY/$ECR_REPO_FRONTEND:latest" \
+            web-next/
+
+          docker push "$REGISTRY/$ECR_REPO_FRONTEND:$IMAGE_TAG"
+          docker push "$REGISTRY/$ECR_REPO_FRONTEND:latest"
+
+          echo "image-uri=$REGISTRY/$ECR_REPO_FRONTEND:$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+
+  # ────────────────────────────────────────────────────
+  # Job 3: FastAPI App Runner 배포
+  # ────────────────────────────────────────────────────
+  deploy-api:
+    name: Deploy API
+    runs-on: ubuntu-latest
+    needs: build-api
 
     permissions:
       id-token: write
@@ -95,6 +155,9 @@ jobs:
       name: production
       url: ${{ steps.url.outputs.value }}
 
+    outputs:
+      api-url: ${{ steps.url.outputs.value }}
+
     steps:
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
@@ -102,12 +165,12 @@ jobs:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Deploy (start-deployment or recreate if needed)
+      - name: Deploy API (start-deployment or recreate if needed)
         id: deploy
         env:
-          IMAGE_URI:       ${{ needs.build.outputs.image-uri }}
-          DATABASE_URL:    ${{ secrets.DATABASE_URL }}
-          GEMINI_API_KEY:  ${{ secrets.GEMINI_API_KEY }}
+          IMAGE_URI:      ${{ needs.build-api.outputs.image-uri }}
+          DATABASE_URL:   ${{ secrets.DATABASE_URL }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
           set -euo pipefail
 
@@ -115,7 +178,6 @@ jobs:
           ECR_ROLE="arn:aws:iam::${ACCOUNT_ID}:role/AppRunnerECRAccessRole"
           SERVICE_NAME="tenasia-intelligence-hub"
 
-          # 서비스 ARN을 이름으로 동적 조회 (Secret 의존성 제거)
           SERVICE_ARN=$(aws apprunner list-services \
             --query "ServiceSummaryList[?ServiceName=='${SERVICE_NAME}'].ServiceArn | [0]" \
             --output text 2>/dev/null || true)
@@ -127,10 +189,9 @@ jobs:
               --service-arn "$SERVICE_ARN" \
               --query 'Service.Status' --output text 2>/dev/null || echo "NOT_FOUND")
           fi
-          echo "현재 서비스 상태: $STATUS (ARN: ${SERVICE_ARN:-없음})"
+          echo "현재 API 서비스 상태: $STATUS"
 
           if [ "$STATUS" = "RUNNING" ]; then
-            # ── 정상 상태: 환경 변수 업데이트 후 배포 트리거 ────
             aws apprunner update-service \
               --service-arn "$SERVICE_ARN" \
               --source-configuration "{
@@ -148,36 +209,25 @@ jobs:
                 \"AuthenticationConfiguration\": {\"AccessRoleArn\": \"$ECR_ROLE\"},
                 \"AutoDeploymentsEnabled\": false
               }"
-            echo "서비스 업데이트 완료"
             echo "service-arn=$SERVICE_ARN" >> "$GITHUB_OUTPUT"
 
           else
-            # ── 비정상/미존재: 삭제 후 재생성 ────────────────────
-            echo "서비스 비정상 상태($STATUS) → 삭제 후 재생성 진행"
+            echo "서비스 비정상 상태($STATUS) → 삭제 후 재생성"
 
-            # 기존 서비스 삭제 (없거나 이미 삭제 중이면 무시)
             if [ "$STATUS" != "NOT_FOUND" ] && [ "$STATUS" != "DELETED" ]; then
-              echo "서비스 삭제 요청..."
               aws apprunner delete-service --service-arn "$SERVICE_ARN" || true
             fi
 
-            # 서비스 이름이 list-services에서 사라질 때까지 대기 (최대 10분)
-            # describe-service는 삭제 중에도 에러를 반환해 조기 탈출하는 문제가 있으므로
-            # list-services로 이름 소멸 여부를 확인합니다.
             echo "서비스 이름 해제 대기 중 (최대 10분)..."
             for i in $(seq 1 30); do
               FOUND=$(aws apprunner list-services \
                 --query "ServiceSummaryList[?ServiceName=='${SERVICE_NAME}'].ServiceName | [0]" \
                 --output text 2>/dev/null || echo "")
               echo "  [삭제 대기 $i/30] 잔존: ${FOUND:-없음}"
-              if [ -z "$FOUND" ] || [ "$FOUND" = "None" ]; then
-                echo "  서비스 이름 해제 확인"
-                break
-              fi
+              if [ -z "$FOUND" ] || [ "$FOUND" = "None" ]; then break; fi
               sleep 20
             done
 
-            # 소스 설정 JSON 파일 생성 (jq로 특수문자 안전 처리)
             jq -n \
               --arg image  "$IMAGE_URI" \
               --arg db     "$DATABASE_URL" \
@@ -197,16 +247,13 @@ jobs:
                 },
                 AuthenticationConfiguration: {AccessRoleArn: $role},
                 AutoDeploymentsEnabled: false
-              }' > /tmp/source-config.json
-            echo "source-config.json 생성 완료"
+              }' > /tmp/api-config.json
 
-            # 새 서비스 생성 (이름 충돌 시 최대 3회 재시도)
-            echo "새 서비스 생성 중: $SERVICE_NAME"
             NEW_ARN=""
             for attempt in 1 2 3; do
               NEW_ARN=$(aws apprunner create-service \
                 --service-name "$SERVICE_NAME" \
-                --source-configuration file:///tmp/source-config.json \
+                --source-configuration file:///tmp/api-config.json \
                 --instance-configuration '{"Cpu":"1 vCPU","Memory":"2 GB"}' \
                 --health-check-configuration \
                   '{"Protocol":"HTTP","Path":"/health","Interval":10,"Timeout":5,"HealthyThreshold":1,"UnhealthyThreshold":5}' \
@@ -216,50 +263,189 @@ jobs:
             done
 
             if [[ "$NEW_ARN" != arn:* ]]; then
-              echo "서비스 생성 최종 실패: $NEW_ARN"
-              exit 1
+              echo "API 서비스 생성 최종 실패: $NEW_ARN"; exit 1
             fi
-
-            echo "새 서비스 ARN: $NEW_ARN"
             echo "service-arn=$NEW_ARN" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Wait for deployment
+      - name: Wait for API deployment
         run: |
           ARN="${{ steps.deploy.outputs.service-arn }}"
-          echo "배포 완료 대기 중 (최대 15분)..."
           for i in $(seq 1 30); do
             STATUS=$(aws apprunner describe-service \
-              --service-arn "$ARN" \
-              --query 'Service.Status' --output text)
-            echo "[$i/30] 상태: $STATUS"
+              --service-arn "$ARN" --query 'Service.Status' --output text)
+            echo "[$i/30] API 상태: $STATUS"
             case "$STATUS" in
-              RUNNING)     echo "배포 성공!"; exit 0 ;;
-              *_FAILED)    echo "배포 실패: $STATUS"; exit 1 ;;
+              RUNNING)   echo "API 배포 성공!"; exit 0 ;;
+              *_FAILED)  echo "API 배포 실패: $STATUS"; exit 1 ;;
             esac
             sleep 30
           done
-          echo "타임아웃 — AWS Console 에서 확인하세요"; exit 1
+          echo "타임아웃"; exit 1
 
-      - name: Get service URL
+      - name: Get API URL
         id: url
         run: |
           ARN="${{ steps.deploy.outputs.service-arn }}"
           URL=$(aws apprunner describe-service \
-            --service-arn "$ARN" \
-            --query 'Service.ServiceUrl' --output text)
+            --service-arn "$ARN" --query 'Service.ServiceUrl' --output text)
           echo "value=https://$URL" >> "$GITHUB_OUTPUT"
-          echo "서비스 URL: https://$URL"
+          echo "API URL: https://$URL"
+
+  # ────────────────────────────────────────────────────
+  # Job 4: Next.js App Runner 배포
+  #   - deploy-api 완료 후 FASTAPI_URL 을 런타임 env 로 주입
+  # ────────────────────────────────────────────────────
+  deploy-frontend:
+    name: Deploy Frontend
+    runs-on: ubuntu-latest
+    needs: [build-frontend, deploy-api]
+
+    permissions:
+      id-token: write
+      contents: read
+
+    environment:
+      name: production-frontend
+      url: ${{ steps.url.outputs.value }}
+
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy Frontend (start-deployment or recreate if needed)
+        id: deploy
+        env:
+          IMAGE_URI:   ${{ needs.build-frontend.outputs.image-uri }}
+          FASTAPI_URL: ${{ needs.deploy-api.outputs.api-url }}
+        run: |
+          set -euo pipefail
+
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          ECR_ROLE="arn:aws:iam::${ACCOUNT_ID}:role/AppRunnerECRAccessRole"
+          SERVICE_NAME="tenasia-intelligence-hub-frontend"
+
+          SERVICE_ARN=$(aws apprunner list-services \
+            --query "ServiceSummaryList[?ServiceName=='${SERVICE_NAME}'].ServiceArn | [0]" \
+            --output text 2>/dev/null || true)
+
+          if [ -z "$SERVICE_ARN" ] || [ "$SERVICE_ARN" = "None" ]; then
+            STATUS="NOT_FOUND"
+          else
+            STATUS=$(aws apprunner describe-service \
+              --service-arn "$SERVICE_ARN" \
+              --query 'Service.Status' --output text 2>/dev/null || echo "NOT_FOUND")
+          fi
+          echo "현재 Frontend 서비스 상태: $STATUS"
+
+          if [ "$STATUS" = "RUNNING" ]; then
+            aws apprunner update-service \
+              --service-arn "$SERVICE_ARN" \
+              --source-configuration "{
+                \"ImageRepository\": {
+                  \"ImageIdentifier\": \"$IMAGE_URI\",
+                  \"ImageConfiguration\": {
+                    \"Port\": \"3000\",
+                    \"RuntimeEnvironmentVariables\": {
+                      \"FASTAPI_URL\": \"$FASTAPI_URL\"
+                    }
+                  },
+                  \"ImageRepositoryType\": \"ECR\"
+                },
+                \"AuthenticationConfiguration\": {\"AccessRoleArn\": \"$ECR_ROLE\"},
+                \"AutoDeploymentsEnabled\": false
+              }"
+            echo "service-arn=$SERVICE_ARN" >> "$GITHUB_OUTPUT"
+
+          else
+            echo "서비스 비정상 상태($STATUS) → 삭제 후 재생성"
+
+            if [ "$STATUS" != "NOT_FOUND" ] && [ "$STATUS" != "DELETED" ]; then
+              aws apprunner delete-service --service-arn "$SERVICE_ARN" || true
+            fi
+
+            echo "서비스 이름 해제 대기 중 (최대 10분)..."
+            for i in $(seq 1 30); do
+              FOUND=$(aws apprunner list-services \
+                --query "ServiceSummaryList[?ServiceName=='${SERVICE_NAME}'].ServiceName | [0]" \
+                --output text 2>/dev/null || echo "")
+              echo "  [삭제 대기 $i/30] 잔존: ${FOUND:-없음}"
+              if [ -z "$FOUND" ] || [ "$FOUND" = "None" ]; then break; fi
+              sleep 20
+            done
+
+            jq -n \
+              --arg image      "$IMAGE_URI" \
+              --arg fastapi    "$FASTAPI_URL" \
+              --arg role       "$ECR_ROLE" \
+              '{
+                ImageRepository: {
+                  ImageIdentifier: $image,
+                  ImageConfiguration: {
+                    Port: "3000",
+                    RuntimeEnvironmentVariables: {
+                      FASTAPI_URL: $fastapi
+                    }
+                  },
+                  ImageRepositoryType: "ECR"
+                },
+                AuthenticationConfiguration: {AccessRoleArn: $role},
+                AutoDeploymentsEnabled: false
+              }' > /tmp/frontend-config.json
+
+            NEW_ARN=""
+            for attempt in 1 2 3; do
+              NEW_ARN=$(aws apprunner create-service \
+                --service-name "$SERVICE_NAME" \
+                --source-configuration file:///tmp/frontend-config.json \
+                --instance-configuration '{"Cpu":"1 vCPU","Memory":"2 GB"}' \
+                --health-check-configuration \
+                  '{"Protocol":"HTTP","Path":"/healthz","Interval":10,"Timeout":5,"HealthyThreshold":1,"UnhealthyThreshold":5}' \
+                --query 'Service.ServiceArn' --output text 2>&1) && break
+              echo "  [생성 시도 $attempt/3] 실패: $NEW_ARN — 30초 후 재시도"
+              sleep 30
+            done
+
+            if [[ "$NEW_ARN" != arn:* ]]; then
+              echo "Frontend 서비스 생성 최종 실패: $NEW_ARN"; exit 1
+            fi
+            echo "service-arn=$NEW_ARN" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Wait for Frontend deployment
+        run: |
+          ARN="${{ steps.deploy.outputs.service-arn }}"
+          for i in $(seq 1 30); do
+            STATUS=$(aws apprunner describe-service \
+              --service-arn "$ARN" --query 'Service.Status' --output text)
+            echo "[$i/30] Frontend 상태: $STATUS"
+            case "$STATUS" in
+              RUNNING)   echo "Frontend 배포 성공!"; exit 0 ;;
+              *_FAILED)  echo "Frontend 배포 실패: $STATUS"; exit 1 ;;
+            esac
+            sleep 30
+          done
+          echo "타임아웃"; exit 1
+
+      - name: Get Frontend URL
+        id: url
+        run: |
+          ARN="${{ steps.deploy.outputs.service-arn }}"
+          URL=$(aws apprunner describe-service \
+            --service-arn "$ARN" --query 'Service.ServiceUrl' --output text)
+          echo "value=https://$URL" >> "$GITHUB_OUTPUT"
+          echo "Frontend URL: https://$URL"
 
       - name: Summary
         run: |
           cat >> "$GITHUB_STEP_SUMMARY" <<EOF
-          ## 배포 완료 ✅
+          ## 전체 배포 완료 ✅
           | 항목 | 값 |
           |------|-----|
-          | 이미지 | \`${{ needs.build.outputs.image-uri }}\` |
+          | API | ${{ needs.deploy-api.outputs.api-url }} |
+          | 프론트엔드 | ${{ steps.url.outputs.value }} |
           | 커밋 | \`${{ github.sha }}\` |
-          | URL | ${{ steps.url.outputs.value }} |
           EOF
-
-  # Job 4 (EC2 Scraper) — EC2 인스턴스 준비 후 추가 예정

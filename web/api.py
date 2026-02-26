@@ -65,10 +65,11 @@ app = FastAPI(
     redoc_url=None,
 )
 
-# App Runner 내부에서만 사용하므로 CORS는 localhost만 허용
+# Next.js 프록시(/api/*) 경유로 브라우저 요청이 들어오므로 origins=["*"]
+# 직접 접근 시에도 내부 관리 도구용이므로 전체 허용
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:8501", "http://localhost:3000"],
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )

@@ -1,4 +1,6 @@
-const BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+// 로컬 개발: NEXT_PUBLIC_API_URL=http://localhost:8000 (.env 설정)
+// 프로덕션: NEXT_PUBLIC_API_URL 미설정 → /api 프록시 경유 (next.config.ts rewrites)
+const BASE = process.env.NEXT_PUBLIC_API_URL ?? "/api";
 
 async function request<T>(
   path: string,
