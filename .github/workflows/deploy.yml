@@ -418,6 +418,29 @@ jobs:
           done
           echo "타임아웃"; exit 1
 
+      - name: Fetch App Runner Logs on Failure
+        if: failure()
+        run: |
+          ARN="${{ steps.deploy.outputs.service-arn }}"
+          if [ -z "$ARN" ]; then echo "ARN 없음 — 로그 스킵"; exit 0; fi
+          SERVICE_NAME="tenasia-intelligence-hub-frontend"
+          SERVICE_ID=$(echo "$ARN" | awk -F'/' '{print $NF}')
+
+          echo "=== App Runner Service Status ==="
+          aws apprunner describe-service --service-arn "$ARN" \
+            --query 'Service.{Status:Status,StatusReason:StatusReason}' \
+            --output table 2>/dev/null || true
+
+          echo ""
+          echo "=== App Runner System Log (최근 20분) ==="
+          aws logs tail "/aws/apprunner/${SERVICE_NAME}/${SERVICE_ID}/system" \
+            --since 20m --format short 2>/dev/null || echo "(system 로그 없음 또는 권한 부족)"
+
+          echo ""
+          echo "=== App Runner Application Log (최근 20분) ==="
+          aws logs tail "/aws/apprunner/${SERVICE_NAME}/${SERVICE_ID}/application" \
+            --since 20m --format short 2>/dev/null || echo "(application 로그 없음 또는 권한 부족)"
+
       - name: Get Frontend URL
         id: url
         run: |

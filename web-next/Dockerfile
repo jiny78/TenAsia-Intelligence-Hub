@@ -75,9 +75,13 @@ EXPOSE 3000
 ENV PORT=3000 \
     HOSTNAME=0.0.0.0 \
     NODE_ENV=production \
-    NEXT_TELEMETRY_DISABLED=1
+    NEXT_TELEMETRY_DISABLED=1 \
+    NODE_OPTIONS="--max-old-space-size=1800"
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
-    CMD wget -qO- http://localhost:3000/ || exit 1
+# App Runner has its own health check; this is for local docker run
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD wget -qO- http://localhost:3000/healthz || exit 1
 
-CMD ["node", "server.js"]
+# Use shell form so HOSTNAME is explicitly set at runtime,
+# overriding any value injected by the container runtime (e.g. AWS Fargate).
+CMD ["sh", "-c", "HOSTNAME=0.0.0.0 exec node server.js"]
