@@ -51,6 +51,7 @@ from typing import Sequence, Union
 
 import sqlalchemy as sa
 from alembic import op
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects.postgresql import JSONB
 
 revision: str = "0004"
@@ -89,9 +90,7 @@ def upgrade() -> None:
                   comment="영어 공식 표기 (예: BTS, HYBE)"),
         sa.Column(
             "category",
-            sa.Enum("ARTIST", "AGENCY", "EVENT",
-                    name="glossary_category_enum",
-                    create_type=False),
+            postgresql.ENUM(name="glossary_category_enum", create_type=False),
             nullable=False,
             comment="용어 분류 (ARTIST / AGENCY / EVENT)",
         ),

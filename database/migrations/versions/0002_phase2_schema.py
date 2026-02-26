@@ -112,11 +112,7 @@ def upgrade() -> None:
         "articles",
         sa.Column(
             "process_status",
-            sa.Enum(
-                "PENDING", "SCRAPED", "PROCESSED", "ERROR",
-                name="process_status_enum",
-                create_type=False,        # 위에서 이미 생성
-            ),
+            postgresql.ENUM(name="process_status_enum", create_type=False),
             nullable=False,
             server_default="SCRAPED",     # 기존 행: 수집 완료 상태
         ),
@@ -246,11 +242,7 @@ def upgrade() -> None:
         ),
         sa.Column(
             "entity_type",
-            sa.Enum(
-                "ARTIST", "GROUP", "EVENT",
-                name="entity_type_enum",
-                create_type=False,
-            ),
+            postgresql.ENUM(name="entity_type_enum", create_type=False),
             nullable=False,
         ),
         sa.Column(
@@ -313,21 +305,13 @@ def upgrade() -> None:
         sa.Column("id",       sa.BigInteger(), primary_key=True),
         sa.Column(
             "level",
-            sa.Enum(
-                "DEBUG", "INFO", "WARNING", "ERROR",
-                name="log_level_enum",
-                create_type=False,
-            ),
+            postgresql.ENUM(name="log_level_enum", create_type=False),
             nullable=False,
             server_default="INFO",
         ),
         sa.Column(
             "category",
-            sa.Enum(
-                "SCRAPE", "AI_PROCESS", "DB_WRITE", "S3_UPLOAD", "API_CALL",
-                name="log_category_enum",
-                create_type=False,
-            ),
+            postgresql.ENUM(name="log_category_enum", create_type=False),
             nullable=False,
         ),
         sa.Column(

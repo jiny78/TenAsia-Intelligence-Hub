@@ -147,10 +147,7 @@ def upgrade() -> None:
         # 기본 프로필
         sa.Column(
             "gender",
-            sa.Enum(
-                "MALE", "FEMALE", "MIXED", "UNKNOWN",
-                name="artist_gender_enum", create_type=False,
-            ),
+            postgresql.ENUM(name="artist_gender_enum", create_type=False),
             nullable=True,
         ),
 
@@ -171,10 +168,7 @@ def upgrade() -> None:
         # 활동 상태 (증거 기반)
         sa.Column(
             "activity_status",
-            sa.Enum(
-                "ACTIVE", "HIATUS", "DISBANDED", "SOLO_ONLY",
-                name="activity_status_enum", create_type=False,
-            ),
+            postgresql.ENUM(name="activity_status_enum", create_type=False),
             nullable=True,
         ),
         sa.Column("activity_status_source_article_id", sa.Integer(), nullable=True),
@@ -409,10 +403,7 @@ def upgrade() -> None:
         sa.Column("school_name_en",  sa.String(300), nullable=True),
         sa.Column(
             "education_level",
-            sa.Enum(
-                "MIDDLE_SCHOOL", "HIGH_SCHOOL", "UNIVERSITY", "GRADUATE", "DROPOUT",
-                name="education_level_enum", create_type=False,
-            ),
+            postgresql.ENUM(name="education_level_enum", create_type=False),
             nullable=False,
         ),
         sa.Column("graduated_year", sa.Integer(), nullable=True),
@@ -443,12 +434,7 @@ def upgrade() -> None:
         ),
         sa.Column(
             "platform",
-            sa.Enum(
-                "INSTAGRAM", "TWITTER_X", "YOUTUBE", "TIKTOK",
-                "WEVERSE", "VLIVE", "FACEBOOK", "THREADS",
-                "BLUESKY", "WEIBO", "OTHER",
-                name="sns_platform_enum", create_type=False,
-            ),
+            postgresql.ENUM(name="sns_platform_enum", create_type=False),
             nullable=False,
         ),
         sa.Column("url",            sa.Text(),       nullable=True),
@@ -489,12 +475,7 @@ def upgrade() -> None:
         ),
         sa.Column(
             "platform",
-            sa.Enum(
-                "INSTAGRAM", "TWITTER_X", "YOUTUBE", "TIKTOK",
-                "WEVERSE", "VLIVE", "FACEBOOK", "THREADS",
-                "BLUESKY", "WEIBO", "OTHER",
-                name="sns_platform_enum", create_type=False,
-            ),
+            postgresql.ENUM(name="sns_platform_enum", create_type=False),
             nullable=False,
         ),
         sa.Column("url",            sa.Text(),       nullable=True),
@@ -537,10 +518,7 @@ def upgrade() -> None:
         ),
         sa.Column(
             "entity_type",
-            sa.Enum(
-                "ARTIST", "GROUP", "EVENT",
-                name="entity_type_enum", create_type=False,
-            ),
+            postgresql.ENUM(name="entity_type_enum", create_type=False),
             nullable=False,
             comment="ARTIST=artists.id 참조, GROUP=groups.id 참조",
         ),
