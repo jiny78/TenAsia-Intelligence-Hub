@@ -615,7 +615,10 @@ def upgrade() -> None:
     op.execute("DROP INDEX IF EXISTS idx_em_entity")
 
     # 8-D. 구 entity_id 컬럼 삭제
-    #      (FK 제약이 있으면 먼저 삭제)
+    #      v_artist_coverage 가 entity_id 를 참조하므로 먼저 DROP
+    op.execute("DROP VIEW IF EXISTS v_artist_coverage")
+
+    #      FK 제약이 있으면 먼저 삭제
     op.execute("""
         DO $$ DECLARE
             c TEXT;
