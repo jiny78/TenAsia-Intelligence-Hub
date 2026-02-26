@@ -90,7 +90,6 @@ jobs:
     permissions:
       id-token: write
       contents: read
-      secrets: write   # APP_RUNNER_SERVICE_ARN 자동 갱신용
 
     environment:
       name: production
@@ -107,9 +106,7 @@ jobs:
         id: deploy
         env:
           IMAGE_URI:    ${{ needs.build.outputs.image-uri }}
-          SERVICE_ARN:  ${{ secrets.APP_RUNNER_SERVICE_ARN }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          GH_TOKEN:     ${{ github.token }}
         run: |
           set -euo pipefail
 
@@ -117,11 +114,19 @@ jobs:
           ECR_ROLE="arn:aws:iam::${ACCOUNT_ID}:role/AppRunnerECRAccessRole"
           SERVICE_NAME="tenasia-intelligence-hub"
 
-          # 현재 서비스 상태 확인
-          STATUS=$(aws apprunner describe-service \
-            --service-arn "$SERVICE_ARN" \
-            --query 'Service.Status' --output text 2>/dev/null || echo "NOT_FOUND")
-          echo "현재 서비스 상태: $STATUS"
+          # 서비스 ARN을 이름으로 동적 조회 (Secret 의존성 제거)
+          SERVICE_ARN=$(aws apprunner list-services \
+            --query "ServiceSummaryList[?ServiceName=='${SERVICE_NAME}'].ServiceArn | [0]" \
+            --output text 2>/dev/null || true)
+
+          if [ -z "$SERVICE_ARN" ] || [ "$SERVICE_ARN" = "None" ]; then
+            STATUS="NOT_FOUND"
+          else
+            STATUS=$(aws apprunner describe-service \
+              --service-arn "$SERVICE_ARN" \
+              --query 'Service.Status' --output text 2>/dev/null || echo "NOT_FOUND")
+          fi
+          echo "현재 서비스 상태: $STATUS (ARN: ${SERVICE_ARN:-없음})"
 
           if [ "$STATUS" = "RUNNING" ]; then
             # ── 정상 상태: 일반 배포 트리거 ──────────────────────
@@ -137,16 +142,16 @@ jobs:
             if [ "$STATUS" != "NOT_FOUND" ] && [ "$STATUS" != "DELETED" ]; then
               echo "서비스 삭제 요청..."
               aws apprunner delete-service --service-arn "$SERVICE_ARN" || true
-            fi
 
-            # DELETED 상태까지 대기 (최대 5분)
-            for i in $(seq 1 15); do
-              S=$(aws apprunner describe-service --service-arn "$SERVICE_ARN" \
-                --query 'Service.Status' --output text 2>/dev/null || echo "DELETED")
-              echo "  [삭제 대기 $i/15] 상태: $S"
-              [ "$S" = "DELETED" ] && break
-              sleep 20
-            done
+              # DELETED 상태까지 대기 (최대 5분)
+              for i in $(seq 1 15); do
+                S=$(aws apprunner describe-service --service-arn "$SERVICE_ARN" \
+                  --query 'Service.Status' --output text 2>/dev/null || echo "DELETED")
+                echo "  [삭제 대기 $i/15] 상태: $S"
+                [ "$S" = "DELETED" ] && break
+                sleep 20
+              done
+            fi
 
             # 소스 설정 JSON 파일 생성 (jq로 특수문자 안전 처리)
             jq -n \
@@ -178,12 +183,6 @@ jobs:
               --query 'Service.ServiceArn' --output text)
 
             echo "새 서비스 ARN: $NEW_ARN"
-
-            # GitHub Secret 자동 갱신
-            gh secret set APP_RUNNER_SERVICE_ARN --body "$NEW_ARN" \
-              --repo "$GITHUB_REPOSITORY"
-            echo "APP_RUNNER_SERVICE_ARN 시크릿 갱신 완료"
-
             echo "service-arn=$NEW_ARN" >> "$GITHUB_OUTPUT"
           fi
 
