@@ -159,16 +159,23 @@ jobs:
             if [ "$STATUS" != "NOT_FOUND" ] && [ "$STATUS" != "DELETED" ]; then
               echo "서비스 삭제 요청..."
               aws apprunner delete-service --service-arn "$SERVICE_ARN" || true
-
-              # DELETED 상태까지 대기 (최대 5분)
-              for i in $(seq 1 15); do
-                S=$(aws apprunner describe-service --service-arn "$SERVICE_ARN" \
-                  --query 'Service.Status' --output text 2>/dev/null || echo "DELETED")
-                echo "  [삭제 대기 $i/15] 상태: $S"
-                [ "$S" = "DELETED" ] && break
-                sleep 20
-              done
             fi
+
+            # 서비스 이름이 list-services에서 사라질 때까지 대기 (최대 10분)
+            # describe-service는 삭제 중에도 에러를 반환해 조기 탈출하는 문제가 있으므로
+            # list-services로 이름 소멸 여부를 확인합니다.
+            echo "서비스 이름 해제 대기 중 (최대 10분)..."
+            for i in $(seq 1 30); do
+              FOUND=$(aws apprunner list-services \
+                --query "ServiceSummaryList[?ServiceName=='${SERVICE_NAME}'].ServiceName | [0]" \
+                --output text 2>/dev/null || echo "")
+              echo "  [삭제 대기 $i/30] 잔존: ${FOUND:-없음}"
+              if [ -z "$FOUND" ] || [ "$FOUND" = "None" ]; then
+                echo "  서비스 이름 해제 확인"
+                break
+              fi
+              sleep 20
+            done
 
             # 소스 설정 JSON 파일 생성 (jq로 특수문자 안전 처리)
             jq -n \
@@ -193,15 +200,25 @@ jobs:
               }' > /tmp/source-config.json
             echo "source-config.json 생성 완료"
 
-            # 새 서비스 생성
+            # 새 서비스 생성 (이름 충돌 시 최대 3회 재시도)
             echo "새 서비스 생성 중: $SERVICE_NAME"
-            NEW_ARN=$(aws apprunner create-service \
-              --service-name "$SERVICE_NAME" \
-              --source-configuration file:///tmp/source-config.json \
-              --instance-configuration '{"Cpu":"1 vCPU","Memory":"2 GB"}' \
-              --health-check-configuration \
-                '{"Protocol":"HTTP","Path":"/health","Interval":10,"Timeout":5,"HealthyThreshold":1,"UnhealthyThreshold":5}' \
-              --query 'Service.ServiceArn' --output text)
+            NEW_ARN=""
+            for attempt in 1 2 3; do
+              NEW_ARN=$(aws apprunner create-service \
+                --service-name "$SERVICE_NAME" \
+                --source-configuration file:///tmp/source-config.json \
+                --instance-configuration '{"Cpu":"1 vCPU","Memory":"2 GB"}' \
+                --health-check-configuration \
+                  '{"Protocol":"HTTP","Path":"/health","Interval":10,"Timeout":5,"HealthyThreshold":1,"UnhealthyThreshold":5}' \
+                --query 'Service.ServiceArn' --output text 2>&1) && break
+              echo "  [생성 시도 $attempt/3] 실패: $NEW_ARN — 30초 후 재시도"
+              sleep 30
+            done
+
+            if [[ "$NEW_ARN" != arn:* ]]; then
+              echo "서비스 생성 최종 실패: $NEW_ARN"
+              exit 1
+            fi
 
             echo "새 서비스 ARN: $NEW_ARN"
             echo "service-arn=$NEW_ARN" >> "$GITHUB_OUTPUT"
