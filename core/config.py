@@ -321,11 +321,17 @@ def get_settings() -> Settings:
 
     if missing:
         _print_env_error_guide(missing)
-        sys.exit(1)
+        # 웹 서버 컨텍스트에서는 sys.exit 대신 경고만 출력하고 계속 실행합니다.
+        # 누락된 설정은 해당 기능 사용 시점에 에러를 반환합니다.
+        logger.error(
+            "필수 환경 변수 누락 (서버는 계속 실행): %s",
+            [k for k, _ in missing],
+        )
 
     logger.info(
-        "설정 로드 완료 | env=%s | Gemini=OK | DB=%s",
+        "설정 로드 완료 | env=%s | Gemini=%s | DB=%s",
         s.ENVIRONMENT,
+        "OK" if s.GEMINI_API_KEY else "MISSING",
         "OK" if s.DATABASE_URL else "미설정(개발 환경)",
     )
     return s

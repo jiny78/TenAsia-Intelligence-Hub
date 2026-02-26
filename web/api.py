@@ -484,10 +484,12 @@ def health() -> JSONResponse:
     gemini_status, gemini_level  = _check_gemini()
     disk_status,   disk_ok       = _check_disk()
 
-    if not db_ok or gemini_level == "error":
+    # DB 다운만 503(unhealthy) — Gemini 오류는 degraded(200) 로 처리해
+    # App Runner 헬스체크가 Gemini 설정과 무관하게 통과하도록 합니다.
+    if not db_ok:
         overall   = "unhealthy"
         http_code = 503
-    elif not disk_ok or gemini_level == "degraded":
+    elif not disk_ok or gemini_level in ("error", "degraded"):
         overall   = "degraded"
         http_code = 200
     else:
