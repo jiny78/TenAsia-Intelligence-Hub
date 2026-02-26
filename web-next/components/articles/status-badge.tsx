@@ -8,6 +8,7 @@ const CFG: Record<
   PROCESSED:     { label: "완료",      dot: "bg-emerald-400", text: "text-emerald-400", bg: "bg-emerald-400/10", border: "border-emerald-400/20" },
   SCRAPED:       { label: "수집",      dot: "bg-blue-400",    text: "text-blue-400",    bg: "bg-blue-400/10",    border: "border-blue-400/20"    },
   PENDING:       { label: "대기",      dot: "bg-zinc-400",    text: "text-zinc-400",    bg: "bg-zinc-400/10",    border: "border-zinc-400/20"    },
+  VERIFIED:      { label: "검증됨",    dot: "bg-violet-400",  text: "text-violet-400",  bg: "bg-violet-400/10",  border: "border-violet-400/20"  },
   MANUAL_REVIEW: { label: "검토 필요", dot: "bg-amber-400",   text: "text-amber-400",   bg: "bg-amber-400/10",   border: "border-amber-400/20"   },
   ERROR:         { label: "오류",      dot: "bg-red-400",     text: "text-red-400",     bg: "bg-red-400/10",     border: "border-red-400/20"     },
 };

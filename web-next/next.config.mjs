@@ -1,6 +1,5 @@
-import type { NextConfig } from "next";
-
-const nextConfig: NextConfig = {
+/** @type {import('next').NextConfig} */
+const nextConfig = {
   // standalone: Docker production 이미지에서 최소 파일만으로 서버 실행 가능
   // server.js + .next/static + public 만으로 동작
   output: "standalone",

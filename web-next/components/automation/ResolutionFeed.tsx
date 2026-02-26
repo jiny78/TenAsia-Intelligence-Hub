@@ -122,22 +122,22 @@ export function ResolutionFeed() {
                 </div>
 
                 {/* Old → New values */}
-                {(log.resolution_type === "FILL" || log.resolution_type === "RECONCILE") && (
+                {(log.resolution_type === "FILL" || log.resolution_type === "RECONCILE") ? (
                   <p className="mt-0.5 truncate text-[11px] text-muted-foreground">
-                    {log.old_value !== null && (
+                    {log.old_value != null ? (
                       <span className="line-through opacity-60">{formatValue(log.old_value)}</span>
-                    )}
-                    {log.old_value !== null && " → "}
+                    ) : null}
+                    {log.old_value != null ? " → " : null}
                     <span className="text-foreground">{formatValue(log.new_value)}</span>
                   </p>
-                )}
+                ) : null}
 
                 {/* Enroll: show term */}
-                {log.resolution_type === "ENROLL" && log.new_value && (
+                {log.resolution_type === "ENROLL" && log.new_value != null ? (
                   <p className="mt-0.5 truncate text-[11px] text-muted-foreground">
                     <span className="text-foreground">{formatValue(log.new_value)}</span>
                   </p>
-                )}
+                ) : null}
 
                 {/* Reasoning */}
                 {log.gemini_reasoning && (
