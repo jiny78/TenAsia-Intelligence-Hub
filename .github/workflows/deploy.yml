@@ -150,7 +150,8 @@ jobs:
   deploy-scraper:
     name: Deploy EC2 Scraper
     runs-on: ubuntu-latest
-    needs: build   # 테스트 통과 후 App Runner 와 병렬 가능하지만 빌드는 먼저 완료돼야 함
+    needs: build
+    if: ${{ secrets.EC2_SCRAPER_INSTANCE_ID != '' }}
 
     permissions:
       id-token: write
