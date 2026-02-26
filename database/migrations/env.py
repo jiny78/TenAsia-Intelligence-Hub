@@ -10,7 +10,12 @@ DB URL 로드 순서:
 from __future__ import annotations
 
 import os
+import sys
+from pathlib import Path
 from logging.config import fileConfig
+
+# 프로젝트 루트(/app)를 Python 경로에 추가
+sys.path.insert(0, str(Path(__file__).parents[2]))
 
 from alembic import context
 from sqlalchemy import engine_from_config, pool
