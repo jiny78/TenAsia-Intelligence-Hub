@@ -181,15 +181,6 @@ class ConflictResolveRequest(BaseModel):
     )
     resolved_by: str = Field(..., max_length=100, description="처리자 이름/ID")
 
-    @field_validator("start_date", "end_date")
-    @classmethod
-    def _validate_date(cls, v: str) -> str:
-        try:
-            datetime.strptime(v, "%Y-%m-%d")
-        except ValueError:
-            raise ValueError(f"날짜 형식 오류: {v!r} — YYYY-MM-DD 형식이어야 합니다.")
-        return v
-
 
 # ── 스크래핑 태스크 상태 (모듈 레벨, 단일 인스턴스용) ────────────────
 # { task_id: {"status": ..., "created_at": ..., "result": ..., "error": ...} }
