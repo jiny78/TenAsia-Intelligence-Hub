@@ -105,8 +105,9 @@ jobs:
       - name: Deploy (start-deployment or recreate if needed)
         id: deploy
         env:
-          IMAGE_URI:    ${{ needs.build.outputs.image-uri }}
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          IMAGE_URI:       ${{ needs.build.outputs.image-uri }}
+          DATABASE_URL:    ${{ secrets.DATABASE_URL }}
+          GEMINI_API_KEY:  ${{ secrets.GEMINI_API_KEY }}
         run: |
           set -euo pipefail
 
@@ -129,9 +130,25 @@ jobs:
           echo "현재 서비스 상태: $STATUS (ARN: ${SERVICE_ARN:-없음})"
 
           if [ "$STATUS" = "RUNNING" ]; then
-            # ── 정상 상태: 일반 배포 트리거 ──────────────────────
-            aws apprunner start-deployment --service-arn "$SERVICE_ARN"
-            echo "배포 트리거 완료"
+            # ── 정상 상태: 환경 변수 업데이트 후 배포 트리거 ────
+            aws apprunner update-service \
+              --service-arn "$SERVICE_ARN" \
+              --source-configuration "{
+                \"ImageRepository\": {
+                  \"ImageIdentifier\": \"$IMAGE_URI\",
+                  \"ImageConfiguration\": {
+                    \"Port\": \"8000\",
+                    \"RuntimeEnvironmentVariables\": {
+                      \"DATABASE_URL\": \"$DATABASE_URL\",
+                      \"GEMINI_API_KEY\": \"$GEMINI_API_KEY\"
+                    }
+                  },
+                  \"ImageRepositoryType\": \"ECR\"
+                },
+                \"AuthenticationConfiguration\": {\"AccessRoleArn\": \"$ECR_ROLE\"},
+                \"AutoDeploymentsEnabled\": false
+              }"
+            echo "서비스 업데이트 완료"
             echo "service-arn=$SERVICE_ARN" >> "$GITHUB_OUTPUT"
 
           else
@@ -155,15 +172,19 @@ jobs:
 
             # 소스 설정 JSON 파일 생성 (jq로 특수문자 안전 처리)
             jq -n \
-              --arg image "$IMAGE_URI" \
-              --arg db    "$DATABASE_URL" \
-              --arg role  "$ECR_ROLE" \
+              --arg image  "$IMAGE_URI" \
+              --arg db     "$DATABASE_URL" \
+              --arg gemini "$GEMINI_API_KEY" \
+              --arg role   "$ECR_ROLE" \
               '{
                 ImageRepository: {
                   ImageIdentifier: $image,
                   ImageConfiguration: {
                     Port: "8000",
-                    RuntimeEnvironmentVariables: {DATABASE_URL: $db}
+                    RuntimeEnvironmentVariables: {
+                      DATABASE_URL:   $db,
+                      GEMINI_API_KEY: $gemini
+                    }
                   },
                   ImageRepositoryType: "ECR"
                 },
