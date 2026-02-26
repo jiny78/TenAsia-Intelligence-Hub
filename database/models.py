@@ -1336,7 +1336,6 @@ class Glossary(Base):
         Index(
             "idx_glossary_auto_provisioned", "created_at",
             postgresql_where=text("is_auto_provisioned = true"),
-            comment="Auto-Provisioned 용어 관리자 검토 큐 조회용",
         ),
         # GIN Trigram (마이그레이션에서 op.execute()로 생성)
         # idx_glossary_trgm_ko, idx_glossary_trgm_en
@@ -1438,7 +1437,6 @@ class AutoResolutionLog(Base):
         Index("idx_arl_created_at",   "created_at"),
         Index(
             "idx_arl_type_date", "resolution_type", "created_at",
-            comment="Phase 5-B feed 조회: 유형별 최신순",
         ),
     )
 
@@ -1536,7 +1534,6 @@ class ConflictFlag(Base):
         Index(
             "idx_cf_open", "created_at",
             postgresql_where=text("status = 'OPEN'"),
-            comment="Phase 5-B: 미해결 모순 조회 최적화",
         ),
     )
 
