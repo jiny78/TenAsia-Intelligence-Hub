@@ -5,19 +5,8 @@ const nextConfig = {
   output: "standalone",
 
   // ── 리버스 프록시 ──────────────────────────────────────────────
-  // 브라우저가 /api/* 를 호출하면 Next.js 서버가 FastAPI로 전달합니다.
-  // - 브라우저 입장에서는 동일 출처(same-origin) → CORS 불필요
-  // - FASTAPI_URL: App Runner 런타임 환경 변수 (빌드 시 불필요)
-  // - 로컬 개발: NEXT_PUBLIC_API_URL 설정 시 프록시 미사용 (direct 호출)
-  async rewrites() {
-    const fastapiUrl = process.env.FASTAPI_URL || "http://localhost:8000";
-    return [
-      {
-        source: "/api/:path*",
-        destination: `${fastapiUrl}/:path*`,
-      },
-    ];
-  },
+  // rewrites()는 빌드 타임에 평가되어 FASTAPI_URL이 localhost:8000으로 고정됨.
+  // 대신 app/api/[...path]/route.ts 에서 런타임에 FASTAPI_URL을 읽어 프록시합니다.
 
   images: {
     remotePatterns: [
