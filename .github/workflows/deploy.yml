@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 env:
-  AWS_REGION:      ap-northeast-2
+  AWS_REGION:      ap-northeast-1
   ECR_REPOSITORY:  tenasia-intelligence-hub
 
 jobs:
