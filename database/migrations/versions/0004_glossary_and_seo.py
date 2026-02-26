@@ -192,8 +192,10 @@ def upgrade() -> None:
     # ══════════════════════════════════════════════════════════
     # 6. v_artist_coverage 뷰 갱신 — global_priority 반영
     # ══════════════════════════════════════════════════════════
+    # DROP 후 CREATE — CREATE OR REPLACE는 컬럼명 변경 불가
+    op.execute("DROP VIEW IF EXISTS v_artist_coverage")
     op.execute("""
-        CREATE OR REPLACE VIEW v_artist_coverage AS
+        CREATE VIEW v_artist_coverage AS
         SELECT
             a.id,
             a.name_ko,
@@ -217,8 +219,9 @@ def upgrade() -> None:
 def downgrade() -> None:
 
     # 뷰 원복 (global_priority 컬럼 없는 버전)
+    op.execute("DROP VIEW IF EXISTS v_artist_coverage")
     op.execute("""
-        CREATE OR REPLACE VIEW v_artist_coverage AS
+        CREATE VIEW v_artist_coverage AS
         SELECT
             a.id,
             a.name_ko,
