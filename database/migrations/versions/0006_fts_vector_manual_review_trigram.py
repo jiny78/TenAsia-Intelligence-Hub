@@ -55,12 +55,12 @@ def upgrade() -> None:
 
     # ══════════════════════════════════════════════════════════
     # 1. ProcessStatus ENUM 에 MANUAL_REVIEW 추가
-    #    ADD VALUE IF NOT EXISTS — 이미 값이 존재하면 무시 (멱등)
-    #    PostgreSQL 12+ : 트랜잭션 내 실행 가능
+    #    PostgreSQL 제약: ADD VALUE로 추가한 값은 같은 트랜잭션에서 사용 불가
+    #    → COMMIT/BEGIN 으로 별도 트랜잭션에서 실행 후 즉시 커밋
     # ══════════════════════════════════════════════════════════
-    op.execute(
-        "ALTER TYPE process_status_enum ADD VALUE IF NOT EXISTS 'MANUAL_REVIEW'"
-    )
+    op.execute(sa.text("COMMIT"))
+    op.execute(sa.text("ALTER TYPE process_status_enum ADD VALUE IF NOT EXISTS 'MANUAL_REVIEW'"))
+    op.execute(sa.text("BEGIN"))
 
     # ══════════════════════════════════════════════════════════
     # 2. articles — search_vector TSVECTOR 컬럼 추가
