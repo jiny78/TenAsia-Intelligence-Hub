@@ -35,7 +35,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libpq5 \
         curl \
         # opencv-python-headless 런타임 의존
-        libgl1-mesa-glx \
+        libgl1 \
         libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/* \
     # 비루트 실행 유저
