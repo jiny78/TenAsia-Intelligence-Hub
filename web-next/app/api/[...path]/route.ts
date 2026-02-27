@@ -15,23 +15,31 @@ async function proxy(
   const { search } = new URL(request.url);
   const url = `${FASTAPI_BASE}/${pathStr}${search}`;
 
-  const init: RequestInit = { method: request.method };
-  const ct = request.headers.get("content-type");
-  if (ct) init.headers = { "content-type": ct };
+  try {
+    const init: RequestInit = { method: request.method };
+    const ct = request.headers.get("content-type");
+    if (ct) init.headers = { "content-type": ct };
 
-  if (request.method !== "GET" && request.method !== "HEAD") {
-    init.body = await request.text();
+    if (request.method !== "GET" && request.method !== "HEAD") {
+      init.body = await request.text();
+    }
+
+    const upstream = await fetch(url, init);
+    const body = await upstream.arrayBuffer();
+
+    return new NextResponse(body, {
+      status: upstream.status,
+      headers: {
+        "content-type": upstream.headers.get("content-type") ?? "application/json",
+      },
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return new NextResponse(
+      JSON.stringify({ detail: `프록시 오류: ${message}` }),
+      { status: 502, headers: { "content-type": "application/json" } }
+    );
   }
-
-  const upstream = await fetch(url, init);
-  const body = await upstream.arrayBuffer();
-
-  return new NextResponse(body, {
-    status: upstream.status,
-    headers: {
-      "content-type": upstream.headers.get("content-type") ?? "application/json",
-    },
-  });
 }
 
 export const GET    = proxy;

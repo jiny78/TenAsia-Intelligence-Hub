@@ -23,6 +23,7 @@ import os
 import signal
 import socket
 import time
+from datetime import datetime
 from typing import Optional
 
 import requests
@@ -134,6 +135,50 @@ def _do_scrape(params: dict, job_id: Optional[int] = None) -> dict:
     return result_dict
 
 
+def _do_scrape_range(params: dict, job_id: Optional[int] = None) -> dict:
+    """
+    날짜 범위 스크래핑을 실행합니다. POST /scrape 의 워커 구현체입니다.
+
+    params 예시:
+        {
+            "start_date": "2024-01-01",
+            "end_date":   "2024-01-31",
+            "language":   "kr",
+            "max_pages":  10,
+            "dry_run":    false,
+        }
+    """
+    start_dt = datetime.strptime(params["start_date"], "%Y-%m-%d")
+    end_dt   = datetime.strptime(params["end_date"],   "%Y-%m-%d").replace(
+        hour=23, minute=59, second=59
+    )
+    language  = params.get("language",  "kr")
+    max_pages = int(params.get("max_pages", 10))
+    dry_run   = bool(params.get("dry_run", False))
+
+    logger.info(
+        "scrape_range 시작 | start=%s end=%s lang=%s max_pages=%d dry_run=%s job_id=%s",
+        start_dt.date(), end_dt.date(), language, max_pages, dry_run, job_id,
+    )
+
+    scraper = TenAsiaScraper()
+    result  = scraper.scrape_range(
+        start_date=start_dt,
+        end_date=end_dt,
+        job_id=job_id,
+        language=language,
+        max_pages=max_pages,
+        dry_run=dry_run,
+    )
+
+    return {
+        "total":         getattr(result, "total",   0),
+        "success_count": len(getattr(result, "success",  [])),
+        "failed_count":  len(getattr(result, "failed",   [])),
+        "skipped_count": len(getattr(result, "skipped",  [])),
+    }
+
+
 def process_job(job: dict) -> None:
     """
     단일 작업을 처리하고 결과를 DB에 기록합니다.
@@ -148,6 +193,8 @@ def process_job(job: dict) -> None:
     try:
         if job_type == "scrape":
             result = _do_scrape(params, job_id=job_id)
+        elif job_type == "scrape_range":
+            result = _do_scrape_range(params, job_id=job_id)
         else:
             raise ValueError(f"알 수 없는 job_type: {job_type!r}")
 
