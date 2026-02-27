@@ -6,10 +6,12 @@ processor/simple_processor.py — 경량 AI 후처리기 (Batch Fast Track)
   · SCRAPED 상태 기사 처리 (기존 gemini_engine.py의 PENDING 불일치 버그 수정)
   · 기사당 ~200 토큰 (배치 20개 = 4000 토큰, 기존 단건 400 토큰 × 20 = 8000 토큰)
   · Kill Switch / 토큰 사용량 기록 연동
+  · 엔티티 추출: PROCESSED 기사에서 아티스트/그룹명 추출 → artists/groups/entity_mappings 저장
 
 처리 결과:
   title_en, summary_ko, summary_en, hashtags_en 채움
   process_status: SCRAPED → PROCESSED (성공) / ERROR (실패)
+  엔티티: artists, groups 테이블 UPSERT + entity_mappings 생성
 """
 
 from __future__ import annotations
@@ -20,7 +22,8 @@ import time
 
 logger = logging.getLogger(__name__)
 
-BATCH_SIZE = 20  # 1회 Gemini 호출당 처리 기사 수
+BATCH_SIZE = 20        # 번역 1회 Gemini 호출당 처리 기사 수
+ENTITY_BATCH_SIZE = 10  # 엔티티 추출 1회 Gemini 호출당 처리 기사 수
 
 # 배치 프롬프트: N개 기사를 JSON 배열로 일괄 반환
 _BATCH_PROMPT = """\
@@ -298,8 +301,276 @@ def process_all_scraped() -> int:
 
 def process_all_with_retry() -> int:
     """
-    ERROR 기사를 SCRAPED으로 리셋한 뒤 전체 처리를 실행합니다.
+    ERROR 기사를 SCRAPED으로 리셋한 뒤 전체 처리 + 엔티티 추출을 실행합니다.
     Worker 루프에서 호출합니다.
     """
     reset_error_to_scraped()
-    return process_all_scraped()
+    n = process_all_scraped()
+    # 번역 완료 후 엔티티 추출 (실패해도 번역 결과는 유지)
+    try:
+        process_entity_extraction()
+    except Exception as exc:
+        logger.warning("엔티티 추출 실패 (번역 결과는 정상): %s", exc)
+    return n
+
+
+# ─────────────────────────────────────────────────────────────
+# 엔티티 추출 (아티스트 / 그룹 → DB UPSERT + EntityMapping)
+# ─────────────────────────────────────────────────────────────
+
+# 엔티티 추출 프롬프트
+_ENTITY_PROMPT = """\
+You are a K-pop expert. Extract all K-pop idol artists and groups mentioned in the following Korean articles.
+Return ONLY a JSON array — no markdown, no explanation.
+
+Articles:
+{articles_json}
+
+Return this JSON array (one object per article):
+[
+  {{
+    "id": <integer article id>,
+    "entities": [
+      {{
+        "name_ko": "Korean name (required)",
+        "name_en": "English/romanized name or null",
+        "type": "ARTIST" or "GROUP",
+        "is_primary": true if this is the main subject of the article,
+        "confidence": 0.7-1.0
+      }}
+    ],
+    "primary_artist_ko": "primary artist or group name in Korean or null",
+    "primary_artist_en": "primary artist or group name in English or null"
+  }}
+]
+
+Rules:
+- Only include K-pop idols and groups, not actors, presenters, or companies
+- Set is_primary=true for the main subject of the article (usually 1 per article)
+- Set confidence based on how clearly the entity is identified (0.7+ = confident)
+- If no K-pop entities found, return empty entities array"""
+
+
+def _call_gemini_entity_batch(articles: list[dict]) -> list[dict]:
+    """N개 기사에서 아티스트/그룹 엔티티를 Gemini 1회 호출로 추출합니다."""
+    from core.config import check_gemini_kill_switch, record_gemini_usage
+
+    check_gemini_kill_switch()
+
+    articles_json = json.dumps(
+        [
+            {
+                "id": a["id"],
+                "title": a["title_ko"] or "",
+                "content": (a["content_ko"] or "")[:500],
+            }
+            for a in articles
+        ],
+        ensure_ascii=False,
+    )
+
+    prompt = _ENTITY_PROMPT.format(articles_json=articles_json)
+    model = _get_model()
+    response = model.generate_content(prompt)
+
+    usage = getattr(response, "usage_metadata", None)
+    total_tokens = getattr(usage, "total_token_count", 0)
+    if total_tokens:
+        try:
+            record_gemini_usage(total_tokens)
+        except Exception:
+            pass
+
+    raw = response.text.strip()
+    result = json.loads(raw)
+    if isinstance(result, dict):
+        result = [result]
+    return result
+
+
+def _save_entity_results(results: list[dict]) -> int:
+    """Gemini 엔티티 추출 결과를 artist/group/entity_mapping 테이블에 저장합니다."""
+    from sqlalchemy import select
+
+    from core.db import get_db
+    from database.models import (
+        ActivityStatus,
+        Article,
+        Artist,
+        EntityMapping,
+        EntityType,
+        Group,
+    )
+
+    count = 0
+    for r in results:
+        article_id = r.get("id")
+        entities = r.get("entities") or []
+        primary_ko = (r.get("primary_artist_ko") or "").strip() or None
+        primary_en = (r.get("primary_artist_en") or "").strip() or None
+
+        if not article_id:
+            continue
+
+        for ent in entities:
+            name_ko = (ent.get("name_ko") or "").strip()
+            name_en = (ent.get("name_en") or "").strip() or None
+            etype = (ent.get("type") or "ARTIST").upper()
+            confidence = float(ent.get("confidence", 0.5))
+
+            if not name_ko or confidence < 0.5:
+                continue
+
+            try:
+                if etype == "GROUP":
+                    with get_db() as session:
+                        group = session.scalars(
+                            select(Group).where(Group.name_ko == name_ko)
+                        ).first()
+                        if group is None:
+                            group = Group(
+                                name_ko=name_ko,
+                                name_en=name_en,
+                                activity_status=ActivityStatus.ACTIVE,
+                            )
+                            session.add(group)
+                            session.flush()
+                        elif name_en and not group.name_en:
+                            group.name_en = name_en
+                        entity_id = group.id
+                        session.commit()
+
+                    with get_db() as session:
+                        existing = session.scalars(
+                            select(EntityMapping)
+                            .where(EntityMapping.article_id == article_id)
+                            .where(EntityMapping.group_id == entity_id)
+                        ).first()
+                        if existing is None:
+                            session.add(EntityMapping(
+                                article_id=article_id,
+                                entity_type=EntityType.GROUP,
+                                group_id=entity_id,
+                                confidence_score=min(confidence, 1.0),
+                            ))
+                            session.commit()
+
+                else:  # ARTIST
+                    with get_db() as session:
+                        artist = session.scalars(
+                            select(Artist).where(Artist.name_ko == name_ko)
+                        ).first()
+                        if artist is None:
+                            artist = Artist(name_ko=name_ko, name_en=name_en)
+                            session.add(artist)
+                            session.flush()
+                        elif name_en and not artist.name_en:
+                            artist.name_en = name_en
+                        entity_id = artist.id
+                        session.commit()
+
+                    with get_db() as session:
+                        existing = session.scalars(
+                            select(EntityMapping)
+                            .where(EntityMapping.article_id == article_id)
+                            .where(EntityMapping.artist_id == entity_id)
+                        ).first()
+                        if existing is None:
+                            session.add(EntityMapping(
+                                article_id=article_id,
+                                entity_type=EntityType.ARTIST,
+                                artist_id=entity_id,
+                                confidence_score=min(confidence, 1.0),
+                            ))
+                            session.commit()
+
+            except Exception as exc:
+                logger.warning(
+                    "엔티티 저장 실패 | article_id=%d name_ko=%s: %s",
+                    article_id, name_ko, exc,
+                )
+
+        # 대표 아티스트 이름 업데이트
+        if primary_ko:
+            try:
+                with get_db() as session:
+                    art = session.get(Article, article_id)
+                    if art and not art.artist_name_ko:
+                        art.artist_name_ko = primary_ko
+                        if primary_en:
+                            art.artist_name_en = primary_en
+                        session.commit()
+            except Exception as exc:
+                logger.warning(
+                    "artist_name 업데이트 실패 | article_id=%d: %s", article_id, exc
+                )
+
+        count += 1
+
+    return count
+
+
+def process_entity_extraction(batch_size: int = ENTITY_BATCH_SIZE) -> int:
+    """
+    EntityMapping이 없는 PROCESSED 기사에서 K-pop 아티스트/그룹 엔티티를 추출합니다.
+
+    - Gemini 1회 호출로 batch_size개 기사 처리
+    - artists / groups 테이블 UPSERT (name_ko 기준)
+    - entity_mappings 레코드 생성
+    - articles.artist_name_ko/en 업데이트 (대표 아티스트)
+    - process_status는 변경하지 않음 (PROCESSED 유지)
+    """
+    from sqlalchemy import exists as sa_exists
+    from sqlalchemy import select
+
+    from core.db import get_db
+    from database.models import Article, EntityMapping, ProcessStatus
+
+    with get_db() as session:
+        has_mapping = sa_exists().where(EntityMapping.article_id == Article.id)
+        rows = list(
+            session.scalars(
+                select(Article)
+                .where(Article.process_status == ProcessStatus.PROCESSED)
+                .where(~has_mapping)
+                .where(Article.title_ko.isnot(None))
+                .order_by(Article.published_at.desc().nullslast())
+                .limit(batch_size)
+            )
+        )
+        article_data = [
+            {
+                "id": a.id,
+                "title_ko": a.title_ko or "",
+                "content_ko": (a.content_ko or "")[:500],
+            }
+            for a in rows
+        ]
+
+    if not article_data:
+        logger.debug("엔티티 추출할 PROCESSED 기사 없음")
+        return 0
+
+    logger.info("엔티티 추출 시작 | %d개 기사 → Gemini 1회 호출", len(article_data))
+
+    try:
+        results = _call_gemini_entity_batch(article_data)
+        count = _save_entity_results(results)
+        logger.info("엔티티 추출 완료 | 처리=%d / 대상=%d", count, len(article_data))
+        return count
+    except Exception as exc:
+        logger.exception("엔티티 추출 실패: %s", exc)
+        return 0
+
+
+def process_all_entity_extraction() -> int:
+    """EntityMapping이 없는 PROCESSED 기사 전체에 엔티티 추출을 실행합니다."""
+    total = 0
+    while True:
+        n = process_entity_extraction(batch_size=ENTITY_BATCH_SIZE)
+        total += n
+        if n == 0:
+            break
+    if total:
+        logger.info("전체 엔티티 추출 완료 | 총=%d", total)
+    return total
