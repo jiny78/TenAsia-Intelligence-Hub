@@ -179,6 +179,42 @@ def _do_scrape_range(params: dict, job_id: Optional[int] = None) -> dict:
     }
 
 
+def _do_scrape_rss(params: dict, job_id: Optional[int] = None) -> dict:
+    """
+    RSS 피드 1회 요청으로 기사 메타데이터를 즉시 저장합니다.
+    개별 페이지 fetch 없이 RSS 데이터만 사용 (50개 기사 ≈ 1초).
+
+    params 예시:
+        {
+            "language":   "kr",
+            "start_date": "2026-02-01",  # 선택
+            "end_date":   "2026-02-27",  # 선택
+        }
+    """
+    language   = params.get("language", "kr")
+    start_date = params.get("start_date")
+    end_date   = params.get("end_date")
+
+    start_dt = datetime.strptime(start_date, "%Y-%m-%d") if start_date else None
+    end_dt   = (
+        datetime.strptime(end_date, "%Y-%m-%d").replace(hour=23, minute=59, second=59)
+        if end_date else None
+    )
+
+    logger.info(
+        "scrape_rss 시작 | lang=%s start=%s end=%s job_id=%s",
+        language, start_dt, end_dt, job_id,
+    )
+
+    scraper = TenAsiaScraper()
+    return scraper.scrape_from_rss(
+        job_id=job_id,
+        language=language,
+        start_date=start_dt,
+        end_date=end_dt,
+    )
+
+
 def _do_process_scraped() -> None:
     """스크래핑 완료 후 SCRAPED 기사를 AI 처리합니다. 실패해도 스크래핑 결과에 영향 없음."""
     try:
@@ -204,6 +240,8 @@ def process_job(job: dict) -> None:
             result = _do_scrape(params, job_id=job_id)
         elif job_type == "scrape_range":
             result = _do_scrape_range(params, job_id=job_id)
+        elif job_type == "scrape_rss":
+            result = _do_scrape_rss(params, job_id=job_id)
         else:
             raise ValueError(f"알 수 없는 job_type: {job_type!r}")
 

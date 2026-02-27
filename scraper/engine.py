@@ -176,9 +176,12 @@ class ParseError(ScraperError):
 class RSSEntry:
     """RSS / 목록 페이지에서 수집한 기사 메타데이터."""
 
-    url:          str
-    title:        str                   = ""
-    published_at: Optional[datetime]    = None
+    url:           str
+    title:         str                = ""
+    published_at:  Optional[datetime] = None
+    description:   str                = ""        # RSS <description> 본문 요약
+    thumbnail_url: Optional[str]      = None      # <media:content> / <enclosure>
+    author:        Optional[str]      = None      # <author> / <dc:creator>
 
 
 @dataclass
@@ -1323,10 +1326,42 @@ class TenAsiaScraper(BaseScraper):
             title = (item.findtext("title") or "").strip()
             pub   = (item.findtext("pubDate") or "").strip()
             if url:
+                # ── 추가 필드 추출 ────────────────────────────
+                # description: CDATA로 감싸인 HTML 텍스트 → 순수 텍스트
+                raw_desc = (item.findtext("description") or "").strip()
+                if raw_desc:
+                    try:
+                        raw_desc = BeautifulSoup(
+                            raw_desc, "html.parser"
+                        ).get_text(" ", strip=True)
+                    except Exception:
+                        pass
+                desc = raw_desc[:1000]
+
+                # author: <author> 또는 namespace 제거 후 <creator>
+                author = (
+                    item.findtext("author")
+                    or item.findtext("creator")
+                    or ""
+                ).strip() or None
+
+                # thumbnail: <enclosure type="image/..."> 또는 <content url="...">
+                thumb: Optional[str] = None
+                enc = item.find("enclosure")
+                if enc is not None and (enc.get("type", "").startswith("image")):
+                    thumb = enc.get("url")
+                if not thumb:
+                    content_tag = item.find("content")
+                    if content_tag is not None:
+                        thumb = content_tag.get("url")
+
                 entries.append(RSSEntry(
                     url=url,
                     title=title,
                     published_at=cls._parse_rss_date(pub),
+                    description=desc,
+                    thumbnail_url=thumb,
+                    author=author,
                 ))
 
         # Atom — <entry> 요소 (RSS 가 없을 때)
@@ -1345,10 +1380,17 @@ class TenAsiaScraper(BaseScraper):
                     or ""
                 ).strip()
                 if url:
+                    raw_desc = (entry.findtext("summary") or entry.findtext("content") or "").strip()
+                    if raw_desc:
+                        try:
+                            raw_desc = BeautifulSoup(raw_desc, "html.parser").get_text(" ", strip=True)
+                        except Exception:
+                            pass
                     entries.append(RSSEntry(
                         url=url,
                         title=title,
                         published_at=cls._parse_datetime(pub),
+                        description=raw_desc[:1000],
                     ))
 
         return entries
@@ -1724,6 +1766,96 @@ class TenAsiaScraper(BaseScraper):
             skipped=len(combined.skipped),
         )
         return combined
+
+    def scrape_from_rss(
+        self,
+        job_id:        Optional[int]      = None,
+        language:      str                = "kr",
+        start_date:    Optional[datetime] = None,
+        end_date:      Optional[datetime] = None,
+        skip_existing: bool               = True,
+    ) -> dict[str, Any]:
+        """
+        RSS 피드 1회 요청으로 기사 메타데이터를 즉시 저장합니다.
+        개별 기사 페이지 fetch 없이 RSS 데이터만으로 articles 테이블에 저장합니다.
+
+        속도 비교:
+            scrape_batch (기존): 50개 ≈ 125초 (2.5초/기사 × 50)
+            scrape_from_rss:    50개 ≈ 1초   (RSS 1회 요청)
+
+        저장 데이터:
+            title_ko      ← RSS <title>
+            content_ko    ← RSS <description> (HTML 제거, 최대 1000자)
+            published_at  ← RSS <pubDate>
+            thumbnail_url ← RSS <enclosure> or <media:content> (있을 경우)
+            author        ← RSS <author> or <dc:creator> (있을 경우)
+            process_status = 'SCRAPED' → AI 처리 큐 즉시 진입
+
+        Args:
+            job_id:        연결된 job_queue.id
+            language:      기사 언어 코드 ('kr')
+            start_date:    이 날짜 이전 기사 스킵 (None = 필터 없음)
+            end_date:      이 날짜 이후 기사 스킵 (None = 필터 없음)
+            skip_existing: SCRAPED/PROCESSED/PENDING 기사 스킵 여부 (기본 True)
+
+        Returns:
+            {"saved": int, "skipped": int, "total": int}
+        """
+        entries = self._collect_feed_entries(start_date=start_date, end_date=end_date)
+
+        if not entries:
+            self.log.info("scrape_from_rss: 피드 항목 없음")
+            return {"saved": 0, "skipped": 0, "total": 0}
+
+        # 상태 기반 중복 체크
+        to_save: list[RSSEntry] = entries
+        if skip_existing:
+            statuses = get_articles_status_by_urls([e.url for e in entries])
+            to_save = [
+                e for e in entries
+                if statuses.get(e.url) not in ("SCRAPED", "PROCESSED", "PENDING", "MANUAL_REVIEW")
+            ]
+
+        skipped_count = len(entries) - len(to_save)
+
+        self.log.info(
+            "scrape_from_rss_start",
+            total=len(entries),
+            to_save=len(to_save),
+            skipped=skipped_count,
+            job_id=job_id,
+        )
+
+        saved = 0
+        for entry in to_save:
+            data: dict[str, Any] = {
+                "title_ko":      entry.title or None,
+                "content_ko":    entry.description or None,
+                "author":        entry.author or None,
+                "thumbnail_url": entry.thumbnail_url or None,
+                "published_at":  entry.published_at,
+                "language":      language,
+                "process_status": "SCRAPED",
+            }
+            try:
+                upsert_article(entry.url, data, job_id=job_id)
+                saved += 1
+                self.log.debug(
+                    "rss_entry_saved",
+                    url=entry.url,
+                    title=str(entry.title)[:50],
+                    has_content=bool(entry.description),
+                )
+            except Exception as exc:
+                self.log.warning("rss_entry_save_failed", url=entry.url, error=str(exc))
+
+        self.log.info(
+            "scrape_from_rss_done",
+            saved=saved,
+            skipped=skipped_count,
+            total=len(entries),
+        )
+        return {"saved": saved, "skipped": skipped_count, "total": len(entries)}
 
 
 # ─────────────────────────────────────────────────────────────
