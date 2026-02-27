@@ -44,32 +44,32 @@ export function StatsCards() {
         <StatCard
           icon={<Newspaper className="h-5 w-5" />}
           label="전체 기사"
-          value={stats?.articles.total ?? "—"}
-          sub={`오늘 +${stats?.articles.today ?? 0}건`}
+          value={stats?.articles?.total ?? "—"}
+          sub={`오늘 +${stats?.articles?.today ?? 0}건`}
           iconBg="bg-purple-500/10"
           iconColor="text-purple-400"
         />
         <StatCard
           icon={<CheckCircle2 className="h-5 w-5" />}
           label="처리 완료"
-          value={stats?.articles.PROCESSED ?? "—"}
-          sub={`검토 필요: ${stats?.articles.MANUAL_REVIEW ?? 0}`}
+          value={stats?.articles?.PROCESSED ?? "—"}
+          sub={`검토 필요: ${stats?.articles?.MANUAL_REVIEW ?? 0}`}
           iconBg="bg-emerald-500/10"
           iconColor="text-emerald-400"
         />
         <StatCard
           icon={<Clock className="h-5 w-5" />}
           label="처리 대기"
-          value={(stats?.articles.PENDING ?? 0) + (stats?.articles.SCRAPED ?? 0)}
-          sub={`오류: ${stats?.articles.ERROR ?? 0}`}
+          value={(stats?.articles?.PENDING ?? 0) + (stats?.articles?.SCRAPED ?? 0)}
+          sub={`오류: ${stats?.articles?.ERROR ?? 0}`}
           iconBg="bg-amber-500/10"
           iconColor="text-amber-400"
         />
         <StatCard
           icon={<Users2 className="h-5 w-5" />}
           label="아티스트"
-          value={stats?.artists.total ?? "—"}
-          sub={`검증됨: ${stats?.artists.verified ?? 0}`}
+          value={stats?.artists?.total ?? "—"}
+          sub={`검증됨: ${stats?.artists?.verified ?? 0}`}
           iconBg="bg-blue-500/10"
           iconColor="text-blue-400"
         />

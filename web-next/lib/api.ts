@@ -60,7 +60,10 @@ export const scraperApi = {
 
 // ── Dashboard ──────────────────────────────────────────────────
 export const dashboardApi = {
-  stats: () => request<import("./types").DashboardStats>("/status"),
+  stats: async () => {
+    const res = await request<{ db: import("./types").DashboardStats }>("/status");
+    return res.db;
+  },
   health: () => request<import("./types").HealthStatus>("/health"),
   costReport: () => request<import("./types").CostReport>("/reports/cost/today"),
 };
