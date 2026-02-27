@@ -65,7 +65,28 @@ export const dashboardApi = {
     return res.db;
   },
   health: () => request<import("./types").HealthStatus>("/health"),
-  costReport: () => request<import("./types").CostReport>("/reports/cost/today"),
+  costReport: async () => {
+    const res = await request<{
+      usage: { api_calls: number; prompt_tokens: number; completion_tokens: number; total_tokens: number; avg_latency_ms: number };
+      cost:  { actual_input_usd: number; actual_output_usd: number; actual_total_usd: number };
+      savings: { skipped_articles: number; saved_cost_usd_est: number; total_if_no_priority_usd: number };
+    }>("/reports/cost/today");
+    const totalIfNo = res.savings?.total_if_no_priority_usd ?? 0;
+    const saved     = res.savings?.saved_cost_usd_est ?? 0;
+    return {
+      api_calls:            res.usage?.api_calls ?? 0,
+      prompt_tokens:        res.usage?.prompt_tokens ?? 0,
+      completion_tokens:    res.usage?.completion_tokens ?? 0,
+      total_tokens:         res.usage?.total_tokens ?? 0,
+      avg_latency_ms:       res.usage?.avg_latency_ms ?? 0,
+      input_cost_usd:       res.cost?.actual_input_usd ?? 0,
+      output_cost_usd:      res.cost?.actual_output_usd ?? 0,
+      total_cost_usd:       res.cost?.actual_total_usd ?? 0,
+      skipped_articles:     res.savings?.skipped_articles ?? 0,
+      estimated_savings_usd: saved,
+      savings_pct:          totalIfNo > 0 ? Math.round((saved / totalIfNo) * 100) : 0,
+    } as import("./types").CostReport;
+  },
 };
 
 // ── Glossary ───────────────────────────────────────────────────
