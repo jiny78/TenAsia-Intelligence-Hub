@@ -505,6 +505,25 @@ def _save_entity_results(results: list[dict]) -> int:
                     "artist_name 업데이트 실패 | article_id=%d: %s", article_id, exc
                 )
 
+        # 엔티티가 없는 기사는 sentinel EntityMapping(EVENT, confidence=0)을 생성해
+        # 다음 추출 사이클에서 재처리되지 않도록 표시합니다.
+        try:
+            with get_db() as session:
+                has_any = session.scalars(
+                    select(EntityMapping).where(EntityMapping.article_id == article_id)
+                ).first()
+                if has_any is None:
+                    session.add(EntityMapping(
+                        article_id=article_id,
+                        entity_type=EntityType.EVENT,
+                        confidence_score=0.0,
+                    ))
+                    session.commit()
+        except Exception as exc:
+            logger.warning(
+                "sentinel EntityMapping 생성 실패 | article_id=%d: %s", article_id, exc
+            )
+
         count += 1
 
     return count
