@@ -204,10 +204,10 @@ class Settings(BaseSettings):
     ENVIRONMENT: str = "development"
 
     # ── Gemini 모델 ────────────────────────────────────────
-    GEMINI_MODEL: str   = "gemini-2.0-flash"
-    ARTICLE_MODEL: str  = "gemini-2.0-flash"
-    VIDEO_MODEL: str    = "gemini-1.5-flash"
-    FALLBACK_MODEL: str = "gemini-1.5-flash"
+    GEMINI_MODEL: str   = "gemini-2.5-flash"
+    ARTICLE_MODEL: str  = "gemini-2.5-flash"
+    VIDEO_MODEL: str    = "gemini-2.0-flash-lite"
+    FALLBACK_MODEL: str = "gemini-2.0-flash-lite"
 
     # ── Gemini API 속도 제어 ──────────────────────────────
     GEMINI_RPM_LIMIT: int = 60   # 분당 요청 수 (무료: 15, 유료: 2000)

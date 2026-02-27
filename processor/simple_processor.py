@@ -238,9 +238,47 @@ def process_scraped_batch(batch_size: int = BATCH_SIZE) -> int:
         return done
 
     except Exception as exc:
-        logger.warning("배치 Gemini 호출 실패: %s — 기사 ERROR 처리", exc)
+        logger.exception("배치 Gemini 호출 실패 — 기사 ERROR 처리: %s", exc)
         _mark_error(ids)
         return 0
+
+
+def reset_error_to_scraped(limit: int = 200) -> int:
+    """
+    ERROR 상태 기사를 SCRAPED으로 되돌려 재처리 큐에 진입시킵니다.
+    최대 limit개를 처리하며, 리셋된 기사 수를 반환합니다.
+    """
+    from sqlalchemy import select
+
+    from core.db import get_db
+    from database.models import Article, ProcessStatus
+
+    with get_db() as session:
+        articles = list(
+            session.scalars(
+                select(Article)
+                .where(Article.process_status == ProcessStatus.ERROR)
+                .order_by(Article.published_at.desc().nullslast())
+                .limit(limit)
+            )
+        )
+        ids = [a.id for a in articles]
+
+    if not ids:
+        return 0
+
+    count = 0
+    for aid in ids:
+        with get_db() as session:
+            art = session.get(Article, aid)
+            if art and art.process_status == ProcessStatus.ERROR:
+                art.process_status = ProcessStatus.SCRAPED
+                session.commit()
+                count += 1
+
+    if count:
+        logger.info("ERROR → SCRAPED 리셋 | %d개", count)
+    return count
 
 
 def process_all_scraped() -> int:
@@ -256,3 +294,12 @@ def process_all_scraped() -> int:
     if total:
         logger.info("전체 배치 AI 처리 완료 | 총=%d", total)
     return total
+
+
+def process_all_with_retry() -> int:
+    """
+    ERROR 기사를 SCRAPED으로 리셋한 뒤 전체 처리를 실행합니다.
+    Worker 루프에서 호출합니다.
+    """
+    reset_error_to_scraped()
+    return process_all_scraped()
