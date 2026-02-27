@@ -5,7 +5,7 @@ scraper/engine.py — 안정적 스크래핑 엔진 (Throttling & Queue)
     Throttling (2중 레이어):
         1층 — DomainThrottle (scraper/throttle.py)
               도메인별 최소 간격 + RPM 슬라이딩 윈도우 (Thread-safe)
-        2층 — Human Delay (self.delay = random.uniform(2.0, 5.0))
+        2층 — Human Delay (self.delay = random.uniform(0.5, 1.5))
               도메인 간격 외에 추가되는 랜덤 지연 — 봇 패턴 탐지 회피
 
     배치 처리:
@@ -292,16 +292,16 @@ class BaseScraper(abc.ABC):
 
     def __init__(
         self,
-        delay_min:   float = 2.0,
-        delay_max:   float = 5.0,
+        delay_min:   float = 0.5,
+        delay_max:   float = 1.5,
         max_retries: int   = 3,
         timeout:     int   = 15,
         batch_size:  int   = 10,
     ) -> None:
         """
         Args:
-            delay_min:   Human delay 하한 (초). 기본 2.0
-            delay_max:   Human delay 상한 (초). 기본 5.0
+            delay_min:   Human delay 하한 (초). 기본 0.5
+            delay_max:   Human delay 상한 (초). 기본 1.5
             max_retries: 429/5xx 재시도 최대 횟수. 기본 3
             timeout:     HTTP 요청 타임아웃 (초). 기본 15
             batch_size:  한 번에 처리할 최대 URL 수. 기본 10
