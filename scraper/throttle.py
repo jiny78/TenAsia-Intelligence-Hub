@@ -42,7 +42,8 @@ logger = structlog.get_logger(__name__)
 
 # 도메인 → (최소 간격 초, 최대 RPM)
 _DOMAIN_RULES: dict[str, tuple[float, int]] = {
-    "tenasia.hankyung.com": (1.0,  30),
+    "tenasia.co.kr":        (1.0,  30),   # www.tenasia.co.kr (2026-02 이전)
+    "tenasia.hankyung.com": (1.0,  30),   # 구 도메인 (리다이렉트됨, 호환 유지)
     "naver.com":            (0.5,  60),
     "entertain.naver.com":  (0.5,  60),
     "news.naver.com":       (0.5,  60),
