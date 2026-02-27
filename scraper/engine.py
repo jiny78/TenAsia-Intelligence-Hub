@@ -1276,13 +1276,15 @@ class TenAsiaScraper(BaseScraper):
 
     # ── RSS / 목록 페이지 ─────────────────────────────────────
 
-    # RSS 피드 URL — 환경·운영 정책에 따라 서브클래스에서 재정의 가능
-    _RSS_URL:       str = "https://tenasia.hankyung.com/rss/allnews.rss"
-    _LIST_BASE_URL: str = "https://tenasia.hankyung.com"
-    _LIST_PATH:     str = "/all"
+    # RSS 피드 URL — 2026-02 도메인 이전: tenasia.hankyung.com → www.tenasia.co.kr
+    _RSS_URL:       str = "https://www.tenasia.co.kr/rss/topic/"
+    _LIST_BASE_URL: str = "https://www.tenasia.co.kr"
+    _LIST_PATH:     str = "/topic"
 
     # 목록 페이지에서 기사 링크를 찾기 위한 CSS 셀렉터 (우선순위 순)
     _LIST_PAGE_SELECTORS: list[str] = [
+        ".news-tit a",          # www.tenasia.co.kr 현행 구조
+        ".txt-wrap a",          # www.tenasia.co.kr 현행 구조
         "article.news-item a",
         ".article-list a",
         ".news_list li a",

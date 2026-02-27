@@ -306,7 +306,7 @@ def _recover_stuck_jobs() -> None:
                            worker_id  = NULL,
                            started_at = NULL
                      WHERE status = 'running'
-                       AND started_at < NOW() - INTERVAL '30 minutes'
+                       AND started_at < NOW() - INTERVAL '20 minutes'
                     RETURNING id
                 """)
                 rows = cur.fetchall()
