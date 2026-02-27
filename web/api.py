@@ -82,6 +82,10 @@ _STATIC_ROOT = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static"
 os.makedirs(_STATIC_ROOT, exist_ok=True)
 app.mount("/static", StaticFiles(directory=_STATIC_ROOT), name="static")
 
+# ── 공개 API 라우터 (소비자 사이트용) ──────────────────────────
+from web.public_api import public_router  # noqa: E402
+app.include_router(public_router)
+
 
 # ── 요청/응답 스키마 ─────────────────────────────────────────
 
