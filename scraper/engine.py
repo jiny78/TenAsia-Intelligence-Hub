@@ -1504,6 +1504,43 @@ class TenAsiaScraper(BaseScraper):
             self.log.warning("list_page_error", url=url, error=str(exc))
             return []
 
+    def _fetch_sitemap_by_date(self, date: datetime) -> list[RSSEntry]:
+        """
+        사이트맵 페이지에서 특정 날짜의 기사 목록을 수집합니다.
+
+        URL 패턴: https://www.tenasia.co.kr/sitemap/YYYY/MM/DD
+        기사 날짜는 URL의 날짜로 설정합니다 (페이지에 별도 날짜 표시 없음).
+        """
+        url = f"{self._LIST_BASE_URL}/sitemap/{date.strftime('%Y/%m/%d')}"
+        try:
+            resp = self._session.get(url, timeout=self.timeout)
+            if not resp.ok:
+                self.log.warning("sitemap_page_failed", url=url, status=resp.status_code)
+                return []
+
+            soup = BeautifulSoup(resp.text, "html.parser")
+            entries: list[RSSEntry] = []
+            seen: set[str] = set()
+
+            for a in soup.select(".news-tit a"):
+                href = a.get("href", "").strip()
+                if not href or href in seen:
+                    continue
+                if not re.search(r"/article[s]?/|\d{8,}", href):
+                    continue
+                seen.add(href)
+                entries.append(RSSEntry(
+                    url=href,
+                    title=a.get_text(strip=True),
+                    published_at=date,
+                ))
+
+            self.log.info("sitemap_fetched", date=date.strftime("%Y-%m-%d"), entries=len(entries))
+            return entries
+        except Exception as exc:
+            self.log.warning("sitemap_error", url=url, error=str(exc))
+            return []
+
     def _collect_feed_entries(
         self,
         start_date: Optional[datetime] = None,
@@ -1511,56 +1548,45 @@ class TenAsiaScraper(BaseScraper):
         max_pages:  int                = 10,
     ) -> list[RSSEntry]:
         """
-        RSS + 목록 페이지 페이지네이션으로 기사 후보를 수집합니다.
+        사이트맵(날짜 지정 시 우선) + RSS 로 기사 후보를 수집합니다.
 
-        1. RSS 를 먼저 취득합니다.
-        2. RSS 의 가장 오래된 항목이 start_date 보다 최신이면
-           (RSS 가 범위를 커버하지 못함) 목록 페이지를 추가 탐색합니다.
-        3. start_date / end_date 로 날짜 필터를 적용합니다.
-           published_at 이 없는 항목은 실제 스크래핑 후 확인을 위해 포함합니다.
+        날짜 범위가 있으면:
+          1. 범위 내 각 날짜의 사이트맵(/sitemap/YYYY/MM/DD)에서 URL 수집
+          2. RSS 로 추가 보완 (최신 기사 누락 방지)
+        날짜 범위가 없으면 (scrape_rss 등):
+          1. RSS 만 사용 (빠른 경로)
         """
+        from datetime import date as date_cls, timedelta
+
         entries: list[RSSEntry] = []
         seen:    set[str]       = set()
 
-        # 1. RSS
+        _start = _ensure_tz(start_date) if start_date else None
+        _end   = _ensure_tz(end_date)   if end_date   else None
+
+        # 1. 날짜 범위 → 사이트맵 우선 수집
+        if _start:
+            cur = _start.date() if hasattr(_start, "date") else _start
+            end_d = (_end.date() if hasattr(_end, "date") else _end) if _end else cur
+            day_count = 0
+            while cur <= end_d and day_count < max_pages:
+                sitemap_entries = self._fetch_sitemap_by_date(
+                    datetime(cur.year, cur.month, cur.day)
+                )
+                for e in sitemap_entries:
+                    if e.url not in seen:
+                        seen.add(e.url)
+                        entries.append(e)
+                cur += timedelta(days=1)
+                day_count += 1
+
+        # 2. RSS 보완 (중복 제거)
         for e in self._fetch_rss():
             if e.url not in seen:
                 seen.add(e.url)
                 entries.append(e)
 
-        # 2. 목록 페이지 페이지네이션 필요 여부 판단
-        _start = _ensure_tz(start_date) if start_date else None
-        rss_oldest = min(
-            (_ensure_tz(e.published_at) for e in entries if e.published_at),
-            default=None,
-        )
-        need_list = _start is not None and (
-            not entries                            # RSS 없음
-            or (rss_oldest is not None and rss_oldest > _start)  # RSS 범위 부족
-        )
-
-        if need_list:
-            for page in range(1, max_pages + 1):
-                page_entries = self._fetch_list_page(page)
-                if not page_entries:
-                    break
-                added = False
-                for e in page_entries:
-                    if e.url not in seen:
-                        seen.add(e.url)
-                        entries.append(e)
-                        added = True
-                # 날짜가 있는 항목이 start_date 보다 오래됐으면 중단
-                dated = [e for e in page_entries if e.published_at]
-                if dated:
-                    page_oldest = min(_ensure_tz(e.published_at) for e in dated)
-                    if page_oldest < _start:
-                        break
-                if not added:
-                    break
-
         # 3. 날짜 필터
-        _end = _ensure_tz(end_date) if end_date else None
         if _start or _end:
             filtered: list[RSSEntry] = []
             for e in entries:
@@ -1570,7 +1596,6 @@ class TenAsiaScraper(BaseScraper):
                         continue
                     if _end and pa > _end:
                         continue
-                # published_at 없는 항목은 포함 (scrape_batch 에서 이중 확인)
                 filtered.append(e)
             entries = filtered
 

@@ -216,10 +216,10 @@ def _do_scrape_rss(params: dict, job_id: Optional[int] = None) -> dict:
 
 
 def _do_process_scraped() -> None:
-    """스크래핑 완료 후 SCRAPED 기사를 AI 처리합니다. 실패해도 스크래핑 결과에 영향 없음."""
+    """SCRAPED 기사(+ ERROR 기사 자동 리셋)를 AI 처리합니다. 실패해도 스크래핑 결과에 영향 없음."""
     try:
-        from processor.simple_processor import process_all_scraped
-        process_all_scraped()
+        from processor.simple_processor import process_all_with_retry
+        process_all_with_retry()
     except Exception as exc:
         logger.warning("AI 후처리 실패 (스크래핑 결과는 정상 저장됨) | %s: %s", type(exc).__name__, exc)
 

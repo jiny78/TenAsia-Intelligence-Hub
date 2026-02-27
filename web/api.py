@@ -959,6 +959,41 @@ def delete_job(job_id: int) -> dict[str, Any]:
     return {"job_id": job_id, "status": "cancelled"}
 
 
+@app.post("/admin/reset-errors", status_code=200)
+def reset_error_articles(limit: int = 200) -> dict[str, Any]:
+    """
+    ERROR 상태 기사를 SCRAPED으로 리셋하여 AI 재처리 큐에 올립니다.
+    Worker가 다음 루프에서 자동으로 처리합니다.
+    """
+    from processor.simple_processor import reset_error_to_scraped
+    count = reset_error_to_scraped(limit=limit)
+    return {"reset": count, "message": f"{count}개 기사를 SCRAPED으로 리셋했습니다."}
+
+
+@app.post("/admin/reset-stuck-jobs", status_code=200)
+def reset_stuck_jobs(minutes: int = 20) -> dict[str, Any]:
+    """running 상태로 minutes분 이상 멈춰있는 잡을 pending으로 리셋합니다."""
+    from scraper.db import _conn
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE job_queue
+                   SET status     = 'pending',
+                       worker_id  = NULL,
+                       started_at = NULL
+                 WHERE status = 'running'
+                   AND started_at < NOW() - INTERVAL '%(m)s minutes'
+                RETURNING id
+                """,
+                {"m": minutes},
+            )
+            rows = cur.fetchall()
+            conn.commit()
+    ids = [r[0] for r in rows]
+    return {"reset_jobs": ids, "count": len(ids)}
+
+
 @app.post("/trigger/ssm")
 def trigger_ssm(req: SsmTriggerRequest) -> dict[str, Any]:
     """
