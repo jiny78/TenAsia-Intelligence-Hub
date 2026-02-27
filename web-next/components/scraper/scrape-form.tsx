@@ -1,7 +1,7 @@
 "use client";
 import { useState, useEffect } from "react";
 import { format } from "date-fns";
-import { Play, FlaskConical, CalendarDays } from "lucide-react";
+import { Play, FlaskConical, CalendarDays, Zap } from "lucide-react";
 import type { DateRange } from "react-day-picker";
 import { DateRangePicker } from "@/components/ui/date-range-picker";
 import { Switch } from "@/components/ui/switch";
@@ -14,6 +14,7 @@ export function ScrapeForm() {
   const [batchSize, setBatchSize] = useState(10);
   const [dryRun, setDryRun] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [rssLoading, setRssLoading] = useState(false);
   const [taskId, setTaskId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [progress, setProgress] = useState(0);
@@ -30,6 +31,20 @@ export function ScrapeForm() {
 
   const hasRunning = jobs?.some((j) => j.status === "running") ?? false;
   const recentDone = jobs?.filter((j) => j.status === "completed").slice(0, 5) ?? [];
+
+  async function submitRss() {
+    setRssLoading(true);
+    setError(null);
+    setTaskId(null);
+    try {
+      const res = await scraperApi.scrapeRss();
+      setTaskId(res.task_id);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setRssLoading(false);
+    }
+  }
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -102,6 +117,30 @@ export function ScrapeForm() {
         </div>
       )}
 
+      {/* RSS 빠른 수집 */}
+      <div className="rounded-xl border border-emerald-500/20 bg-emerald-500/5 p-4 space-y-2">
+        <div className="flex items-center justify-between">
+          <div>
+            <p className="text-sm font-semibold flex items-center gap-1.5">
+              <Zap className="h-3.5 w-3.5 text-emerald-400" />
+              RSS 빠른 수집
+            </p>
+            <p className="text-[11px] text-muted-foreground mt-0.5">
+              최신 기사 ~50개를 1초 안에 수집 (개별 페이지 fetch 없음)
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={submitRss}
+            disabled={rssLoading}
+            className="rounded-lg bg-emerald-500 px-4 py-2 text-xs font-semibold text-white shadow transition-all hover:bg-emerald-400 disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-1.5 shrink-0"
+          >
+            <Zap className="h-3.5 w-3.5" />
+            {rssLoading ? "수집 중..." : "지금 실행"}
+          </button>
+        </div>
+      </div>
+
       {/* Submit */}
       <button
         type="submit"
@@ -109,7 +148,7 @@ export function ScrapeForm() {
         className="w-full rounded-xl bg-gradient-to-r from-violet-500 to-pink-500 py-3 text-sm font-semibold text-white shadow-lg transition-all duration-200 hover:opacity-90 hover:shadow-[0_8px_20px_-6px_hsl(267_84%_64%/0.7)] disabled:opacity-40 disabled:cursor-not-allowed flex items-center justify-center gap-2"
       >
         <Play className="h-4 w-4" />
-        {loading ? "시작 중..." : "스크래핑 시작"}
+        {loading ? "시작 중..." : "날짜 범위 스크래핑"}
       </button>
 
       {/* Feedback */}

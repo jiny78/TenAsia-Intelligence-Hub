@@ -178,6 +178,14 @@ class ScrapeRequest(BaseModel):
     dry_run:    bool = Field(False, description="드라이 런 모드 (DB 저장 없음)")
 
 
+class ScrapeRSSRequest(BaseModel):
+    """RSS 피드 즉시 수집 요청 (개별 페이지 fetch 없음, ~50배 빠름)."""
+
+    language:   str            = Field("kr", description="언어 코드 (kr / en / jp)")
+    start_date: Optional[str]  = Field(None, description="시작일 YYYY-MM-DD (없으면 RSS 전체)")
+    end_date:   Optional[str]  = Field(None, description="종료일 YYYY-MM-DD")
+
+
 class ConflictResolveRequest(BaseModel):
     """[Phase 5-B] ConflictFlag 해결·기각 요청."""
 
@@ -1037,6 +1045,30 @@ def start_scrape(req: ScrapeRequest) -> dict[str, Any]:
         "task_id":  str(job_id),
         "status":   "pending",
         "message":  "스크래핑 작업이 워커 큐에 추가되었습니다.",
+        "poll_url": f"/jobs/{job_id}",
+    }
+
+
+@app.post("/scrape/rss", status_code=202)
+def start_scrape_rss(req: ScrapeRSSRequest) -> dict[str, Any]:
+    """
+    RSS 피드 1회 요청으로 최신 기사를 즉시 저장합니다.
+    개별 페이지 fetch 없이 RSS 메타데이터만 저장 (기존 대비 ~50배 빠름).
+
+    날짜 범위 없이 호출하면 RSS 피드 전체 (최신 ~50개)를 수집합니다.
+    """
+    params: dict[str, Any] = {"language": req.language}
+    if req.start_date:
+        params["start_date"] = req.start_date
+    if req.end_date:
+        params["end_date"] = req.end_date
+
+    job_id = create_job("scrape_rss", params, priority=8)
+    logger.info("scrape_rss 큐 추가 | job_id=%d lang=%s", job_id, req.language)
+    return {
+        "task_id":  str(job_id),
+        "status":   "pending",
+        "message":  "RSS 수집 작업이 워커 큐에 추가되었습니다.",
         "poll_url": f"/jobs/{job_id}",
     }
 

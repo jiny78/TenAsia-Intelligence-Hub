@@ -46,6 +46,11 @@ export const scraperApi = {
       method: "POST",
       body: JSON.stringify(body),
     }),
+  scrapeRss: (params?: { language?: string; start_date?: string; end_date?: string }) =>
+    request<{ task_id: string }>("/scrape/rss", {
+      method: "POST",
+      body: JSON.stringify({ language: "kr", ...params }),
+    }),
   scrapeUrl: (url: string, language?: string) =>
     request<{ job_id: number }>("/scrape/url", {
       method: "POST",
