@@ -970,6 +970,17 @@ def reset_error_articles(limit: int = 200) -> dict[str, Any]:
     return {"reset": count, "message": f"{count}개 기사를 SCRAPED으로 리셋했습니다."}
 
 
+@app.post("/admin/extract-entities", status_code=200)
+def trigger_entity_extraction(batch_size: int = 50) -> dict[str, Any]:
+    """
+    PROCESSED 기사에서 K-pop 아티스트/그룹 엔티티를 추출합니다.
+    EntityMapping이 없는 기사를 대상으로 artists/groups/entity_mappings 테이블에 저장합니다.
+    """
+    from processor.simple_processor import process_all_entity_extraction
+    count = process_all_entity_extraction()
+    return {"processed": count, "message": f"{count}개 기사 엔티티 추출 완료"}
+
+
 @app.post("/admin/reset-stuck-jobs", status_code=200)
 def reset_stuck_jobs(minutes: int = 20) -> dict[str, Any]:
     """running 상태로 minutes분 이상 멈춰있는 잡을 pending으로 리셋합니다."""
