@@ -47,11 +47,9 @@ WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 
-# Build-time env var (Next.js public 변수는 빌드 시 번들에 삽입됨)
-ARG NEXT_PUBLIC_API_URL=http://localhost:8000
-ENV NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL} \
-    NODE_ENV=production \
-    # 텔레메트리 비활성화
+# 프로덕션 빌드: NEXT_PUBLIC_API_URL 미설정 → 브라우저에서 /api 프록시 경유
+# 로컬 개발: .env.local 에서 NEXT_PUBLIC_API_URL=http://localhost:8000 설정
+ENV NODE_ENV=production \
     NEXT_TELEMETRY_DISABLED=1
 
 RUN npm run build
