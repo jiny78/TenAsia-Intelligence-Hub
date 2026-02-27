@@ -179,6 +179,15 @@ def _do_scrape_range(params: dict, job_id: Optional[int] = None) -> dict:
     }
 
 
+def _do_process_scraped() -> None:
+    """스크래핑 완료 후 SCRAPED 기사를 AI 처리합니다. 실패해도 스크래핑 결과에 영향 없음."""
+    try:
+        from processor.simple_processor import process_all_scraped
+        process_all_scraped()
+    except Exception as exc:
+        logger.warning("AI 후처리 실패 (스크래핑 결과는 정상 저장됨) | %s: %s", type(exc).__name__, exc)
+
+
 def process_job(job: dict) -> None:
     """
     단일 작업을 처리하고 결과를 DB에 기록합니다.
@@ -200,6 +209,9 @@ def process_job(job: dict) -> None:
 
         update_job_status(job_id, "completed", result=result)
         logger.info("작업 완료 | id=%d", job_id)
+
+        # 스크래핑 성공 후 SCRAPED 기사를 즉시 AI 처리
+        _do_process_scraped()
 
     except ForbiddenError as exc:
         # 403 IP/UA 차단: 재시도해도 의미 없으므로 즉시 실패 처리
