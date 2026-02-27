@@ -283,7 +283,7 @@ jobs:
   # ────────────────────────────────────────────────────
   # Job 4: 스크래퍼 워커 App Runner 배포
   #   - API 이미지 재사용, StartCommand만 변경
-  #   - DATABASE_URL 만 주입 (Gemini 불필요)
+  #   - DATABASE_URL + GEMINI_API_KEY 주입 (simple_processor 사용)
   # ────────────────────────────────────────────────────
   deploy-worker:
     name: Deploy Scraper Worker
@@ -304,8 +304,9 @@ jobs:
       - name: Deploy Worker
         id: deploy
         env:
-          IMAGE_URI:    ${{ needs.build-api.outputs.image-uri }}
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          IMAGE_URI:      ${{ needs.build-api.outputs.image-uri }}
+          DATABASE_URL:   ${{ secrets.DATABASE_URL }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
           set -euo pipefail
 
@@ -329,6 +330,7 @@ jobs:
           jq -n \
             --arg image  "$IMAGE_URI" \
             --arg db     "$DATABASE_URL" \
+            --arg gemini "$GEMINI_API_KEY" \
             --arg role   "$ECR_ROLE" \
             '{
               ImageRepository: {
@@ -337,9 +339,10 @@ jobs:
                   Port: "8000",
                   StartCommand: "python -m web.worker_main",
                   RuntimeEnvironmentVariables: {
-                    DATABASE_URL:  $db,
-                    SKIP_MIGRATE:  "true",
-                    WORKER_ID:     "apprunner-worker"
+                    DATABASE_URL:   $db,
+                    GEMINI_API_KEY: $gemini,
+                    SKIP_MIGRATE:   "true",
+                    WORKER_ID:      "apprunner-worker"
                   }
                 },
                 ImageRepositoryType: "ECR"
