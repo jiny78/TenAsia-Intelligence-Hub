@@ -42,7 +42,7 @@ export const articlesApi = {
 // ── Scraper ────────────────────────────────────────────────────
 export const scraperApi = {
   scrapeRange: (body: import("./types").ScrapeRangeRequest) =>
-    request<{ task_id: string }>("/scrape/range", {
+    request<{ task_id: string }>("/scrape", {
       method: "POST",
       body: JSON.stringify(body),
     }),

@@ -42,7 +42,7 @@ from typing import Any, Literal, Optional
 import boto3
 import psycopg2
 import psycopg2.extras
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -1008,35 +1008,32 @@ def get_ssm_result(command_id: str) -> dict[str, Any]:
 
 
 @app.post("/scrape", status_code=202)
-def start_scrape(req: ScrapeRequest, background_tasks: BackgroundTasks) -> dict[str, Any]:
+def start_scrape(req: ScrapeRequest) -> dict[str, Any]:
     """
-    날짜 범위 스크래핑을 백그라운드에서 시작합니다.
+    날짜 범위 스크래핑을 워커 큐에 추가합니다.
 
-    즉시 task_id 를 반환하며, 실제 스크래핑은 백그라운드에서 진행됩니다.
-    GET /scrape/{task_id} 로 진행 상황을 조회하세요.
+    즉시 job_id 를 반환하며, 실제 스크래핑은 별도 워커 서비스에서 진행됩니다.
+    GET /jobs/{job_id} 로 진행 상황을 조회하세요.
     """
-    task_id = str(uuid.uuid4())
-    _scrape_tasks[task_id] = {
-        "status":     "pending",
-        "created_at": datetime.now().isoformat(),
-        "request": {
+    job_id = create_job(
+        "scrape_range",
+        params={
             "start_date": req.start_date,
             "end_date":   req.end_date,
             "language":   req.language,
             "max_pages":  req.max_pages,
             "dry_run":    req.dry_run,
         },
-    }
-    background_tasks.add_task(_run_scrape_bg, task_id, req)
+    )
     logger.info(
-        "스크래핑 시작 | task_id=%s start=%s end=%s lang=%s dry_run=%s",
-        task_id, req.start_date, req.end_date, req.language, req.dry_run,
+        "스크래핑 큐 추가 | job_id=%d start=%s end=%s lang=%s dry_run=%s",
+        job_id, req.start_date, req.end_date, req.language, req.dry_run,
     )
     return {
-        "task_id":    task_id,
-        "status":     "pending",
-        "message":    "스크래핑이 백그라운드에서 시작되었습니다.",
-        "poll_url":   f"/scrape/{task_id}",
+        "task_id":  str(job_id),
+        "status":   "pending",
+        "message":  "스크래핑 작업이 워커 큐에 추가되었습니다.",
+        "poll_url": f"/jobs/{job_id}",
     }
 
 
