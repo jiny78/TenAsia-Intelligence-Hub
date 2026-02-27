@@ -253,9 +253,36 @@ class _ShutdownFlag:
         self.running = False
 
 
+def _recover_stuck_jobs() -> None:
+    """
+    30분 이상 'running' 상태인 잡을 'pending'으로 되돌립니다.
+    Worker 재배포 시 강제 종료된 잡을 복구합니다.
+    """
+    try:
+        from scraper.db import _conn
+        with _conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE job_queue
+                       SET status     = 'pending',
+                           worker_id  = NULL,
+                           started_at = NULL
+                     WHERE status = 'running'
+                       AND started_at < NOW() - INTERVAL '30 minutes'
+                    RETURNING id
+                """)
+                rows = cur.fetchall()
+                conn.commit()
+        if rows:
+            logger.info("stuck 잡 복구 | ids=%s", [r[0] for r in rows])
+    except Exception as exc:
+        logger.warning("stuck 잡 복구 실패 (무시): %s", exc)
+
+
 def run_loop() -> None:
     """
     루프 모드: pending 작업을 계속 폴링하며 처리합니다.
+    잡이 없을 때도 SCRAPED 기사 AI 처리를 계속 실행합니다.
     SIGTERM 수신 시 현재 작업 완료 후 종료합니다.
     """
     worker_id = _get_worker_id()
@@ -264,11 +291,14 @@ def run_loop() -> None:
     logger.info("워커 루프 시작 | worker_id=%s poll_interval=%ds", worker_id, POLL_INTERVAL)
 
     create_db_tables()  # 테이블이 없으면 생성 (멱등)
+    _recover_stuck_jobs()  # 시작 시 stuck 잡 복구
 
     while flag.running:
         job = get_pending_job(worker_id)
 
         if job is None:
+            # 스크래핑 잡이 없으면 SCRAPED 기사 AI 처리 시도
+            _do_process_scraped()
             logger.debug("대기 중… (큐 비어있음)")
             time.sleep(POLL_INTERVAL)
             continue
