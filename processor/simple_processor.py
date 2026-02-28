@@ -327,9 +327,9 @@ def process_all_with_retry() -> int:
 # 엔티티 추출 (아티스트 / 그룹 → DB UPSERT + EntityMapping)
 # ─────────────────────────────────────────────────────────────
 
-# 엔티티 추출 프롬프트
+# 엔티티 추출 프롬프트 (엄격한 조건)
 _ENTITY_PROMPT = """\
-You are a K-pop expert. Extract all K-pop idol artists and groups mentioned in the following Korean articles.
+You are a K-pop expert. Extract K-pop idol artists and groups from the following Korean articles.
 Return ONLY a JSON array — no markdown, no explanation.
 
 Articles:
@@ -344,7 +344,10 @@ Return this JSON array (one object per article):
         "name_ko": "Korean name (required)",
         "name_en": "English/romanized name or null",
         "type": "ARTIST" or "GROUP",
-        "is_primary": true if this is the main subject of the article,
+        "in_title": true if this entity's name appears in the article title,
+        "subject_count": <integer: number of times this entity is the main subject (주어) in the body>,
+        "has_activity_content": true if the article discusses this entity's activities/profile/career,
+        "activity_summary_ko": "1-2 sentence Korean summary of the activity content, or null",
         "confidence": 0.7-1.0
       }}
     ],
@@ -354,10 +357,13 @@ Return this JSON array (one object per article):
 ]
 
 Rules:
-- Only include K-pop idols and groups, not actors, presenters, or companies
-- Set is_primary=true for the main subject of the article (usually 1 per article)
-- Set confidence based on how clearly the entity is identified (0.7+ = confident)
-- If no K-pop entities found, return empty entities array"""
+- Only include K-pop idols and groups (not actors, presenters, companies, or other celebrities)
+- in_title: true only if the entity name literally appears in the title string
+- subject_count: count sentences where this entity is the grammatical subject/topic (주어로 등장)
+- has_activity_content: true if article discusses comebacks, albums, concerts, awards, profile, group activities
+- activity_summary_ko: brief summary of their activity/profile content if has_activity_content is true
+- Strict confidence: 0.9+ for main subject, 0.7+ for clearly mentioned, below 0.7 = skip
+- If no qualifying K-pop entities found, return empty entities array"""
 
 
 def _call_gemini_entity_batch(articles: list[dict]) -> list[dict]:
@@ -371,7 +377,7 @@ def _call_gemini_entity_batch(articles: list[dict]) -> list[dict]:
             {
                 "id": a["id"],
                 "title": a["title_ko"] or "",
-                "content": (a["content_ko"] or "")[:500],
+                "content": (a["content_ko"] or "")[:800],  # 주어 횟수 카운트를 위해 더 많이 전달
             }
             for a in articles
         ],
@@ -426,8 +432,20 @@ def _save_entity_results(results: list[dict]) -> int:
             name_en = (ent.get("name_en") or "").strip() or None
             etype = (ent.get("type") or "ARTIST").upper()
             confidence = float(ent.get("confidence", 0.5))
+            in_title = bool(ent.get("in_title", False))
+            subject_count = int(ent.get("subject_count", 0))
+            has_activity_content = bool(ent.get("has_activity_content", False))
+            activity_summary_ko = (ent.get("activity_summary_ko") or "").strip() or None
 
-            if not name_ko or confidence < 0.5:
+            if not name_ko or confidence < 0.7:
+                continue
+
+            # 엄격한 연관성 조건: 제목 포함 또는 주어로 4회 이상 언급
+            if not in_title and subject_count < 4:
+                logger.debug(
+                    "엔티티 필터링 | article_id=%d name_ko=%s in_title=%s subject_count=%d",
+                    article_id, name_ko, in_title, subject_count,
+                )
                 continue
 
             try:
@@ -446,6 +464,9 @@ def _save_entity_results(results: list[dict]) -> int:
                             session.flush()
                         elif name_en and not group.name_en:
                             group.name_en = name_en
+                        # 활동 내용 있으면 bio_ko 보완
+                        if has_activity_content and activity_summary_ko and not group.bio_ko:
+                            group.bio_ko = activity_summary_ko
                         entity_id = group.id
                         session.commit()
 
@@ -475,6 +496,9 @@ def _save_entity_results(results: list[dict]) -> int:
                             session.flush()
                         elif name_en and not artist.name_en:
                             artist.name_en = name_en
+                        # 활동 내용 있으면 bio_ko 보완
+                        if has_activity_content and activity_summary_ko and not artist.bio_ko:
+                            artist.bio_ko = activity_summary_ko
                         entity_id = artist.id
                         session.commit()
 
@@ -570,7 +594,7 @@ def process_entity_extraction(batch_size: int = ENTITY_BATCH_SIZE) -> int:
             {
                 "id": a.id,
                 "title_ko": a.title_ko or "",
-                "content_ko": (a.content_ko or "")[:500],
+                "content_ko": (a.content_ko or "")[:800],
             }
             for a in rows
         ]
