@@ -203,12 +203,14 @@ export const idolsApi = {
   listArtists: (q?: string) =>
     request<PublicArtist[]>(`/public/artists${q ? `?q=${encodeURIComponent(q)}&limit=200` : "?limit=200"}`),
 
-  listMappings: (params?: { artist_id?: number; group_id?: number; article_id?: number }) => {
-    const q = new URLSearchParams({ limit: "100" });
-    if (params?.artist_id  !== undefined) q.set("artist_id",  String(params.artist_id));
-    if (params?.group_id   !== undefined) q.set("group_id",   String(params.group_id));
-    if (params?.article_id !== undefined) q.set("article_id", String(params.article_id));
-    return request<EntityMappingItem[]>(`/public/entity-mappings?${q}`);
+  listMappings: (params?: { artist_id?: number; group_id?: number; article_id?: number; q?: string; limit?: number; offset?: number }) => {
+    const qs = new URLSearchParams({ limit: String(params?.limit ?? 50) });
+    if (params?.artist_id  !== undefined) qs.set("artist_id",  String(params.artist_id));
+    if (params?.group_id   !== undefined) qs.set("group_id",   String(params.group_id));
+    if (params?.article_id !== undefined) qs.set("article_id", String(params.article_id));
+    if (params?.q)                        qs.set("q",          params.q);
+    if (params?.offset !== undefined)     qs.set("offset",     String(params.offset));
+    return request<{ items: EntityMappingItem[]; total: number }>(`/public/entity-mappings?${qs}`);
   },
 
   deleteMapping: (id: number) =>
