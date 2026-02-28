@@ -1072,6 +1072,32 @@ def enrich_all_background() -> dict[str, Any]:
     return {"status": "started", "message": "전체 프로필 보강 백그라운드 시작됨"}
 
 
+@app.post("/admin/re-enrich-sparse", status_code=202)
+def re_enrich_sparse_profiles(limit: int = 200) -> dict[str, Any]:
+    """
+    이미 enriched_at이 설정되어 있지만 bio_ko가 NULL인 프로필을 재보강합니다.
+    enriched_at을 NULL로 리셋한 뒤 Wikipedia + Gemini로 재처리합니다.
+    기존에 채워진 필드(name_en, debut_date 등)는 덮어쓰지 않습니다.
+    백그라운드 스레드에서 실행됩니다.
+    """
+    global _enrich_all_thread
+    if _enrich_all_thread and _enrich_all_thread.is_alive():
+        raise HTTPException(status_code=409, detail="이미 보강 작업이 실행 중입니다.")
+
+    def _run() -> None:
+        from processor.profile_enricher import re_enrich_sparse
+        try:
+            logger.info("누락 프로필 재보강 시작 (백그라운드)")
+            result = re_enrich_sparse(limit=limit)
+            logger.info("누락 프로필 재보강 완료: %s", result)
+        except Exception as exc:
+            logger.error("누락 프로필 재보강 실패: %s", exc)
+
+    _enrich_all_thread = _threading.Thread(target=_run, daemon=True, name="enrich-all")
+    _enrich_all_thread.start()
+    return {"status": "started", "message": f"누락 프로필 재보강 시작 (limit={limit})"}
+
+
 @app.get("/admin/enrich-status", status_code=200)
 def enrich_all_status() -> dict[str, Any]:
     """전체 보강 작업 진행 상태 조회."""

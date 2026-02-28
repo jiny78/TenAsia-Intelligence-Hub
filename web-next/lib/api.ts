@@ -258,6 +258,12 @@ export const idolsApi = {
   enrichStatus: () =>
     request<{ running: boolean }>(`/admin/enrich-status`),
 
+  reEnrichSparse: (limit = 200) =>
+    request<{ status: string; message: string }>(
+      `/admin/re-enrich-sparse?limit=${limit}`,
+      { method: "POST", body: JSON.stringify({}) },
+    ),
+
   backfillThumbnails: (limit = 30, days = 20) =>
     request<{ message: string; status: string }>(
       `/admin/backfill-thumbnails?limit=${limit}&days=${days}`,

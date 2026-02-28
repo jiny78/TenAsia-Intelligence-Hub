@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { idolsApi } from "@/lib/api";
-import { Sparkles, Loader2, Users, User, RotateCcw, AlertTriangle } from "lucide-react";
+import { Sparkles, Loader2, Users, User, RotateCcw, AlertTriangle, RefreshCw } from "lucide-react";
 
 type Target = "all" | "artists" | "groups";
 
@@ -37,6 +37,32 @@ export function EnrichPanel() {
       setError(`오류: ${e}`);
     } finally {
       setLoading(false);
+    }
+  }
+
+  // ── 누락 프로필 재보강 ─────────────────────────────────────
+  const [sparseLoading, setSparseLoading] = useState(false);
+  const [sparseMsg,     setSparseMsg]     = useState("");
+
+  async function handleReEnrichSparse() {
+    setSparseLoading(true);
+    setSparseMsg("");
+    try {
+      const res = await idolsApi.reEnrichSparse(200);
+      setSparseMsg(res.message ?? "재보강 시작됨");
+      if (pollRef.current) clearInterval(pollRef.current);
+      pollRef.current = setInterval(pollStatus, 4000);
+      setBgRunning(true);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg.includes("409")) {
+        setSparseMsg("이미 보강 작업이 실행 중입니다.");
+        pollRef.current = setInterval(pollStatus, 4000);
+      } else {
+        setSparseMsg(`오류: ${e}`);
+      }
+    } finally {
+      setSparseLoading(false);
     }
   }
 
@@ -118,6 +144,41 @@ export function EnrichPanel() {
 
   return (
     <div className="space-y-5">
+
+      {/* ── 누락 프로필 재보강 ── */}
+      <div className="rounded-xl border border-primary/30 bg-primary/5 p-5 space-y-3">
+        <div>
+          <h2 className="font-semibold text-sm flex items-center gap-1.5">
+            <RefreshCw className="h-4 w-4 text-primary" />
+            누락 프로필 재보강
+          </h2>
+          <p className="mt-1 text-xs text-muted-foreground leading-relaxed">
+            소개글(bio)이 비어 있는 아티스트/그룹을 Wikipedia에서 다시 찾아 채웁니다.
+            이미 값이 있는 필드(데뷔일, 소속사 등)는 유지됩니다.
+            Wikipedia 텍스트 한도: 3,000자 / stage_name_ko 우선 검색.
+          </p>
+        </div>
+        <button
+          onClick={handleReEnrichSparse}
+          disabled={sparseLoading || bgRunning}
+          className="inline-flex items-center gap-2 rounded-lg bg-primary px-4 py-2 text-xs font-semibold text-primary-foreground hover:bg-primary/90 disabled:opacity-50 transition-colors"
+        >
+          {sparseLoading || bgRunning
+            ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            : <RefreshCw className="h-3.5 w-3.5" />}
+          누락 프로필 재보강 실행
+        </button>
+        {sparseMsg && (
+          <p className={`text-xs rounded-lg border p-3 ${
+            sparseMsg.includes("오류")
+              ? "bg-rose-500/10 border-rose-500/20 text-rose-400"
+              : "bg-primary/10 border-primary/20 text-primary"
+          }`}>
+            {bgRunning && <Loader2 className="inline h-3 w-3 animate-spin mr-1.5" />}
+            {sparseMsg}
+          </p>
+        )}
+      </div>
 
       {/* ── 전체 재보강 (맨 위) ── */}
       <div className="rounded-xl border border-amber-500/30 bg-amber-500/5 p-5 space-y-4">

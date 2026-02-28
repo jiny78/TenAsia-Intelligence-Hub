@@ -1,10 +1,17 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useMemo } from "react";
 import { idolsApi, type EntityMappingItem } from "@/lib/api";
-import { Trash2, Loader2, Plus, RefreshCw, ChevronLeft, ChevronRight, Search } from "lucide-react";
+import { Loader2, Plus, RefreshCw, ChevronLeft, ChevronRight, Search, X, ExternalLink } from "lucide-react";
 
 const PAGE_SIZE = 50;
+
+interface ArticleGroup {
+  article_id: number;
+  article_title_ko: string | null;
+  article_url: string | null;
+  mappings: EntityMappingItem[];
+}
 
 export function MappingsTab() {
   const [mappings, setMappings] = useState<EntityMappingItem[]>([]);
@@ -13,8 +20,8 @@ export function MappingsTab() {
   const [deleting, setDeleting] = useState<Record<number, boolean>>({});
 
   // 검색 상태
-  const [searchQ,         setSearchQ]         = useState("");  // 이름 통합 검색
-  const [filterArticleId, setFilterArticleId] = useState("");  // 기사 ID 정확 검색
+  const [searchQ,         setSearchQ]         = useState("");
+  const [filterArticleId, setFilterArticleId] = useState("");
   const [page,            setPage]            = useState(0);
 
   // 새 매핑 추가 폼
@@ -30,6 +37,23 @@ export function MappingsTab() {
   const [helperLoading, setHelperLoading] = useState(false);
 
   const totalPages = Math.ceil(total / PAGE_SIZE);
+
+  // 기사별로 그룹핑
+  const articleGroups = useMemo<ArticleGroup[]>(() => {
+    const map = new Map<number, ArticleGroup>();
+    for (const m of mappings) {
+      if (!map.has(m.article_id)) {
+        map.set(m.article_id, {
+          article_id:      m.article_id,
+          article_title_ko: m.article_title_ko,
+          article_url:     m.article_url,
+          mappings:        [],
+        });
+      }
+      map.get(m.article_id)!.mappings.push(m);
+    }
+    return Array.from(map.values());
+  }, [mappings]);
 
   const load = useCallback(async (p = page) => {
     setLoading(true);
@@ -218,7 +242,7 @@ export function MappingsTab() {
         {addError && <p className="text-xs text-rose-500">{addError}</p>}
       </div>
 
-      {/* ── 검색 + 새로고침 ── */}
+      {/* ── 검색 ── */}
       <form onSubmit={handleSearch} className="flex flex-wrap items-end gap-3">
         <div className="space-y-1 flex-1 min-w-48">
           <label className="text-[10px] text-muted-foreground uppercase tracking-wider">아티스트/그룹/기사 이름 검색</label>
@@ -253,75 +277,76 @@ export function MappingsTab() {
         </button>
       </form>
 
-      {/* ── 테이블 ── */}
-      <div className="rounded-xl border border-border overflow-hidden">
-        <table className="w-full text-sm">
-          <thead className="bg-muted/50 text-xs font-semibold text-muted-foreground">
-            <tr>
-              <th className="px-4 py-3 text-left w-14">ID</th>
-              <th className="px-4 py-3 text-left">기사</th>
-              <th className="px-4 py-3 text-left">엔티티</th>
-              <th className="px-4 py-3 text-left w-16">신뢰도</th>
-              <th className="px-4 py-3 text-center w-14">삭제</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-border">
-            {loading && (
-              <tr>
-                <td colSpan={5} className="px-4 py-10 text-center">
-                  <Loader2 className="h-5 w-5 animate-spin mx-auto text-muted-foreground" />
-                </td>
-              </tr>
-            )}
-            {!loading && mappings.length === 0 && (
-              <tr>
-                <td colSpan={5} className="px-4 py-8 text-center text-xs text-muted-foreground">
-                  매핑 없음
-                </td>
-              </tr>
-            )}
-            {mappings.map((m) => (
-              <tr key={m.id} className="hover:bg-muted/30 transition-colors">
-                <td className="px-4 py-2.5 text-xs text-muted-foreground font-mono">{m.id}</td>
-                <td className="px-4 py-2.5 max-w-xs">
-                  <p className="text-xs font-medium line-clamp-1 mb-0.5">
-                    {m.article_title_ko ?? `기사 #${m.article_id}`}
-                  </p>
-                  <p className="text-[10px] text-muted-foreground font-mono">id={m.article_id}</p>
-                </td>
-                <td className="px-4 py-2.5">
-                  {m.entity_type === "ARTIST" ? (
-                    <span className="inline-flex items-center gap-1">
-                      <span className="rounded-full bg-purple-500/15 text-purple-400 text-[10px] font-semibold px-1.5 py-0.5">아티스트</span>
-                      <span className="text-xs font-medium">{m.artist_name_ko ?? `#${m.artist_id}`}</span>
-                    </span>
-                  ) : m.entity_type === "GROUP" ? (
-                    <span className="inline-flex items-center gap-1">
-                      <span className="rounded-full bg-pink-500/15 text-pink-400 text-[10px] font-semibold px-1.5 py-0.5">그룹</span>
-                      <span className="text-xs font-medium">{m.group_name_ko ?? `#${m.group_id}`}</span>
-                    </span>
-                  ) : (
-                    <span className="text-xs text-muted-foreground">—</span>
-                  )}
-                </td>
-                <td className="px-4 py-2.5 text-xs text-muted-foreground">
-                  {m.confidence_score != null ? `${(m.confidence_score * 100).toFixed(0)}%` : "—"}
-                </td>
-                <td className="px-4 py-2.5 text-center">
-                  <button
-                    onClick={() => handleDelete(m.id)}
-                    disabled={deleting[m.id]}
-                    className="inline-flex items-center justify-center rounded-md p-1.5 text-muted-foreground hover:text-rose-500 hover:bg-rose-500/10 disabled:opacity-50 transition-colors"
+      {/* ── 기사별 매핑 목록 ── */}
+      <div className="space-y-2">
+        {loading && (
+          <div className="flex items-center justify-center py-10">
+            <Loader2 className="h-5 w-5 animate-spin text-muted-foreground" />
+          </div>
+        )}
+        {!loading && articleGroups.length === 0 && (
+          <div className="rounded-xl border border-border px-4 py-8 text-center text-xs text-muted-foreground">
+            매핑 없음
+          </div>
+        )}
+        {!loading && articleGroups.map((group) => (
+          <div key={group.article_id} className="rounded-xl border border-border bg-card px-4 py-3 flex items-start gap-3">
+            {/* 기사 정보 */}
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center gap-1.5 mb-2">
+                <p className="text-xs font-medium line-clamp-1">
+                  {group.article_title_ko ?? `기사 #${group.article_id}`}
+                </p>
+                {group.article_url && (
+                  <a
+                    href={group.article_url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="shrink-0 text-muted-foreground hover:text-foreground transition-colors"
                   >
-                    {deleting[m.id]
-                      ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                      : <Trash2 className="h-3.5 w-3.5" />}
-                  </button>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+                    <ExternalLink className="h-3 w-3" />
+                  </a>
+                )}
+              </div>
+              <p className="text-[10px] text-muted-foreground font-mono mb-2">id={group.article_id}</p>
+
+              {/* 연결된 엔티티 태그 — 각 태그 ✕로 개별 연결 해제 */}
+              <div className="flex flex-wrap gap-1.5">
+                {group.mappings.map((m) => {
+                  const isArtist = m.entity_type === "ARTIST";
+                  const label    = isArtist
+                    ? (m.artist_name_ko ?? `아티스트 #${m.artist_id}`)
+                    : (m.group_name_ko  ?? `그룹 #${m.group_id}`);
+                  return (
+                    <span
+                      key={m.id}
+                      className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-xs transition-colors ${
+                        isArtist
+                          ? "border-purple-500/30 bg-purple-500/10 text-purple-300"
+                          : "border-pink-500/30 bg-pink-500/10 text-pink-300"
+                      }`}
+                    >
+                      <span className={`text-[9px] font-semibold ${isArtist ? "text-purple-400" : "text-pink-400"}`}>
+                        {isArtist ? "아티스트" : "그룹"}
+                      </span>
+                      <span className="font-medium">{label}</span>
+                      <button
+                        onClick={() => handleDelete(m.id)}
+                        disabled={deleting[m.id]}
+                        title={`${label} 연결 해제`}
+                        className="ml-0.5 rounded-full p-0.5 hover:bg-rose-500/20 hover:text-rose-400 disabled:opacity-50 transition-colors"
+                      >
+                        {deleting[m.id]
+                          ? <Loader2 className="h-3 w-3 animate-spin" />
+                          : <X className="h-3 w-3" />}
+                      </button>
+                    </span>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+        ))}
       </div>
 
       {/* ── 페이지네이션 ── */}
