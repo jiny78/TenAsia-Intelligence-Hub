@@ -219,10 +219,11 @@ def _call_gemini_single(prompt: str) -> dict:
 
 # ── 아티스트 보강 ─────────────────────────────────────────────────
 
-def enrich_artists(batch_size: int = ARTIST_BATCH_SIZE) -> int:
+def enrich_artists(batch_size: int = ARTIST_BATCH_SIZE, overwrite_bio: bool = False) -> int:
     """
     enriched_at IS NULL 인 아티스트를 Wikipedia + Gemini 로 보강합니다.
     보강 완료 후 enriched_at = NOW() 기록.
+    overwrite_bio=True: bio_ko/bio_en도 기존 값 덮어씀 (재보강 시 사용).
     """
     from sqlalchemy import select
     from core.db import get_db
@@ -283,7 +284,7 @@ def enrich_artists(batch_size: int = ARTIST_BATCH_SIZE) -> int:
                 if artist is None:
                     continue
 
-                changed = _apply_artist_fields(artist, r)
+                changed = _apply_artist_fields(artist, r, overwrite_bio=overwrite_bio)
                 artist.enriched_at = now
                 session.commit()
 
@@ -305,13 +306,19 @@ def enrich_artists(batch_size: int = ARTIST_BATCH_SIZE) -> int:
     return count
 
 
-def _apply_artist_fields(artist, r: dict) -> bool:
+def _apply_artist_fields(artist, r: dict, overwrite_bio: bool = False) -> bool:
     """아티스트 필드 적용. changed 여부 반환."""
     changed = False
 
     def _set(field: str, value):
         nonlocal changed
         if value and not getattr(artist, field):
+            setattr(artist, field, value)
+            changed = True
+
+    def _set_bio(field: str, value):
+        nonlocal changed
+        if value and (not getattr(artist, field) or overwrite_bio):
             setattr(artist, field, value)
             changed = True
 
@@ -323,8 +330,8 @@ def _apply_artist_fields(artist, r: dict) -> bool:
     _set("nationality_en", r.get("nationality_en"))
     _set("mbti",           r.get("mbti"))
     _set("blood_type",     r.get("blood_type"))
-    _set("bio_ko",         r.get("bio_ko"))
-    _set("bio_en",         r.get("bio_en"))
+    _set_bio("bio_ko",     r.get("bio_ko"))
+    _set_bio("bio_en",     r.get("bio_en"))
 
     if r.get("height_cm") and not artist.height_cm:
         try:
@@ -354,10 +361,11 @@ def _apply_artist_fields(artist, r: dict) -> bool:
 
 # ── 그룹 보강 ─────────────────────────────────────────────────────
 
-def enrich_groups(batch_size: int = GROUP_BATCH_SIZE) -> int:
+def enrich_groups(batch_size: int = GROUP_BATCH_SIZE, overwrite_bio: bool = False) -> int:
     """
     enriched_at IS NULL 인 그룹을 Wikipedia + Gemini 로 보강합니다.
     보강 완료 후 enriched_at = NOW() 기록.
+    overwrite_bio=True: bio_ko/bio_en도 기존 값 덮어씀 (재보강 시 사용).
     """
     from sqlalchemy import select
     from core.db import get_db
@@ -410,7 +418,7 @@ def enrich_groups(batch_size: int = GROUP_BATCH_SIZE) -> int:
                 if group is None:
                     continue
 
-                changed = _apply_group_fields(group, r)
+                changed = _apply_group_fields(group, r, overwrite_bio=overwrite_bio)
                 group.enriched_at = now
                 session.commit()
 
@@ -432,7 +440,7 @@ def enrich_groups(batch_size: int = GROUP_BATCH_SIZE) -> int:
     return count
 
 
-def _apply_group_fields(group, r: dict) -> bool:
+def _apply_group_fields(group, r: dict, overwrite_bio: bool = False) -> bool:
     """그룹 필드 적용. changed 여부 반환."""
     changed = False
 
@@ -442,14 +450,20 @@ def _apply_group_fields(group, r: dict) -> bool:
             setattr(group, field, value)
             changed = True
 
+    def _set_bio(field: str, value):
+        nonlocal changed
+        if value and (not getattr(group, field) or overwrite_bio):
+            setattr(group, field, value)
+            changed = True
+
     _set("name_en",        r.get("name_en"))
     _set("debut_date",     r.get("debut_date"))
     _set("label_ko",       r.get("label_ko"))
     _set("label_en",       r.get("label_en"))
     _set("fandom_name_ko", r.get("fandom_name_ko"))
     _set("fandom_name_en", r.get("fandom_name_en"))
-    _set("bio_ko",         r.get("bio_ko"))
-    _set("bio_en",         r.get("bio_en"))
+    _set_bio("bio_ko",     r.get("bio_ko"))
+    _set_bio("bio_en",     r.get("bio_en"))
 
     gender_val = r.get("gender")
     if gender_val and not group.gender:
@@ -484,11 +498,13 @@ def _mark_enriched(model_cls, entity_id: int, now: datetime) -> None:
 
 def re_enrich_sparse(limit: int = 200) -> dict[str, int]:
     """
-    이미 enriched_at이 설정되어 있지만 bio_ko가 NULL인 아티스트/그룹을 재보강합니다.
-    enriched_at을 NULL로 리셋한 뒤 즉시 enrich_artists/enrich_groups를 호출합니다.
-    기존에 채워진 필드(name_en, debut_date 등)는 덮어쓰지 않습니다.
+    핵심 필드가 비어있는 아티스트/그룹을 Wikipedia + Gemini로 재보강합니다.
+    - 그룹: bio_ko IS NULL OR label_ko IS NULL OR debut_date IS NULL
+    - 아티스트: bio_ko IS NULL OR birth_date IS NULL OR name_en IS NULL
+    enriched_at을 NULL로 리셋한 뒤 enrich_artists/enrich_groups를 호출합니다.
+    bio_ko/bio_en은 기존 값이 있어도 Wikipedia 기반으로 덮어씁니다.
     """
-    from sqlalchemy import select
+    from sqlalchemy import or_, select
     from core.db import get_db
     from database.models import Artist, Group
 
@@ -497,7 +513,13 @@ def re_enrich_sparse(limit: int = 200) -> dict[str, int]:
             session.scalars(
                 select(Artist)
                 .where(Artist.enriched_at.isnot(None))
-                .where(Artist.bio_ko.is_(None))
+                .where(
+                    or_(
+                        Artist.bio_ko.is_(None),
+                        Artist.birth_date.is_(None),
+                        Artist.name_en.is_(None),
+                    )
+                )
                 .order_by(Artist.global_priority.desc().nullslast(), Artist.id)
                 .limit(limit)
             )
@@ -510,7 +532,13 @@ def re_enrich_sparse(limit: int = 200) -> dict[str, int]:
             session.scalars(
                 select(Group)
                 .where(Group.enriched_at.isnot(None))
-                .where(Group.bio_ko.is_(None))
+                .where(
+                    or_(
+                        Group.bio_ko.is_(None),
+                        Group.label_ko.is_(None),
+                        Group.debut_date.is_(None),
+                    )
+                )
                 .order_by(Group.global_priority.desc().nullslast(), Group.id)
                 .limit(limit)
             )
@@ -523,8 +551,8 @@ def re_enrich_sparse(limit: int = 200) -> dict[str, int]:
 
     logger.info("재보강 대상 리셋 | 아티스트=%d 그룹=%d", artist_count, group_count)
 
-    enriched_artists = enrich_artists(batch_size=max(artist_count, 1))
-    enriched_groups  = enrich_groups(batch_size=max(group_count, 1))
+    enriched_artists = enrich_artists(batch_size=max(artist_count, 1), overwrite_bio=True)
+    enriched_groups  = enrich_groups(batch_size=max(group_count, 1),   overwrite_bio=True)
 
     logger.info("재보강 완료 | 아티스트=%d 그룹=%d", enriched_artists, enriched_groups)
     return {"artists": enriched_artists, "groups": enriched_groups}
