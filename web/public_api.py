@@ -700,49 +700,104 @@ def list_entity_mappings(
     article_id: Optional[int] = Query(None),
     artist_id:  Optional[int] = Query(None),
     group_id:   Optional[int] = Query(None),
+    q:          Optional[str] = Query(None, description="아티스트명/그룹명/기사제목 검색"),
     limit:      int           = Query(50, ge=1, le=200),
-) -> list[dict]:
-    """엔티티 매핑 목록 조회 (관리자용)."""
+    offset:     int           = Query(0, ge=0),
+) -> dict:
+    """엔티티 매핑 목록 조회 (관리자용). {items, total} 반환."""
     try:
         from core.db import get_db
         from database.models import Article, Artist, EntityMapping, Group
-        from sqlalchemy import select
+        from sqlalchemy import func, or_, select
         from sqlalchemy.orm import joinedload
 
         with get_db() as session:
-            stmt = (
-                select(EntityMapping)
-                .options(
-                    joinedload(EntityMapping.article),
-                    joinedload(EntityMapping.artist),
-                    joinedload(EntityMapping.group),
-                )
-                .order_by(EntityMapping.id.desc())
-                .limit(limit)
-            )
+            # 기본 필터 목록 구성
+            base_filters = []
             if article_id is not None:
-                stmt = stmt.where(EntityMapping.article_id == article_id)
+                base_filters.append(EntityMapping.article_id == article_id)
             if artist_id is not None:
-                stmt = stmt.where(EntityMapping.artist_id == artist_id)
+                base_filters.append(EntityMapping.artist_id == artist_id)
             if group_id is not None:
-                stmt = stmt.where(EntityMapping.group_id == group_id)
+                base_filters.append(EntityMapping.group_id == group_id)
+
+            # 이름 검색 시 outerjoin으로 매칭 ID 먼저 수집
+            if q:
+                like = f"%{q}%"
+                id_stmt = (
+                    select(EntityMapping.id)
+                    .outerjoin(Artist, EntityMapping.artist_id == Artist.id)
+                    .outerjoin(Group, EntityMapping.group_id == Group.id)
+                    .outerjoin(Article, EntityMapping.article_id == Article.id)
+                    .where(
+                        or_(
+                            Artist.name_ko.ilike(like),
+                            Artist.stage_name_ko.ilike(like),
+                            Group.name_ko.ilike(like),
+                            Article.title_ko.ilike(like),
+                        )
+                    )
+                )
+                for f in base_filters:
+                    id_stmt = id_stmt.where(f)
+                matching_ids = session.execute(id_stmt).scalars().all()
+                total = len(matching_ids)
+
+                if not matching_ids:
+                    return {"items": [], "total": 0}
+
+                stmt = (
+                    select(EntityMapping)
+                    .options(
+                        joinedload(EntityMapping.article),
+                        joinedload(EntityMapping.artist),
+                        joinedload(EntityMapping.group),
+                    )
+                    .where(EntityMapping.id.in_(matching_ids))
+                    .order_by(EntityMapping.id.desc())
+                    .limit(limit)
+                    .offset(offset)
+                )
+            else:
+                # COUNT 쿼리
+                count_stmt = select(func.count()).select_from(EntityMapping)
+                for f in base_filters:
+                    count_stmt = count_stmt.where(f)
+                total = session.scalar(count_stmt) or 0
+
+                stmt = (
+                    select(EntityMapping)
+                    .options(
+                        joinedload(EntityMapping.article),
+                        joinedload(EntityMapping.artist),
+                        joinedload(EntityMapping.group),
+                    )
+                    .order_by(EntityMapping.id.desc())
+                    .limit(limit)
+                    .offset(offset)
+                )
+                for f in base_filters:
+                    stmt = stmt.where(f)
 
             rows = session.execute(stmt).scalars().all()
-            return [
-                {
-                    "id":               m.id,
-                    "article_id":       m.article_id,
-                    "article_title_ko": m.article.title_ko if m.article else None,
-                    "article_url":      m.article.source_url if m.article else None,
-                    "entity_type":      m.entity_type.value if m.entity_type else None,
-                    "artist_id":        m.artist_id,
-                    "artist_name_ko":   m.artist.name_ko if m.artist else None,
-                    "group_id":         m.group_id,
-                    "group_name_ko":    m.group.name_ko if m.group else None,
-                    "confidence_score": m.confidence_score,
-                }
-                for m in rows
-            ]
+            return {
+                "items": [
+                    {
+                        "id":               m.id,
+                        "article_id":       m.article_id,
+                        "article_title_ko": m.article.title_ko if m.article else None,
+                        "article_url":      m.article.source_url if m.article else None,
+                        "entity_type":      m.entity_type.value if m.entity_type else None,
+                        "artist_id":        m.artist_id,
+                        "artist_name_ko":   m.artist.name_ko if m.artist else None,
+                        "group_id":         m.group_id,
+                        "group_name_ko":    m.group.name_ko if m.group else None,
+                        "confidence_score": m.confidence_score,
+                    }
+                    for m in rows
+                ],
+                "total": total,
+            }
 
     except Exception as exc:
         logger.exception("엔티티 매핑 목록 조회 실패: %s", exc)
