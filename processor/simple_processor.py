@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 BATCH_SIZE = 20        # 번역 1회 Gemini 호출당 처리 기사 수
 ENTITY_BATCH_SIZE = 10  # 엔티티 추출 1회 Gemini 호출당 처리 기사 수
+MIN_CONTENT_LEN = 300  # RSS 본문 최소 길이 (이보다 짧으면 전체 페이지 스크래핑 대상)
 
 # 배치 프롬프트: N개 기사를 JSON 배열로 일괄 반환
 _BATCH_PROMPT = """\
@@ -328,16 +329,83 @@ def process_all_scraped() -> int:
     return total
 
 
+def queue_fullscrape_for_new_entities(article_ids: list[int]) -> int:
+    """
+    신규 아티스트/그룹이 발견된 기사 중 본문이 짧은 기사(RSS 수집)에 대해
+    전체 페이지 스크래핑을 job_queue에 등록합니다.
+
+    조건: content_ko가 None 이거나 MIN_CONTENT_LEN(300자) 미만
+    처리:
+      1. summary_ko/en, hashtags_en 초기화 → 전체 본문 기반 재생성 유도
+      2. EntityMapping 삭제 → 전체 본문으로 엔티티 재추출 유도
+      3. scrape 잡을 job_queue에 등록
+
+    Returns:
+        등록된 잡 수
+    """
+    from sqlalchemy import delete as sa_delete
+
+    from core.db import get_db
+    from database.models import Article, EntityMapping
+    from scraper.db import create_job
+
+    queued = 0
+    for article_id in article_ids:
+        try:
+            with get_db() as session:
+                art = session.get(Article, article_id)
+                if art is None:
+                    continue
+                content_len = len(art.content_ko or "")
+                if content_len >= MIN_CONTENT_LEN:
+                    logger.debug(
+                        "full_scrape_skip | article_id=%d content_len=%d (충분)",
+                        article_id, content_len,
+                    )
+                    continue
+                source_url = art.source_url
+
+                # AI 필드 초기화 → 전체 본문으로 재생성 유도
+                art.summary_ko = None
+                art.summary_en = None
+                art.hashtags_en = None
+                session.commit()
+
+            # EntityMapping 삭제 → 전체 본문으로 엔티티 재추출
+            with get_db() as session:
+                session.execute(
+                    sa_delete(EntityMapping).where(EntityMapping.article_id == article_id)
+                )
+                session.commit()
+
+            create_job("scrape", {"source_url": source_url, "language": "kr"})
+            logger.info(
+                "hybrid_fullscrape_queued | article_id=%d content_len=%d url=%s",
+                article_id, content_len, source_url,
+            )
+            queued += 1
+        except Exception as exc:
+            logger.warning("hybrid_fullscrape_queue_failed | article_id=%d: %s", article_id, exc)
+
+    if queued:
+        logger.info("하이브리드 스크래핑 큐 등록 완료 | %d개 기사 (신규 엔티티)", queued)
+    return queued
+
+
 def process_all_with_retry() -> int:
     """
     ERROR 기사를 SCRAPED으로 리셋한 뒤 전체 처리 + 엔티티 추출을 실행합니다.
+    신규 엔티티 발견 시 얇은 본문 기사에 대해 전체 스크래핑 잡을 큐에 등록합니다.
     Worker 루프에서 호출합니다.
     """
     reset_error_to_scraped()
     n = process_all_scraped()
     # 번역 완료 후 엔티티 추출 (실패해도 번역 결과는 유지)
     try:
-        process_entity_extraction()
+        entity_count, new_entity_article_ids = process_entity_extraction()
+        # 신규 엔티티 발견 → 본문 짧은 기사 전체 스크래핑 예약 (하이브리드)
+        if new_entity_article_ids:
+            queue_fullscrape_for_new_entities(new_entity_article_ids)
     except Exception as exc:
         logger.warning("엔티티 추출 실패 (번역 결과는 정상): %s", exc)
     return n
@@ -431,8 +499,13 @@ def _call_gemini_entity_batch(articles: list[dict]) -> list[dict]:
     return result
 
 
-def _save_entity_results(results: list[dict]) -> int:
-    """Gemini 엔티티 추출 결과를 artist/group/entity_mapping 테이블에 저장합니다."""
+def _save_entity_results(results: list[dict]) -> tuple[int, list[int]]:
+    """
+    Gemini 엔티티 추출 결과를 artist/group/entity_mapping 테이블에 저장합니다.
+
+    Returns:
+        (count, new_entity_article_ids) — 신규 아티스트/그룹이 생성된 기사 ID 목록
+    """
     from sqlalchemy import select
 
     from core.db import get_db
@@ -446,6 +519,7 @@ def _save_entity_results(results: list[dict]) -> int:
     )
 
     count = 0
+    new_entity_article_ids: list[int] = []  # 신규 엔티티 생성된 기사 ID
     for r in results:
         article_id = r.get("id")
         entities = r.get("entities") or []
@@ -496,6 +570,9 @@ def _save_entity_results(results: list[dict]) -> int:
                             )
                             session.add(group)
                             session.flush()
+                            # 신규 그룹 → 하이브리드 스크래핑 대상 추가
+                            new_entity_article_ids.append(article_id)
+                            logger.info("새 그룹 생성 | name_ko=%s article_id=%d → 전체 스크래핑 예약", name_ko, article_id)
                         elif name_en and not group.name_en:
                             group.name_en = name_en
                         # 활동 내용 있으면 bio_ko 보완
@@ -543,6 +620,9 @@ def _save_entity_results(results: list[dict]) -> int:
                             artist = Artist(name_ko=name_ko, name_en=name_en)
                             session.add(artist)
                             session.flush()
+                            # 신규 아티스트 → 하이브리드 스크래핑 대상 추가
+                            new_entity_article_ids.append(article_id)
+                            logger.info("새 아티스트 생성 | name_ko=%s article_id=%d → 전체 스크래핑 예약", name_ko, article_id)
                         elif name_en and not artist.name_en:
                             artist.name_en = name_en
                         # 활동 내용 있으면 bio_ko 보완
@@ -608,10 +688,10 @@ def _save_entity_results(results: list[dict]) -> int:
 
         count += 1
 
-    return count
+    return count, list(set(new_entity_article_ids))
 
 
-def process_entity_extraction(batch_size: int = ENTITY_BATCH_SIZE) -> int:
+def process_entity_extraction(batch_size: int = ENTITY_BATCH_SIZE) -> tuple[int, list[int]]:
     """
     EntityMapping이 없는 PROCESSED 기사에서 K-pop 아티스트/그룹 엔티티를 추출합니다.
 
@@ -650,18 +730,21 @@ def process_entity_extraction(batch_size: int = ENTITY_BATCH_SIZE) -> int:
 
     if not article_data:
         logger.debug("엔티티 추출할 PROCESSED 기사 없음")
-        return 0
+        return 0, []
 
     logger.info("엔티티 추출 시작 | %d개 기사 → Gemini 1회 호출", len(article_data))
 
     try:
         results = _call_gemini_entity_batch(article_data)
-        count = _save_entity_results(results)
-        logger.info("엔티티 추출 완료 | 처리=%d / 대상=%d", count, len(article_data))
-        return count
+        count, new_entity_article_ids = _save_entity_results(results)
+        logger.info(
+            "엔티티 추출 완료 | 처리=%d / 대상=%d | 신규엔티티=%d개 기사",
+            count, len(article_data), len(new_entity_article_ids),
+        )
+        return count, new_entity_article_ids
     except Exception as exc:
         logger.exception("엔티티 추출 실패: %s", exc)
-        return 0
+        return 0, []
 
 
 def process_all_entity_extraction() -> int:
