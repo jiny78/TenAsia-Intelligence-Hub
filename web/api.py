@@ -34,6 +34,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import threading as _threading
 import time
 import uuid
 from datetime import date, datetime
@@ -991,6 +992,89 @@ def trigger_sentiment_extraction(batch_size: int = 20) -> dict[str, Any]:
     from processor.simple_processor import process_sentiment_batch
     count = process_sentiment_batch(batch_size=batch_size)
     return {"processed": count, "message": f"{count}개 기사 감성 분류 완료 (batch={batch_size})"}
+
+
+_enrich_all_thread: _threading.Thread | None = None
+
+
+@app.post("/admin/reset-all-enrichment", status_code=200)
+def reset_all_enrichment() -> dict[str, Any]:
+    """
+    모든 아티스트/그룹의 보강 데이터를 초기화합니다.
+    enriched_at + 모든 보강 필드를 NULL로 리셋 → 다음 보강 실행 시 전체 재처리.
+    """
+    try:
+        from core.db import get_db
+        from database.models import Artist, Group
+        from sqlalchemy import func, select, update
+
+        with get_db() as session:
+            session.execute(
+                update(Group).values(
+                    enriched_at=None,
+                    name_en=None, debut_date=None,
+                    label_ko=None, label_en=None,
+                    fandom_name_ko=None, fandom_name_en=None,
+                    gender=None, activity_status=None,
+                    bio_ko=None, bio_en=None,
+                )
+            )
+            session.execute(
+                update(Artist).values(
+                    enriched_at=None,
+                    name_en=None, stage_name_ko=None, stage_name_en=None,
+                    birth_date=None, nationality_ko=None, nationality_en=None,
+                    mbti=None, blood_type=None,
+                    height_cm=None, weight_kg=None,
+                    gender=None, bio_ko=None, bio_en=None,
+                )
+            )
+            session.commit()
+            group_count  = session.scalar(select(func.count(Group.id)))
+            artist_count = session.scalar(select(func.count(Artist.id)))
+
+        logger.info("전체 보강 초기화 완료 | 그룹=%d 아티스트=%d", group_count, artist_count)
+        return {
+            "reset_groups":  group_count,
+            "reset_artists": artist_count,
+            "message": f"그룹 {group_count}개 + 아티스트 {artist_count}명 초기화 완료",
+        }
+
+    except Exception as exc:
+        logger.exception("전체 보강 초기화 실패: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/admin/enrich-all", status_code=202)
+def enrich_all_background() -> dict[str, Any]:
+    """
+    전체 아티스트/그룹 프로필을 백그라운드 스레드에서 보강합니다.
+    enriched_at IS NULL 인 항목을 모두 처리할 때까지 반복 실행.
+    이미 실행 중이면 409 반환.
+    """
+    global _enrich_all_thread
+    if _enrich_all_thread and _enrich_all_thread.is_alive():
+        raise HTTPException(status_code=409, detail="이미 전체 보강 작업이 실행 중입니다.")
+
+    def _run() -> None:
+        from processor.profile_enricher import enrich_all_profiles
+        try:
+            logger.info("전체 프로필 보강 시작 (백그라운드)")
+            result = enrich_all_profiles()
+            logger.info("전체 프로필 보강 완료: %s", result)
+        except Exception as exc:
+            logger.error("전체 프로필 보강 실패: %s", exc)
+
+    _enrich_all_thread = _threading.Thread(target=_run, daemon=True, name="enrich-all")
+    _enrich_all_thread.start()
+    return {"status": "started", "message": "전체 프로필 보강 백그라운드 시작됨"}
+
+
+@app.get("/admin/enrich-status", status_code=200)
+def enrich_all_status() -> dict[str, Any]:
+    """전체 보강 작업 진행 상태 조회."""
+    running = _enrich_all_thread is not None and _enrich_all_thread.is_alive()
+    return {"running": running}
 
 
 @app.post("/admin/reset-stuck-jobs", status_code=200)
