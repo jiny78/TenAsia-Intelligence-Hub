@@ -815,3 +815,38 @@ def create_entity_mapping(
     except Exception as exc:
         logger.exception("엔티티 매핑 추가 실패: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+# ─────────────────────────────────────────────────────────────
+# 프로필 보강 (Gemini 기반 자동 데이터 수집)
+# ─────────────────────────────────────────────────────────────
+
+@public_router.post("/enrich-profiles")
+def enrich_profiles(
+    target:     str = Body("all",  embed=True, description="'all' | 'artists' | 'groups'"),
+    batch_size: int = Body(10,     embed=True, description="한 번에 처리할 수"),
+) -> dict:
+    """
+    Gemini 지식 기반으로 비어있는 아티스트/그룹 프로필을 자동 보강합니다.
+    이미 값이 있는 필드는 덮어쓰지 않습니다.
+    """
+    try:
+        from processor.profile_enricher import enrich_artists, enrich_groups
+
+        artists_count = 0
+        groups_count  = 0
+
+        if target in ("all", "artists"):
+            artists_count = enrich_artists(batch_size=batch_size)
+        if target in ("all", "groups"):
+            groups_count = enrich_groups(batch_size=batch_size)
+
+        return {
+            "enriched_artists": artists_count,
+            "enriched_groups":  groups_count,
+            "total":            artists_count + groups_count,
+        }
+
+    except Exception as exc:
+        logger.exception("프로필 보강 실패: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
