@@ -158,6 +158,7 @@ export function EnrichPanel() {
               <li>· 소속사 (한/영)</li>
               <li>· 팬덤명 (한/영)</li>
               <li>· 영문명</li>
+              <li>· 활동 상태 (ACTIVE/HIATUS/DISBANDED)</li>
               <li>· 소개글 (한/영)</li>
             </ul>
           </div>

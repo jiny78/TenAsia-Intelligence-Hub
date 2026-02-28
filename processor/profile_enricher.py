@@ -5,7 +5,7 @@ Gemini 의 K-pop 지식을 활용해 DB에 비어있는 프로필 필드를 채�
   · 아티스트: birth_date, nationality_ko, nationality_en, mbti, blood_type,
               height_cm, weight_kg, gender, stage_name_ko, stage_name_en, bio_ko, bio_en
   · 그룹     : debut_date, label_ko, label_en, fandom_name_ko, fandom_name_en,
-              gender, bio_ko, bio_en
+              gender, activity_status, bio_ko, bio_en
 
 이미 값이 있는 필드는 덮어쓰지 않습니다 (보완 only).
 """
@@ -78,6 +78,7 @@ Return this JSON array (one object per name, same order):
     "label_en": "Label/agency name in English or null",
     "fandom_name_ko": "팬덤명 in Korean or null",
     "fandom_name_en": "Fandom name in English or null",
+    "activity_status": "ACTIVE" | "HIATUS" | "DISBANDED" | "SOLO_ONLY" | null,
     "bio_ko": "1-2 sentence Korean biography or null",
     "bio_en": "1-2 sentence English biography or null"
   }}
@@ -86,6 +87,12 @@ Return this JSON array (one object per name, same order):
 Rules:
 - Only return verified facts you are confident about — use null for uncertain data
 - debut_date: YYYY-MM-DD format; if only year known, use YYYY-01-01
+- activity_status values:
+    ACTIVE    = currently active as a group
+    HIATUS    = temporarily on hiatus / long pause
+    DISBANDED = officially disbanded/broken up
+    SOLO_ONLY = each member active solo but group not officially disbanded
+    null      = uncertain or insufficient information
 - If the name is not a known K-pop group, return all fields as null except name_ko"""
 
 
@@ -247,7 +254,7 @@ def enrich_artists(batch_size: int = ARTIST_BATCH_SIZE) -> int:
 
 def enrich_groups(batch_size: int = GROUP_BATCH_SIZE) -> int:
     """
-    bio_ko 또는 debut_date 가 NULL인 그룹을 Gemini로 보강합니다.
+    bio_ko, debut_date, activity_status 중 하나라도 NULL인 그룹을 Gemini로 보강합니다.
     이미 값이 있는 필드는 덮어쓰지 않습니다.
     보강된 그룹 수를 반환합니다.
     """
@@ -260,7 +267,11 @@ def enrich_groups(batch_size: int = GROUP_BATCH_SIZE) -> int:
             session.scalars(
                 select(Group)
                 .where(
-                    or_(Group.bio_ko.is_(None), Group.debut_date.is_(None))
+                    or_(
+                        Group.bio_ko.is_(None),
+                        Group.debut_date.is_(None),
+                        Group.activity_status.is_(None),
+                    )
                 )
                 .order_by(Group.global_priority.desc().nullslast(), Group.id)
                 .limit(batch_size)
@@ -324,6 +335,16 @@ def enrich_groups(batch_size: int = GROUP_BATCH_SIZE) -> int:
                     from database.models import ArtistGender
                     try:
                         group.gender = ArtistGender(gender_val)
+                        changed = True
+                    except ValueError:
+                        pass
+
+                # activity_status — NULL인 경우에만 설정
+                status_val = r.get("activity_status")
+                if status_val and group.activity_status is None:
+                    from database.models import ActivityStatus
+                    try:
+                        group.activity_status = ActivityStatus(status_val)
                         changed = True
                     except ValueError:
                         pass
