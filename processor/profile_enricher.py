@@ -380,7 +380,7 @@ def enrich_groups(batch_size: int = GROUP_BATCH_SIZE, overwrite_bio: bool = Fals
                 .limit(batch_size)
             )
         )
-        groups = [{"id": g.id, "name_ko": g.name_ko} for g in rows]
+        groups = [{"id": g.id, "name_ko": g.name_ko, "name_en": g.name_en} for g in rows]
 
     if not groups:
         logger.debug("보강할 그룹 없음")
@@ -393,8 +393,12 @@ def enrich_groups(batch_size: int = GROUP_BATCH_SIZE, overwrite_bio: bool = Fals
 
     for g_info in groups:
         name_ko = g_info["name_ko"]
+        name_en = g_info.get("name_en")
         try:
+            # Wikipedia 조회: name_ko 우선 → name_en 폴백 (영문명으로 한국어 Wikipedia 검색)
             wiki_text = _fetch_wikipedia_extract(name_ko)
+            if not wiki_text and name_en:
+                wiki_text = _fetch_wikipedia_extract(name_en)
 
             if wiki_text:
                 prompt = _GROUP_PROMPT_WITH_WIKI.format(
