@@ -237,7 +237,7 @@ def enrich_artists(batch_size: int = ARTIST_BATCH_SIZE) -> int:
                 .limit(batch_size)
             )
         )
-        artists = [{"id": a.id, "name_ko": a.name_ko} for a in rows]
+        artists = [{"id": a.id, "name_ko": a.name_ko, "stage_name_ko": a.stage_name_ko} for a in rows]
 
     if not artists:
         logger.debug("보강할 아티스트 없음")
@@ -251,14 +251,19 @@ def enrich_artists(batch_size: int = ARTIST_BATCH_SIZE) -> int:
     for a_info in artists:
         name_ko = a_info["name_ko"]
         try:
-            # 1. Wikipedia 조회
-            wiki_text = _fetch_wikipedia_extract(name_ko)
+            # 1. Wikipedia 조회 (stage_name_ko 우선, 없으면 name_ko)
+            stage_name = a_info.get("stage_name_ko")
+            wiki_text = None
+            if stage_name and stage_name != name_ko:
+                wiki_text = _fetch_wikipedia_extract(stage_name)
+            if not wiki_text:
+                wiki_text = _fetch_wikipedia_extract(name_ko)
 
             # 2. Gemini 호출 (Wikipedia 텍스트 유무에 따라 프롬프트 분기)
             if wiki_text:
                 prompt = _ARTIST_PROMPT_WITH_WIKI.format(
                     name_ko=name_ko,
-                    wiki_text=wiki_text[:1200],
+                    wiki_text=wiki_text[:3000],
                 )
                 logger.debug("아티스트 Wikipedia 활용 | %s (%d자)", name_ko, len(wiki_text))
             else:
@@ -386,7 +391,7 @@ def enrich_groups(batch_size: int = GROUP_BATCH_SIZE) -> int:
             if wiki_text:
                 prompt = _GROUP_PROMPT_WITH_WIKI.format(
                     name_ko=name_ko,
-                    wiki_text=wiki_text[:1200],
+                    wiki_text=wiki_text[:3000],
                 )
                 logger.debug("그룹 Wikipedia 활용 | %s (%d자)", name_ko, len(wiki_text))
             else:
@@ -475,6 +480,54 @@ def _mark_enriched(model_cls, entity_id: int, now: datetime) -> None:
         if obj:
             obj.enriched_at = now
             session.commit()
+
+
+def re_enrich_sparse(limit: int = 200) -> dict[str, int]:
+    """
+    이미 enriched_at이 설정되어 있지만 bio_ko가 NULL인 아티스트/그룹을 재보강합니다.
+    enriched_at을 NULL로 리셋한 뒤 즉시 enrich_artists/enrich_groups를 호출합니다.
+    기존에 채워진 필드(name_en, debut_date 등)는 덮어쓰지 않습니다.
+    """
+    from sqlalchemy import select
+    from core.db import get_db
+    from database.models import Artist, Group
+
+    with get_db() as session:
+        sparse_artists = list(
+            session.scalars(
+                select(Artist)
+                .where(Artist.enriched_at.isnot(None))
+                .where(Artist.bio_ko.is_(None))
+                .order_by(Artist.global_priority.desc().nullslast(), Artist.id)
+                .limit(limit)
+            )
+        )
+        for a in sparse_artists:
+            a.enriched_at = None
+        artist_count = len(sparse_artists)
+
+        sparse_groups = list(
+            session.scalars(
+                select(Group)
+                .where(Group.enriched_at.isnot(None))
+                .where(Group.bio_ko.is_(None))
+                .order_by(Group.global_priority.desc().nullslast(), Group.id)
+                .limit(limit)
+            )
+        )
+        for g in sparse_groups:
+            g.enriched_at = None
+        group_count = len(sparse_groups)
+
+        session.commit()
+
+    logger.info("재보강 대상 리셋 | 아티스트=%d 그룹=%d", artist_count, group_count)
+
+    enriched_artists = enrich_artists(batch_size=max(artist_count, 1))
+    enriched_groups  = enrich_groups(batch_size=max(group_count, 1))
+
+    logger.info("재보강 완료 | 아티스트=%d 그룹=%d", enriched_artists, enriched_groups)
+    return {"artists": enriched_artists, "groups": enriched_groups}
 
 
 def enrich_all_profiles() -> dict[str, int]:
