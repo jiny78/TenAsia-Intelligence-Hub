@@ -1171,3 +1171,215 @@ def backfill_artist_gender() -> int:
 
     logger.info("아티스트 gender 백필 완료 | 업데이트=%d", updated)
     return updated
+
+
+# ─────────────────────────────────────────────────────────────
+# 아티스트 gender 백필 — Wikidata + Gemini AI
+# ─────────────────────────────────────────────────────────────
+
+_GENDER_BATCH = 30
+_WIKIDATA_API = "https://www.wikidata.org/w/api.php"
+_WIKIDATA_HEADERS = {"User-Agent": "TenAsia-Intelligence-Bot/1.0 (K-pop data enrichment)"}
+_WIKIDATA_MALE   = "Q6581097"   # Wikidata QID: male
+_WIKIDATA_FEMALE = "Q6581072"   # Wikidata QID: female
+
+
+def _lookup_wikidata_gender(name: str) -> str | None:
+    """
+    Wikidata에서 이름으로 P21(sex or gender) 속성을 조회합니다.
+    Returns: 'MALE', 'FEMALE', 또는 None (찾지 못한 경우)
+    """
+    import requests
+
+    try:
+        # 1단계: 엔티티 검색 (한국어 우선)
+        r = requests.get(
+            _WIKIDATA_API,
+            params={
+                "action": "wbsearchentities",
+                "search": name,
+                "language": "ko",
+                "limit": 5,
+                "format": "json",
+            },
+            headers=_WIKIDATA_HEADERS,
+            timeout=8,
+        )
+        results = r.json().get("search", [])
+
+        for result in results:
+            qid = result["id"]
+            # 2단계: claims 조회 (P21 = sex or gender, P31 = instance of)
+            cr = requests.get(
+                _WIKIDATA_API,
+                params={
+                    "action": "wbgetentities",
+                    "ids": qid,
+                    "props": "claims",
+                    "format": "json",
+                },
+                headers=_WIKIDATA_HEADERS,
+                timeout=8,
+            )
+            entity = cr.json().get("entities", {}).get(qid, {})
+            claims = entity.get("claims", {})
+
+            # P31 = instance of → Q5(human)인지 확인
+            p31 = claims.get("P31", [])
+            is_human = any(
+                c.get("mainsnak", {}).get("datavalue", {}).get("value", {}).get("id") == "Q5"
+                for c in p31
+            )
+            if not is_human:
+                continue
+
+            # P21 = sex or gender
+            p21 = claims.get("P21", [])
+            if not p21:
+                continue
+            gender_id = (
+                p21[0]
+                .get("mainsnak", {})
+                .get("datavalue", {})
+                .get("value", {})
+                .get("id")
+            )
+            if gender_id == _WIKIDATA_MALE:
+                return "MALE"
+            if gender_id == _WIKIDATA_FEMALE:
+                return "FEMALE"
+
+    except Exception as exc:
+        logger.warning("Wikidata 조회 오류 name=%s: %s", name, exc)
+
+    return None
+
+
+def _infer_gender_by_gemini(artists: list) -> int:
+    """
+    Gemini를 사용해 K-pop 아티스트 성별을 배치 추론합니다.
+    Returns: 업데이트된 수
+    """
+    from core.db import get_db
+    from database.models import Artist, ArtistGender
+
+    updated = 0
+
+    for i in range(0, len(artists), _GENDER_BATCH):
+        batch = artists[i : i + _GENDER_BATCH]
+        names_json = json.dumps(
+            [
+                {"id": a.id, "name": a.stage_name_ko or a.name_ko}
+                for a in batch
+            ],
+            ensure_ascii=False,
+        )
+        prompt = (
+            "다음은 K-pop 아이돌 또는 한국 연예인 이름 목록입니다.\n"
+            "각 인물의 성별을 판단해주세요.\n\n"
+            "규칙:\n"
+            "- 실제 K-pop 아이돌/가수/배우라면 MALE 또는 FEMALE 반환\n"
+            "- 판단 불가능하거나 실존 인물이 아닌 경우 UNKNOWN 반환\n\n"
+            f"아티스트 목록:\n{names_json}\n\n"
+            "JSON 배열로만 응답 (설명 없음):\n"
+            '[{"id": 1, "gender": "MALE"}, ...]\n'
+            "gender 값은 MALE, FEMALE, UNKNOWN 중 하나"
+        )
+
+        try:
+            model = _get_model()
+            response = model.generate_content(prompt)
+            parsed = json.loads(response.text.strip())
+
+            with get_db() as session:
+                for item in parsed:
+                    aid = item.get("id")
+                    gender_str = (item.get("gender") or "").upper()
+                    if gender_str not in ("MALE", "FEMALE"):
+                        continue
+                    a = session.get(Artist, aid)
+                    if a:
+                        a.gender = ArtistGender(gender_str)
+                        updated += 1
+                        logger.info(
+                            "Gemini gender | id=%d name=%s → %s",
+                            aid, a.name_ko, gender_str,
+                        )
+                session.commit()
+
+        except Exception as exc:
+            logger.warning("Gemini gender 배치 실패 (batch %d): %s", i, exc)
+
+        time.sleep(1)
+
+    return updated
+
+
+def backfill_artist_gender_wiki(limit: int = 200, wiki_delay: float = 0.3) -> int:
+    """
+    Wikidata P21 + Gemini AI를 사용해 gender=NULL/UNKNOWN 아티스트의 성별을 업데이트합니다.
+
+    1단계: Wikidata에서 stage_name_ko / name_ko로 P21(sex or gender) 조회
+    2단계: Wikidata에서 못 찾은 아티스트는 Gemini 배치 추론
+
+    Returns:
+        updated: 총 업데이트된 아티스트 수
+    """
+    from sqlalchemy import select
+
+    from core.db import get_db
+    from database.models import Artist, ArtistGender
+
+    # gender=NULL 또는 UNKNOWN 아티스트 조회
+    with get_db() as session:
+        artists = list(
+            session.scalars(
+                select(Artist)
+                .where(
+                    (Artist.gender.is_(None)) | (Artist.gender == ArtistGender.UNKNOWN)
+                )
+                .order_by(Artist.id)
+                .limit(limit)
+            )
+        )
+
+    logger.info("gender 백필(Wiki+AI) 대상: %d명", len(artists))
+
+    wikidata_updates: list[tuple[int, str]] = []
+    gemini_targets: list = []
+
+    # 1단계: Wikidata 조회
+    for artist in artists:
+        search_name = artist.stage_name_ko or artist.name_ko
+        gender_str = _lookup_wikidata_gender(search_name)
+
+        if gender_str:
+            wikidata_updates.append((artist.id, gender_str))
+            logger.info("Wikidata 성별 확인 | %s → %s", search_name, gender_str)
+        else:
+            gemini_targets.append(artist)
+
+        time.sleep(wiki_delay)
+
+    # Wikidata 결과 DB 저장
+    if wikidata_updates:
+        with get_db() as session:
+            for aid, gender_str in wikidata_updates:
+                a = session.get(Artist, aid)
+                if a:
+                    a.gender = ArtistGender(gender_str)
+            session.commit()
+        logger.info("Wikidata gender 업데이트: %d명", len(wikidata_updates))
+
+    # 2단계: Gemini 배치 추론
+    gemini_updated = 0
+    if gemini_targets:
+        logger.info("Gemini gender 추론 대상: %d명", len(gemini_targets))
+        gemini_updated = _infer_gender_by_gemini(gemini_targets)
+
+    total_updated = len(wikidata_updates) + gemini_updated
+    logger.info(
+        "gender 백필 완료 | Wikidata=%d Gemini=%d 합계=%d",
+        len(wikidata_updates), gemini_updated, total_updated,
+    )
+    return total_updated

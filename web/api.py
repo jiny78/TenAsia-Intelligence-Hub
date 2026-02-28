@@ -21,7 +21,8 @@ Streamlit(포트 8501) → http://localhost:8000 으로 호출합니다.
   DELETE /jobs/{job_id}               작업 취소 (pending 만)
   GET    /jobs/stats                  상태별 통계
   POST   /trigger/ssm                 SSM SendCommand 로 EC2 스크래퍼 즉시 실행
-  POST   /admin/backfill-thumbnails   최근 N일 기사 og:image 사후 백필 (백그라운드)
+  POST   /admin/backfill-thumbnails          최근 N일 기사 og:image 사후 백필 (백그라운드)
+  POST   /admin/backfill-artist-gender-wiki  Wikidata P21 + Gemini AI gender 백필 (백그라운드)
 
   [Phase 5-B] Automation Monitor
   GET    /automation/summary          자율 처리 24h 통계 요약
@@ -1124,6 +1125,27 @@ def trigger_artist_gender_backfill() -> dict[str, Any]:
     t = _threading.Thread(target=_run, daemon=True)
     t.start()
     return {"message": "아티스트 gender 백필 시작 (그룹 소속 기반 추론)", "status": "accepted"}
+
+
+@app.post("/admin/backfill-artist-gender-wiki", status_code=202)
+def trigger_artist_gender_wiki_backfill(limit: int = 200) -> dict[str, Any]:
+    """
+    Wikidata P21 + Gemini AI를 사용해 gender=NULL/UNKNOWN 아티스트의 성별을 업데이트합니다.
+    1단계: Wikidata에서 P21(sex or gender) 조회
+    2단계: 못 찾은 아티스트는 Gemini 배치 추론
+    백그라운드 스레드에서 실행됩니다.
+    """
+    def _run() -> None:
+        try:
+            from processor.simple_processor import backfill_artist_gender_wiki
+            updated = backfill_artist_gender_wiki(limit=limit)
+            logger.info("Wikidata+AI gender 백필 완료 | 업데이트=%d", updated)
+        except Exception as exc:
+            logger.exception("Wikidata+AI gender 백필 오류: %s", exc)
+
+    t = _threading.Thread(target=_run, daemon=True)
+    t.start()
+    return {"message": f"Wikidata + Gemini AI gender 백필 시작 (limit={limit})", "status": "accepted"}
 
 
 @app.post("/admin/backfill-thumbnails", status_code=202)
