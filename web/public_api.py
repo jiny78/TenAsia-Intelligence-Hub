@@ -21,7 +21,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Body, HTTPException, Query
 
 logger = logging.getLogger(__name__)
 
@@ -126,12 +126,13 @@ def _member_dict(mo: Any) -> dict:
 
 @public_router.get("/articles")
 def list_articles(
-    limit:     int           = Query(20, ge=1, le=100),
-    offset:    int           = Query(0,  ge=0),
-    artist_id: Optional[int] = Query(None, description="특정 아티스트 관련 기사"),
-    group_id:  Optional[int] = Query(None, description="특정 그룹 관련 기사"),
-    language:  Optional[str] = Query(None, description="언어 코드 (kr/en/jp)"),
-    q:         Optional[str] = Query(None, description="제목 검색어"),
+    limit:         int           = Query(20, ge=1, le=100),
+    offset:        int           = Query(0,  ge=0),
+    artist_id:     Optional[int] = Query(None, description="특정 아티스트 관련 기사"),
+    group_id:      Optional[int] = Query(None, description="특정 그룹 관련 기사"),
+    language:      Optional[str] = Query(None, description="언어 코드 (kr/en/jp)"),
+    q:             Optional[str] = Query(None, description="제목 검색어"),
+    has_thumbnail: Optional[bool] = Query(None, description="썸네일 있는 기사만"),
 ) -> list[dict]:
     """
     소비자용 기사 목록.
@@ -171,6 +172,9 @@ def list_articles(
                 stmt = stmt.where(
                     Article.title_ko.ilike(like) | Article.title_en.ilike(like)
                 )
+
+            if has_thumbnail is True:
+                stmt = stmt.where(Article.thumbnail_url.isnot(None))
 
             rows = session.execute(stmt.limit(limit).offset(offset)).scalars().all()
             return [_article_summary(a) for a in rows]
@@ -617,4 +621,197 @@ def search(
 
     except Exception as exc:
         logger.exception("통합 검색 실패 q=%r: %s", q, exc)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+# ─────────────────────────────────────────────────────────────
+# 관리 (Admin) — 그룹 상태·엔티티 매핑 수동 편집
+# ─────────────────────────────────────────────────────────────
+
+@public_router.patch("/groups/{group_id}")
+def update_group_status(
+    group_id: int,
+    activity_status: Optional[str] = Body(None, embed=True, description="ACTIVE/HIATUS/DISBANDED/SOLO_ONLY"),
+    bio_ko: Optional[str] = Body(None, embed=True),
+    bio_en: Optional[str] = Body(None, embed=True),
+) -> dict:
+    """그룹 활동 상태 및 소개글 수동 수정."""
+    try:
+        from core.db import get_db
+        from database.models import ActivityStatus, Group
+
+        valid_statuses = {s.value for s in ActivityStatus}
+        if activity_status and activity_status not in valid_statuses:
+            raise HTTPException(status_code=400, detail=f"유효하지 않은 상태: {activity_status}. 허용: {valid_statuses}")
+
+        with get_db() as session:
+            group = session.get(Group, group_id)
+            if group is None:
+                raise HTTPException(status_code=404, detail="그룹을 찾을 수 없습니다.")
+            if activity_status:
+                group.activity_status = ActivityStatus(activity_status)
+            if bio_ko is not None:
+                group.bio_ko = bio_ko or None
+            if bio_en is not None:
+                group.bio_en = bio_en or None
+            session.commit()
+            return _group_dict(group)
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("그룹 상태 수정 실패 id=%d: %s", group_id, exc)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@public_router.patch("/artists/{artist_id}")
+def update_artist(
+    artist_id: int,
+    bio_ko: Optional[str] = Body(None, embed=True),
+    bio_en: Optional[str] = Body(None, embed=True),
+) -> dict:
+    """아티스트 소개글 수동 수정."""
+    try:
+        from core.db import get_db
+        from database.models import Artist
+
+        with get_db() as session:
+            artist = session.get(Artist, artist_id)
+            if artist is None:
+                raise HTTPException(status_code=404, detail="아티스트를 찾을 수 없습니다.")
+            if bio_ko is not None:
+                artist.bio_ko = bio_ko or None
+            if bio_en is not None:
+                artist.bio_en = bio_en or None
+            session.commit()
+            return _artist_dict(artist)
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("아티스트 수정 실패 id=%d: %s", artist_id, exc)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@public_router.get("/entity-mappings")
+def list_entity_mappings(
+    article_id: Optional[int] = Query(None),
+    artist_id:  Optional[int] = Query(None),
+    group_id:   Optional[int] = Query(None),
+    limit:      int           = Query(50, ge=1, le=200),
+) -> list[dict]:
+    """엔티티 매핑 목록 조회 (관리자용)."""
+    try:
+        from core.db import get_db
+        from database.models import Article, Artist, EntityMapping, Group
+        from sqlalchemy import select
+        from sqlalchemy.orm import joinedload
+
+        with get_db() as session:
+            stmt = (
+                select(EntityMapping)
+                .options(
+                    joinedload(EntityMapping.article),
+                    joinedload(EntityMapping.artist),
+                    joinedload(EntityMapping.group),
+                )
+                .order_by(EntityMapping.id.desc())
+                .limit(limit)
+            )
+            if article_id is not None:
+                stmt = stmt.where(EntityMapping.article_id == article_id)
+            if artist_id is not None:
+                stmt = stmt.where(EntityMapping.artist_id == artist_id)
+            if group_id is not None:
+                stmt = stmt.where(EntityMapping.group_id == group_id)
+
+            rows = session.execute(stmt).scalars().all()
+            return [
+                {
+                    "id":               m.id,
+                    "article_id":       m.article_id,
+                    "article_title_ko": m.article.title_ko if m.article else None,
+                    "article_url":      m.article.source_url if m.article else None,
+                    "entity_type":      m.entity_type.value if m.entity_type else None,
+                    "artist_id":        m.artist_id,
+                    "artist_name_ko":   m.artist.name_ko if m.artist else None,
+                    "group_id":         m.group_id,
+                    "group_name_ko":    m.group.name_ko if m.group else None,
+                    "confidence_score": m.confidence_score,
+                }
+                for m in rows
+            ]
+
+    except Exception as exc:
+        logger.exception("엔티티 매핑 목록 조회 실패: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@public_router.delete("/entity-mappings/{mapping_id}", status_code=200)
+def delete_entity_mapping(mapping_id: int) -> dict:
+    """엔티티 매핑 삭제 (관리자용)."""
+    try:
+        from core.db import get_db
+        from database.models import EntityMapping
+
+        with get_db() as session:
+            mapping = session.get(EntityMapping, mapping_id)
+            if mapping is None:
+                raise HTTPException(status_code=404, detail="매핑을 찾을 수 없습니다.")
+            session.delete(mapping)
+            session.commit()
+            return {"deleted": mapping_id}
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("엔티티 매핑 삭제 실패 id=%d: %s", mapping_id, exc)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@public_router.post("/entity-mappings", status_code=201)
+def create_entity_mapping(
+    article_id:       int            = Body(..., embed=True),
+    artist_id:        Optional[int]  = Body(None, embed=True),
+    group_id:         Optional[int]  = Body(None, embed=True),
+    confidence_score: float          = Body(1.0, embed=True),
+) -> dict:
+    """엔티티 매핑 수동 추가 (관리자용)."""
+    try:
+        from core.db import get_db
+        from database.models import EntityMapping, EntityType
+        from sqlalchemy import select
+
+        if artist_id is None and group_id is None:
+            raise HTTPException(status_code=400, detail="artist_id 또는 group_id 중 하나는 필수입니다.")
+
+        entity_type = EntityType.ARTIST if artist_id else EntityType.GROUP
+
+        with get_db() as session:
+            # 중복 확인
+            existing_stmt = select(EntityMapping).where(
+                EntityMapping.article_id == article_id
+            )
+            if artist_id:
+                existing_stmt = existing_stmt.where(EntityMapping.artist_id == artist_id)
+            if group_id:
+                existing_stmt = existing_stmt.where(EntityMapping.group_id == group_id)
+            if session.execute(existing_stmt).scalar_one_or_none():
+                raise HTTPException(status_code=409, detail="이미 존재하는 매핑입니다.")
+
+            mapping = EntityMapping(
+                article_id=article_id,
+                entity_type=entity_type,
+                artist_id=artist_id,
+                group_id=group_id,
+                confidence_score=min(max(confidence_score, 0.0), 1.0),
+            )
+            session.add(mapping)
+            session.commit()
+            return {"created": mapping.id, "article_id": article_id, "artist_id": artist_id, "group_id": group_id}
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("엔티티 매핑 추가 실패: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
