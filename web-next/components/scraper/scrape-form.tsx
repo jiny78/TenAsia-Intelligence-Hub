@@ -11,6 +11,7 @@ import { useJobs } from "@/hooks/use-jobs";
 
 export function ScrapeForm() {
   const [range, setRange] = useState<DateRange | undefined>();
+  const [rssRange, setRssRange] = useState<DateRange | undefined>();
   const [batchSize, setBatchSize] = useState(10);
   const [dryRun, setDryRun] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -37,7 +38,10 @@ export function ScrapeForm() {
     setError(null);
     setTaskId(null);
     try {
-      const res = await scraperApi.scrapeRss();
+      const params: { start_date?: string; end_date?: string } = {};
+      if (rssRange?.from) params.start_date = format(rssRange.from, "yyyy-MM-dd");
+      if (rssRange?.to)   params.end_date   = format(rssRange.to,   "yyyy-MM-dd");
+      const res = await scraperApi.scrapeRss(params);
       setTaskId(res.task_id);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -118,15 +122,15 @@ export function ScrapeForm() {
       )}
 
       {/* RSS 빠른 수집 */}
-      <div className="rounded-xl border border-emerald-500/20 bg-emerald-500/5 p-4 space-y-2">
-        <div className="flex items-center justify-between">
+      <div className="rounded-xl border border-emerald-500/20 bg-emerald-500/5 p-4 space-y-3">
+        <div className="flex items-start justify-between gap-3">
           <div>
             <p className="text-sm font-semibold flex items-center gap-1.5">
               <Zap className="h-3.5 w-3.5 text-emerald-400" />
               RSS 빠른 수집
             </p>
             <p className="text-[11px] text-muted-foreground mt-0.5">
-              최신 기사 ~50개를 1초 안에 수집 (개별 페이지 fetch 없음)
+              RSS 피드 기사를 빠르게 수집 (개별 페이지 fetch 없음)
             </p>
           </div>
           <button
@@ -136,8 +140,24 @@ export function ScrapeForm() {
             className="rounded-lg bg-emerald-500 px-4 py-2 text-xs font-semibold text-white shadow transition-all hover:bg-emerald-400 disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-1.5 shrink-0"
           >
             <Zap className="h-3.5 w-3.5" />
-            {rssLoading ? "수집 중..." : "지금 실행"}
+            {rssLoading ? "수집 중..." : "실행"}
           </button>
+        </div>
+        {/* RSS 날짜 범위 (선택) */}
+        <div className="space-y-1">
+          <p className="text-[10px] font-semibold uppercase tracking-wide text-emerald-500/70">
+            날짜 범위 (선택 — 미설정 시 최신 기사)
+          </p>
+          <DateRangePicker value={rssRange} onChange={setRssRange} placeholder="기간 선택" />
+          {rssRange?.from && (
+            <button
+              type="button"
+              onClick={() => setRssRange(undefined)}
+              className="text-[10px] text-muted-foreground hover:text-foreground"
+            >
+              × 날짜 초기화
+            </button>
+          )}
         </div>
       </div>
 
