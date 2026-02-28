@@ -348,6 +348,7 @@ Return this JSON array (one object per article):
         "subject_count": <integer: number of times this entity is the main subject (주어) in the body>,
         "has_activity_content": true if the article discusses this entity's activities/profile/career,
         "activity_summary_ko": "1-2 sentence Korean summary of the activity content, or null",
+        "activity_status_hint": "ACTIVE" | "HIATUS" | "DISBANDED" | "SOLO_ONLY" | null,
         "confidence": 0.7-1.0
       }}
     ],
@@ -362,6 +363,13 @@ Rules:
 - subject_count: count sentences where this entity is the grammatical subject/topic (주어로 등장)
 - has_activity_content: true if article discusses comebacks, albums, concerts, awards, profile, group activities
 - activity_summary_ko: brief summary of their activity/profile content if has_activity_content is true
+- activity_status_hint: ONLY set this for GROUP type when the article clearly announces a status change:
+    ACTIVE    = comeback announced / new album / tour / award win / actively performing
+    HIATUS    = activity suspension / hiatus / long break announced (활동 잠정 중단, 공백기)
+    DISBANDED = official disbandment announced (해체, 공식 해체)
+    SOLO_ONLY = all members going solo while group not officially disbanded
+    null      = no clear status change announced (most articles — use null by default)
+  Do NOT set activity_status_hint based on past events or vague mentions. Only set when the article's main topic IS the status change.
 - Strict confidence: 0.9+ for main subject, 0.7+ for clearly mentioned, below 0.7 = skip
 - If no qualifying K-pop entities found, return empty entities array"""
 
@@ -436,6 +444,7 @@ def _save_entity_results(results: list[dict]) -> int:
             subject_count = int(ent.get("subject_count", 0))
             has_activity_content = bool(ent.get("has_activity_content", False))
             activity_summary_ko = (ent.get("activity_summary_ko") or "").strip() or None
+            activity_status_hint = (ent.get("activity_status_hint") or "").strip().upper() or None
 
             if not name_ko or confidence < 0.7:
                 continue
@@ -447,6 +456,11 @@ def _save_entity_results(results: list[dict]) -> int:
                     article_id, name_ko, in_title, subject_count,
                 )
                 continue
+
+            # activity_status_hint 유효성 검사
+            _valid_statuses = {"ACTIVE", "HIATUS", "DISBANDED", "SOLO_ONLY"}
+            if activity_status_hint and activity_status_hint not in _valid_statuses:
+                activity_status_hint = None
 
             try:
                 if etype == "GROUP":
@@ -467,6 +481,21 @@ def _save_entity_results(results: list[dict]) -> int:
                         # 활동 내용 있으면 bio_ko 보완
                         if has_activity_content and activity_summary_ko and not group.bio_ko:
                             group.bio_ko = activity_summary_ko
+                        # 기사에서 명확한 활동 상태 변화 감지 시 업데이트 (기존 값 덮어씀)
+                        if activity_status_hint:
+                            try:
+                                new_status = ActivityStatus(activity_status_hint)
+                                if group.activity_status != new_status:
+                                    logger.info(
+                                        "그룹 활동상태 업데이트 | %s: %s → %s (article_id=%d)",
+                                        name_ko,
+                                        group.activity_status,
+                                        new_status,
+                                        article_id,
+                                    )
+                                    group.activity_status = new_status
+                            except ValueError:
+                                pass
                         entity_id = group.id
                         session.commit()
 
