@@ -21,6 +21,7 @@ Streamlit(포트 8501) → http://localhost:8000 으로 호출합니다.
   DELETE /jobs/{job_id}               작업 취소 (pending 만)
   GET    /jobs/stats                  상태별 통계
   POST   /trigger/ssm                 SSM SendCommand 로 EC2 스크래퍼 즉시 실행
+  POST   /admin/backfill-thumbnails   최근 N일 기사 og:image 사후 백필 (백그라운드)
 
   [Phase 5-B] Automation Monitor
   GET    /automation/summary          자율 처리 24h 통계 요약
@@ -1075,6 +1076,34 @@ def enrich_all_status() -> dict[str, Any]:
     """전체 보강 작업 진행 상태 조회."""
     running = _enrich_all_thread is not None and _enrich_all_thread.is_alive()
     return {"running": running}
+
+
+@app.post("/admin/backfill-thumbnails", status_code=202)
+def trigger_thumbnail_backfill(limit: int = 30, days: int = 20) -> dict[str, Any]:
+    """
+    최근 days일치 기사 중 thumbnail_url이 없는 PROCESSED 기사를 직접 fetch하여
+    og:image를 추출하고 articles.thumbnail_url을 업데이트합니다.
+    백그라운드 스레드에서 반복 실행됩니다.
+    """
+    def _run() -> None:
+        try:
+            from processor.simple_processor import backfill_thumbnails_batch
+            total = 0
+            while True:
+                n = backfill_thumbnails_batch(limit=limit, days=days)
+                total += n
+                if n == 0:
+                    break
+            logger.info("썸네일 전체 백필 완료 | 총=%d (최근 %d일)", total, days)
+        except Exception as exc:
+            logger.exception("썸네일 백필 오류: %s", exc)
+
+    t = _threading.Thread(target=_run, daemon=True)
+    t.start()
+    return {
+        "message": f"썸네일 백필 시작 (최근 {days}일, 배치={limit})",
+        "status": "accepted",
+    }
 
 
 @app.post("/admin/reset-stuck-jobs", status_code=200)

@@ -255,4 +255,10 @@ export const idolsApi = {
 
   enrichStatus: () =>
     request<{ running: boolean }>(`/admin/enrich-status`),
+
+  backfillThumbnails: (limit = 30, days = 20) =>
+    request<{ message: string; status: string }>(
+      `/admin/backfill-thumbnails?limit=${limit}&days=${days}`,
+      { method: "POST", body: JSON.stringify({}) },
+    ),
 };
