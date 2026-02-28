@@ -77,7 +77,7 @@ def _do_scrape(params: dict, job_id: Optional[int] = None) -> dict:
 
     params 예시:
         {
-            "source_url": "https://tenasia.hankyung.com/article/123",  # 단일 URL
+            "source_url": "https://www.tenasia.co.kr/article/123",  # 단일 URL
             "urls":       ["https://...", "https://..."],              # 복수 URL (우선)
             "language":   "kr",
             "platforms":  ["x", "instagram"],

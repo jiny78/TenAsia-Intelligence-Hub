@@ -359,7 +359,7 @@ with tab_queue:
     with st.form("queue_form"):
         source_url = st.text_input(
             "기사 URL *",
-            placeholder="https://tenasia.hankyung.com/...",
+            placeholder="https://www.tenasia.co.kr/...",
         )
 
         col1, col2 = st.columns(2)

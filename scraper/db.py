@@ -123,7 +123,7 @@ def create_job(
 
     Example:
         job_id = create_job("scrape", {
-            "source_url": "https://tenasia.hankyung.com/...",
+            "source_url": "https://www.tenasia.co.kr/...",
             "language":   "kr",
             "platforms":  ["x", "instagram"],
         })
