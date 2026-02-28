@@ -985,3 +985,122 @@ def backfill_thumbnails_batch(
             updated, len(article_data), days,
         )
     return updated
+
+
+# ─────────────────────────────────────────────────────────────
+# 아티스트/그룹 photo_url 백필 (article 썸네일 → artists/groups.photo_url)
+# ─────────────────────────────────────────────────────────────
+
+def backfill_artist_photos(limit: int = 100) -> tuple[int, int]:
+    """
+    photo_url이 없는 아티스트/그룹에 대해 entity_mappings로 연결된 기사 썸네일을
+    artists.photo_url / groups.photo_url에 직접 저장합니다.
+
+    - 1순위: article.artist_name_ko == artist.name_ko (주인공 기사)
+    - 2순위: entity_mappings로 연결된 기사 아무거나 (fallback)
+
+    Returns:
+        (artist_updated, group_updated) 업데이트된 수
+    """
+    from sqlalchemy import select
+
+    from core.db import get_db
+    from database.models import Article, Artist, EntityMapping, EntityType, Group
+
+    artist_updated = 0
+    group_updated = 0
+
+    # ── 아티스트 ──────────────────────────────────────────────
+    with get_db() as session:
+        artists = list(
+            session.scalars(
+                select(Artist)
+                .where(Artist.photo_url.is_(None))
+                .order_by(Artist.id)
+                .limit(limit)
+            )
+        )
+
+    for artist in artists:
+        try:
+            with get_db() as session:
+                # 1순위: 주인공 기사 (artist_name_ko 일치)
+                thumb = session.execute(
+                    select(Article.thumbnail_url)
+                    .join(EntityMapping, EntityMapping.article_id == Article.id)
+                    .where(
+                        EntityMapping.artist_id == artist.id,
+                        EntityMapping.entity_type == EntityType.ARTIST,
+                        Article.thumbnail_url.isnot(None),
+                        Article.artist_name_ko == artist.name_ko,
+                    )
+                    .order_by(Article.published_at.desc())
+                    .limit(1)
+                ).scalar_one_or_none()
+
+                # 2순위: 관련 기사 아무거나
+                if not thumb:
+                    thumb = session.execute(
+                        select(Article.thumbnail_url)
+                        .join(EntityMapping, EntityMapping.article_id == Article.id)
+                        .where(
+                            EntityMapping.artist_id == artist.id,
+                            EntityMapping.entity_type == EntityType.ARTIST,
+                            Article.thumbnail_url.isnot(None),
+                        )
+                        .order_by(Article.published_at.desc())
+                        .limit(1)
+                    ).scalar_one_or_none()
+
+                if thumb:
+                    art_obj = session.get(Artist, artist.id)
+                    if art_obj and not art_obj.photo_url:
+                        art_obj.photo_url = thumb
+                        session.commit()
+                        artist_updated += 1
+                        logger.info("아티스트 photo_url 백필 | id=%d name=%s", artist.id, artist.name_ko)
+        except Exception as exc:
+            logger.warning("아티스트 photo_url 백필 실패 | id=%d: %s", artist.id, exc)
+
+    # ── 그룹 ─────────────────────────────────────────────────
+    with get_db() as session:
+        groups = list(
+            session.scalars(
+                select(Group)
+                .where(Group.photo_url.is_(None))
+                .order_by(Group.id)
+                .limit(limit)
+            )
+        )
+
+    for group in groups:
+        try:
+            with get_db() as session:
+                thumb = session.execute(
+                    select(Article.thumbnail_url)
+                    .join(EntityMapping, EntityMapping.article_id == Article.id)
+                    .where(
+                        EntityMapping.group_id == group.id,
+                        EntityMapping.entity_type == EntityType.GROUP,
+                        Article.thumbnail_url.isnot(None),
+                    )
+                    .order_by(Article.published_at.desc())
+                    .limit(1)
+                ).scalar_one_or_none()
+
+                if thumb:
+                    grp_obj = session.get(Group, group.id)
+                    if grp_obj and not grp_obj.photo_url:
+                        grp_obj.photo_url = thumb
+                        session.commit()
+                        group_updated += 1
+                        logger.info("그룹 photo_url 백필 | id=%d name=%s", group.id, group.name_ko)
+        except Exception as exc:
+            logger.warning("그룹 photo_url 백필 실패 | id=%d: %s", group.id, exc)
+
+    if artist_updated or group_updated:
+        logger.info(
+            "아티스트/그룹 photo_url 백필 완료 | 아티스트=%d 그룹=%d",
+            artist_updated, group_updated,
+        )
+    return artist_updated, group_updated

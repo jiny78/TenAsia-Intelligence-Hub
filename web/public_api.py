@@ -80,7 +80,8 @@ def _artist_dict(a: Any, photo_url: Optional[str] = None) -> dict:
         "bio_en":           a.bio_en,
         "is_verified":      a.is_verified,
         "global_priority":  a.global_priority,
-        "photo_url":        photo_url,
+        # 기사 썸네일 우선, 없으면 artists.photo_url DB 컬럼 fallback
+        "photo_url":        photo_url or getattr(a, "photo_url", None),
     }
 
 
@@ -101,7 +102,8 @@ def _group_dict(g: Any, photo_url: Optional[str] = None) -> dict:
         "bio_en":            g.bio_en,
         "is_verified":       g.is_verified,
         "global_priority":   g.global_priority,
-        "photo_url":         photo_url,
+        # 기사 썸네일 우선, 없으면 groups.photo_url DB 컬럼 fallback
+        "photo_url":         photo_url or getattr(g, "photo_url", None),
     }
 
 

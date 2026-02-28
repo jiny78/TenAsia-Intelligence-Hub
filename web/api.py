@@ -1078,6 +1078,35 @@ def enrich_all_status() -> dict[str, Any]:
     return {"running": running}
 
 
+@app.post("/admin/backfill-artist-photos", status_code=202)
+def trigger_artist_photo_backfill(limit: int = 100) -> dict[str, Any]:
+    """
+    photo_url이 없는 아티스트/그룹에 entity_mappings로 연결된 기사 썸네일을
+    artists.photo_url / groups.photo_url에 직접 저장합니다.
+    백그라운드 스레드에서 반복 실행됩니다.
+    """
+    def _run() -> None:
+        try:
+            from processor.simple_processor import backfill_artist_photos
+            total_a, total_g = 0, 0
+            while True:
+                a, g = backfill_artist_photos(limit=limit)
+                total_a += a
+                total_g += g
+                if a == 0 and g == 0:
+                    break
+            logger.info(
+                "아티스트/그룹 photo_url 전체 백필 완료 | 아티스트=%d 그룹=%d",
+                total_a, total_g,
+            )
+        except Exception as exc:
+            logger.exception("아티스트 photo_url 백필 오류: %s", exc)
+
+    t = _threading.Thread(target=_run, daemon=True)
+    t.start()
+    return {"message": f"아티스트/그룹 photo_url 백필 시작 (배치={limit})", "status": "accepted"}
+
+
 @app.post("/admin/backfill-thumbnails", status_code=202)
 def trigger_thumbnail_backfill(limit: int = 30, days: int = 20) -> dict[str, Any]:
     """
