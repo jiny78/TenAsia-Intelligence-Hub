@@ -1,21 +1,22 @@
 """
-processor/profile_enricher.py — Gemini 기반 아티스트/그룹 프로필 자동 보강
+processor/profile_enricher.py — Wikipedia + Gemini 기반 아티스트/그룹 프로필 자동 보강
 
-Gemini 의 K-pop 지식을 활용해 DB에 비어있는 프로필 필드를 채웁니다.
-  · 아티스트: birth_date, nationality_ko, nationality_en, mbti, blood_type,
-              height_cm, weight_kg, gender, stage_name_ko, stage_name_en, bio_ko, bio_en
-  · 그룹     : debut_date, label_ko, label_en, fandom_name_ko, fandom_name_en,
-              gender, activity_status, bio_ko, bio_en
+보강 순서:
+  1. Wikipedia 한국어 API 에서 실제 위키 텍스트를 가져옴 (최신, 정확)
+  2. Gemini 가 위키 텍스트를 파싱해 구조화된 필드로 변환
+  3. Wikipedia 페이지가 없으면 Gemini 기본 지식만 사용 (불확실 → null 반환)
 
-보강 완료 시 enriched_at 타임스탬프를 기록합니다.
-다음 실행에서는 enriched_at IS NULL인 항목만 처리합니다 (= 새로 생긴 프로필만).
-이미 값이 있는 필드는 덮어쓰지 않습니다 (보완 only).
+보강 완료 시 enriched_at 타임스탬프 기록.
+다음 실행에서는 enriched_at IS NULL 인 항목(새 프로필)만 처리.
+이미 값이 있는 필드는 덮어쓰지 않음 (보완 only).
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
@@ -23,80 +24,159 @@ logger = logging.getLogger(__name__)
 ARTIST_BATCH_SIZE = 10
 GROUP_BATCH_SIZE  = 10
 
-# ── 아티스트 프로필 프롬프트 ───────────────────────────────────────
+# ── Wikipedia 한국어 API ──────────────────────────────────────
 
-_ARTIST_PROFILE_PROMPT = """\
-You are a K-pop expert with comprehensive knowledge of K-pop idols.
-Given the following list of K-pop idol names (Korean), provide their profile information.
-Return ONLY a JSON array — no markdown, no explanation.
+def _fetch_wikipedia_extract(name_ko: str) -> str | None:
+    """
+    Wikipedia 한국어 API 에서 인물/그룹 소개글을 가져옵니다.
+    페이지가 없거나 오류 시 None 반환.
+    """
+    try:
+        params = urllib.parse.urlencode({
+            "action":      "query",
+            "titles":      name_ko,
+            "prop":        "extracts",
+            "exintro":     "1",
+            "explaintext": "1",
+            "redirects":   "1",
+            "format":      "json",
+            "utf8":        "1",
+        })
+        url = f"https://ko.wikipedia.org/w/api.php?{params}"
+        req = urllib.request.Request(url, headers={"User-Agent": "TenAsiaBot/1.0"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
 
-Idol names (Korean):
-{names_json}
+        pages = data.get("query", {}).get("pages", {})
+        for pid, page in pages.items():
+            if pid == "-1":
+                return None
+            extract = page.get("extract", "").strip()
+            return extract if len(extract) > 20 else None
+    except Exception as exc:
+        logger.debug("Wikipedia 조회 실패 | %s: %s", name_ko, exc)
+        return None
 
-Return this JSON array (one object per name, same order):
-[
-  {{
-    "name_ko": "Korean name as given",
-    "stage_name_ko": "Stage name in Korean or null",
-    "stage_name_en": "Stage name in English/romanized or null",
-    "name_en": "Full legal name in English or null",
-    "gender": "MALE" | "FEMALE" | "UNKNOWN",
-    "birth_date": "YYYY-MM-DD or null",
-    "nationality_ko": "국적 in Korean (e.g. 대한민국) or null",
-    "nationality_en": "Nationality in English (e.g. South Korean) or null",
-    "mbti": "MBTI type (e.g. ENFP) or null",
-    "blood_type": "A" | "B" | "O" | "AB" | null,
-    "height_cm": <integer cm or null>,
-    "weight_kg": <integer kg or null>,
-    "bio_ko": "1-2 sentence Korean biography or null",
-    "bio_en": "1-2 sentence English biography or null"
-  }}
-]
 
-Rules:
-- Only return verified facts you are confident about — use null for uncertain data
-- blood_type: use null if unknown, never guess
-- birth_date: use full YYYY-MM-DD format; if only year known, use YYYY-01-01
-- weight_kg: use null (often not disclosed, respect privacy)
-- If the name is not a known K-pop idol, return all fields as null except name_ko"""
+# ── Gemini 프롬프트 ──────────────────────────────────────────
 
-# ── 그룹 프로필 프롬프트 ──────────────────────────────────────────
+_ARTIST_PROMPT_WITH_WIKI = """\
+You are a K-pop data extractor. Extract structured profile information from the Wikipedia text below.
+Return ONLY a valid JSON object — no markdown, no explanation.
 
-_GROUP_PROFILE_PROMPT = """\
-You are a K-pop expert with comprehensive knowledge of K-pop groups.
-Given the following list of K-pop group names (Korean), provide their profile information.
-Return ONLY a JSON array — no markdown, no explanation.
+Artist name: {name_ko}
+Wikipedia text:
+{wiki_text}
 
-Group names (Korean):
-{names_json}
-
-Return this JSON array (one object per name, same order):
-[
-  {{
-    "name_ko": "Korean name as given",
-    "name_en": "Group name in English or null",
-    "gender": "MALE" | "FEMALE" | "MIXED" | "UNKNOWN",
-    "debut_date": "YYYY-MM-DD or null",
-    "label_ko": "소속사명 in Korean or null",
-    "label_en": "Label/agency name in English or null",
-    "fandom_name_ko": "팬덤명 in Korean or null",
-    "fandom_name_en": "Fandom name in English or null",
-    "activity_status": "ACTIVE" | "HIATUS" | "DISBANDED" | "SOLO_ONLY" | null,
-    "bio_ko": "1-2 sentence Korean biography or null",
-    "bio_en": "1-2 sentence English biography or null"
-  }}
-]
+Return this JSON object:
+{{
+  "verified_match": true or false (true = this Wikipedia article is definitely about this artist),
+  "stage_name_ko": "Stage name in Korean or null",
+  "stage_name_en": "Stage name in English/romanized or null",
+  "name_en": "Full legal name in English or null",
+  "gender": "MALE" | "FEMALE" | "UNKNOWN",
+  "birth_date": "YYYY-MM-DD or null",
+  "nationality_ko": "국적 in Korean or null",
+  "nationality_en": "Nationality in English or null",
+  "mbti": "MBTI type or null",
+  "blood_type": "A" | "B" | "O" | "AB" | null,
+  "height_cm": <integer or null>,
+  "weight_kg": <integer or null>,
+  "bio_ko": "1-2 sentence Korean biography based on the Wikipedia text, or null",
+  "bio_en": "1-2 sentence English biography based on the Wikipedia text, or null"
+}}
 
 Rules:
-- Only return verified facts you are confident about — use null for uncertain data
-- debut_date: YYYY-MM-DD format; if only year known, use YYYY-01-01
-- activity_status values:
-    ACTIVE    = currently active as a group
-    HIATUS    = temporarily on hiatus / long pause
-    DISBANDED = officially disbanded/broken up
-    SOLO_ONLY = each member active solo but group not officially disbanded
-    null      = uncertain or insufficient information
-- If the name is not a known K-pop group, return all fields as null except name_ko"""
+- If verified_match is false, set ALL other fields to null
+- Only extract facts clearly stated in the Wikipedia text — no inference
+- blood_type: null if not mentioned
+- weight_kg: null (privacy)"""
+
+_ARTIST_PROMPT_NO_WIKI = """\
+You are a K-pop expert. Provide profile information for this K-pop idol.
+Return ONLY a valid JSON object — no markdown, no explanation.
+
+Artist name (Korean): {name_ko}
+
+Return this JSON object:
+{{
+  "verified_match": true or false (true = you are confident this is a known K-pop idol),
+  "stage_name_ko": "Stage name in Korean or null",
+  "stage_name_en": "Stage name in English/romanized or null",
+  "name_en": "Full legal name in English or null",
+  "gender": "MALE" | "FEMALE" | "UNKNOWN",
+  "birth_date": "YYYY-MM-DD or null",
+  "nationality_ko": "국적 in Korean or null",
+  "nationality_en": "Nationality in English or null",
+  "mbti": "MBTI type or null",
+  "blood_type": "A" | "B" | "O" | "AB" | null,
+  "height_cm": <integer or null>,
+  "weight_kg": <integer or null>,
+  "bio_ko": "1-2 sentence Korean biography or null",
+  "bio_en": "1-2 sentence English biography or null"
+}}
+
+Rules:
+- If verified_match is false (unknown idol or uncertain), set ALL other fields to null
+- Only state facts you are highly confident about — use null for anything uncertain
+- Do NOT confuse with similarly-named idols or groups (e.g., 누에라 ≠ 뉴이스트)
+- blood_type: null if not widely known
+- weight_kg: null (privacy)"""
+
+_GROUP_PROMPT_WITH_WIKI = """\
+You are a K-pop data extractor. Extract structured profile information from the Wikipedia text below.
+Return ONLY a valid JSON object — no markdown, no explanation.
+
+Group name: {name_ko}
+Wikipedia text:
+{wiki_text}
+
+Return this JSON object:
+{{
+  "verified_match": true or false (true = this Wikipedia article is definitely about this group),
+  "name_en": "Group name in English or null",
+  "gender": "MALE" | "FEMALE" | "MIXED" | "UNKNOWN",
+  "debut_date": "YYYY-MM-DD or null",
+  "label_ko": "소속사명 in Korean or null",
+  "label_en": "Label/agency name in English or null",
+  "fandom_name_ko": "팬덤명 in Korean or null",
+  "fandom_name_en": "Fandom name in English or null",
+  "activity_status": "ACTIVE" | "HIATUS" | "DISBANDED" | "SOLO_ONLY" | null,
+  "bio_ko": "1-2 sentence Korean biography based on the Wikipedia text, or null",
+  "bio_en": "1-2 sentence English biography based on the Wikipedia text, or null"
+}}
+
+Rules:
+- If verified_match is false, set ALL other fields to null
+- Only extract facts clearly stated in the Wikipedia text — no inference
+- activity_status: infer from the text (disbanded → DISBANDED, active → ACTIVE, etc.)"""
+
+_GROUP_PROMPT_NO_WIKI = """\
+You are a K-pop expert. Provide profile information for this K-pop group.
+Return ONLY a valid JSON object — no markdown, no explanation.
+
+Group name (Korean): {name_ko}
+
+Return this JSON object:
+{{
+  "verified_match": true or false (true = you are confident this is a known K-pop group),
+  "name_en": "Group name in English or null",
+  "gender": "MALE" | "FEMALE" | "MIXED" | "UNKNOWN",
+  "debut_date": "YYYY-MM-DD or null",
+  "label_ko": "소속사명 in Korean or null",
+  "label_en": "Label/agency name in English or null",
+  "fandom_name_ko": "팬덤명 in Korean or null",
+  "fandom_name_en": "Fandom name in English or null",
+  "activity_status": "ACTIVE" | "HIATUS" | "DISBANDED" | "SOLO_ONLY" | null,
+  "bio_ko": "1-2 sentence Korean biography or null",
+  "bio_en": "1-2 sentence English biography or null"
+}}
+
+Rules:
+- If verified_match is false (unknown group or uncertain), set ALL other fields to null
+- Only state facts you are highly confident about — use null for anything uncertain
+- Do NOT confuse with similarly-named groups (e.g., 누에라 ≠ 뉴이스트)
+- activity_status: null if unsure about current status"""
 
 
 def _get_model():
@@ -116,7 +196,8 @@ def _get_model():
     )
 
 
-def _call_gemini(prompt: str) -> list[dict]:
+def _call_gemini_single(prompt: str) -> dict:
+    """단일 엔티티 보강용 Gemini 호출 — JSON 객체 반환."""
     from core.config import check_gemini_kill_switch, record_gemini_usage
     check_gemini_kill_switch()
 
@@ -133,17 +214,15 @@ def _call_gemini(prompt: str) -> list[dict]:
 
     raw = response.text.strip()
     result = json.loads(raw)
-    return result if isinstance(result, list) else [result]
+    return result if isinstance(result, dict) else {}
 
 
 # ── 아티스트 보강 ─────────────────────────────────────────────────
 
 def enrich_artists(batch_size: int = ARTIST_BATCH_SIZE) -> int:
     """
-    enriched_at IS NULL인 아티스트를 Gemini로 보강합니다.
-    보강 완료 후 enriched_at = NOW() 기록 → 다음 실행 시 스킵됩니다.
-    이미 값이 있는 필드는 덮어쓰지 않습니다.
-    보강된 아티스트 수를 반환합니다.
+    enriched_at IS NULL 인 아티스트를 Wikipedia + Gemini 로 보강합니다.
+    보강 완료 후 enriched_at = NOW() 기록.
     """
     from sqlalchemy import select
     from core.db import get_db
@@ -161,104 +240,119 @@ def enrich_artists(batch_size: int = ARTIST_BATCH_SIZE) -> int:
         artists = [{"id": a.id, "name_ko": a.name_ko} for a in rows]
 
     if not artists:
-        logger.debug("보강할 아티스트 없음 (모두 enriched_at 기록됨)")
+        logger.debug("보강할 아티스트 없음")
         return 0
 
     logger.info("아티스트 프로필 보강 시작 | %d명", len(artists))
-
-    names_json = json.dumps([a["name_ko"] for a in artists], ensure_ascii=False)
-    prompt = _ARTIST_PROFILE_PROMPT.format(names_json=names_json)
-
-    try:
-        results = _call_gemini(prompt)
-    except Exception as exc:
-        logger.exception("Gemini 호출 실패: %s", exc)
-        return 0
-
-    result_map: dict[str, dict] = {}
-    for r in results:
-        if isinstance(r, dict) and r.get("name_ko"):
-            result_map[r["name_ko"]] = r
 
     now = datetime.now(timezone.utc)
     count = 0
 
     for a_info in artists:
-        r = result_map.get(a_info["name_ko"])
+        name_ko = a_info["name_ko"]
         try:
+            # 1. Wikipedia 조회
+            wiki_text = _fetch_wikipedia_extract(name_ko)
+
+            # 2. Gemini 호출 (Wikipedia 텍스트 유무에 따라 프롬프트 분기)
+            if wiki_text:
+                prompt = _ARTIST_PROMPT_WITH_WIKI.format(
+                    name_ko=name_ko,
+                    wiki_text=wiki_text[:1200],
+                )
+                logger.debug("아티스트 Wikipedia 활용 | %s (%d자)", name_ko, len(wiki_text))
+            else:
+                prompt = _ARTIST_PROMPT_NO_WIKI.format(name_ko=name_ko)
+
+            r = _call_gemini_single(prompt)
+
+            # verified_match = false → 전체 null (이름 혼동 방지)
+            if not r.get("verified_match"):
+                logger.info("아티스트 보강 건너뜀 (미검증) | %s", name_ko)
+                _mark_enriched(Artist, a_info["id"], now)
+                continue
+
             from core.db import get_db
             with get_db() as session:
                 artist = session.get(Artist, a_info["id"])
                 if artist is None:
                     continue
 
-                changed = False
-
-                def _set(field: str, value):
-                    nonlocal changed
-                    if value and not getattr(artist, field):
-                        setattr(artist, field, value)
-                        changed = True
-
-                if r:
-                    _set("stage_name_ko",   r.get("stage_name_ko"))
-                    _set("stage_name_en",   r.get("stage_name_en"))
-                    _set("name_en",         r.get("name_en"))
-                    _set("birth_date",      r.get("birth_date"))
-                    _set("nationality_ko",  r.get("nationality_ko"))
-                    _set("nationality_en",  r.get("nationality_en"))
-                    _set("mbti",            r.get("mbti"))
-                    _set("blood_type",      r.get("blood_type"))
-                    _set("bio_ko",          r.get("bio_ko"))
-                    _set("bio_en",          r.get("bio_en"))
-
-                    if r.get("height_cm") and not artist.height_cm:
-                        try:
-                            artist.height_cm = int(r["height_cm"])
-                            changed = True
-                        except (ValueError, TypeError):
-                            pass
-                    if r.get("weight_kg") and not artist.weight_kg:
-                        try:
-                            artist.weight_kg = int(r["weight_kg"])
-                            changed = True
-                        except (ValueError, TypeError):
-                            pass
-
-                    gender_val = r.get("gender")
-                    if gender_val and not artist.gender:
-                        from database.models import ArtistGender
-                        try:
-                            artist.gender = ArtistGender(gender_val)
-                            changed = True
-                        except ValueError:
-                            pass
-
-                # 보강 완료 표시 — Gemini가 모르더라도 enriched_at 기록 (재시도 방지)
+                changed = _apply_artist_fields(artist, r)
                 artist.enriched_at = now
                 session.commit()
 
-                if changed:
-                    logger.info("아티스트 보강 ✓ | %s", artist.name_ko)
-                    count += 1
-                else:
-                    logger.debug("아티스트 보강 스킵 (Gemini 정보 없음) | %s", artist.name_ko)
+            if changed:
+                src = "Wikipedia" if wiki_text else "Gemini"
+                logger.info("아티스트 보강 ✓ [%s] | %s", src, name_ko)
+                count += 1
+            else:
+                logger.debug("아티스트 보강 변경 없음 | %s", name_ko)
 
         except Exception as exc:
-            logger.warning("아티스트 보강 저장 실패 | id=%d: %s", a_info["id"], exc)
+            logger.warning("아티스트 보강 실패 | %s: %s", name_ko, exc)
+            try:
+                _mark_enriched(Artist, a_info["id"], now)
+            except Exception:
+                pass
 
-    logger.info("아티스트 프로필 보강 완료 | 보강=%d / 대상=%d", count, len(artists))
+    logger.info("아티스트 보강 완료 | 보강=%d / 대상=%d", count, len(artists))
     return count
+
+
+def _apply_artist_fields(artist, r: dict) -> bool:
+    """아티스트 필드 적용. changed 여부 반환."""
+    changed = False
+
+    def _set(field: str, value):
+        nonlocal changed
+        if value and not getattr(artist, field):
+            setattr(artist, field, value)
+            changed = True
+
+    _set("stage_name_ko",  r.get("stage_name_ko"))
+    _set("stage_name_en",  r.get("stage_name_en"))
+    _set("name_en",        r.get("name_en"))
+    _set("birth_date",     r.get("birth_date"))
+    _set("nationality_ko", r.get("nationality_ko"))
+    _set("nationality_en", r.get("nationality_en"))
+    _set("mbti",           r.get("mbti"))
+    _set("blood_type",     r.get("blood_type"))
+    _set("bio_ko",         r.get("bio_ko"))
+    _set("bio_en",         r.get("bio_en"))
+
+    if r.get("height_cm") and not artist.height_cm:
+        try:
+            artist.height_cm = int(r["height_cm"])
+            changed = True
+        except (ValueError, TypeError):
+            pass
+
+    if r.get("weight_kg") and not artist.weight_kg:
+        try:
+            artist.weight_kg = int(r["weight_kg"])
+            changed = True
+        except (ValueError, TypeError):
+            pass
+
+    gender_val = r.get("gender")
+    if gender_val and not artist.gender:
+        from database.models import ArtistGender
+        try:
+            artist.gender = ArtistGender(gender_val)
+            changed = True
+        except ValueError:
+            pass
+
+    return changed
 
 
 # ── 그룹 보강 ─────────────────────────────────────────────────────
 
 def enrich_groups(batch_size: int = GROUP_BATCH_SIZE) -> int:
     """
-    enriched_at IS NULL인 그룹을 Gemini로 보강합니다.
-    보강 완료 후 enriched_at = NOW() 기록 → 다음 실행 시 스킵됩니다.
-    이미 값이 있는 필드는 덮어쓰지 않습니다.
-    보강된 그룹 수를 반환합니다.
+    enriched_at IS NULL 인 그룹을 Wikipedia + Gemini 로 보강합니다.
+    보강 완료 후 enriched_at = NOW() 기록.
     """
     from sqlalchemy import select
     from core.db import get_db
@@ -276,88 +370,111 @@ def enrich_groups(batch_size: int = GROUP_BATCH_SIZE) -> int:
         groups = [{"id": g.id, "name_ko": g.name_ko} for g in rows]
 
     if not groups:
-        logger.debug("보강할 그룹 없음 (모두 enriched_at 기록됨)")
+        logger.debug("보강할 그룹 없음")
         return 0
 
     logger.info("그룹 프로필 보강 시작 | %d개", len(groups))
-
-    names_json = json.dumps([g["name_ko"] for g in groups], ensure_ascii=False)
-    prompt = _GROUP_PROFILE_PROMPT.format(names_json=names_json)
-
-    try:
-        results = _call_gemini(prompt)
-    except Exception as exc:
-        logger.exception("Gemini 호출 실패: %s", exc)
-        return 0
-
-    result_map: dict[str, dict] = {}
-    for r in results:
-        if isinstance(r, dict) and r.get("name_ko"):
-            result_map[r["name_ko"]] = r
 
     now = datetime.now(timezone.utc)
     count = 0
 
     for g_info in groups:
-        r = result_map.get(g_info["name_ko"])
+        name_ko = g_info["name_ko"]
         try:
+            wiki_text = _fetch_wikipedia_extract(name_ko)
+
+            if wiki_text:
+                prompt = _GROUP_PROMPT_WITH_WIKI.format(
+                    name_ko=name_ko,
+                    wiki_text=wiki_text[:1200],
+                )
+                logger.debug("그룹 Wikipedia 활용 | %s (%d자)", name_ko, len(wiki_text))
+            else:
+                prompt = _GROUP_PROMPT_NO_WIKI.format(name_ko=name_ko)
+
+            r = _call_gemini_single(prompt)
+
+            if not r.get("verified_match"):
+                logger.info("그룹 보강 건너뜀 (미검증) | %s", name_ko)
+                _mark_enriched(Group, g_info["id"], now)
+                continue
+
             from core.db import get_db
             with get_db() as session:
                 group = session.get(Group, g_info["id"])
                 if group is None:
                     continue
 
-                changed = False
-
-                def _set(field: str, value):
-                    nonlocal changed
-                    if value and not getattr(group, field):
-                        setattr(group, field, value)
-                        changed = True
-
-                if r:
-                    _set("name_en",         r.get("name_en"))
-                    _set("debut_date",      r.get("debut_date"))
-                    _set("label_ko",        r.get("label_ko"))
-                    _set("label_en",        r.get("label_en"))
-                    _set("fandom_name_ko",  r.get("fandom_name_ko"))
-                    _set("fandom_name_en",  r.get("fandom_name_en"))
-                    _set("bio_ko",          r.get("bio_ko"))
-                    _set("bio_en",          r.get("bio_en"))
-
-                    gender_val = r.get("gender")
-                    if gender_val and not group.gender:
-                        from database.models import ArtistGender
-                        try:
-                            group.gender = ArtistGender(gender_val)
-                            changed = True
-                        except ValueError:
-                            pass
-
-                    status_val = r.get("activity_status")
-                    if status_val and group.activity_status is None:
-                        from database.models import ActivityStatus
-                        try:
-                            group.activity_status = ActivityStatus(status_val)
-                            changed = True
-                        except ValueError:
-                            pass
-
-                # 보강 완료 표시 — Gemini가 모르더라도 enriched_at 기록 (재시도 방지)
+                changed = _apply_group_fields(group, r)
                 group.enriched_at = now
                 session.commit()
 
-                if changed:
-                    logger.info("그룹 보강 ✓ | %s", group.name_ko)
-                    count += 1
-                else:
-                    logger.debug("그룹 보강 스킵 (Gemini 정보 없음) | %s", group.name_ko)
+            if changed:
+                src = "Wikipedia" if wiki_text else "Gemini"
+                logger.info("그룹 보강 ✓ [%s] | %s", src, name_ko)
+                count += 1
+            else:
+                logger.debug("그룹 보강 변경 없음 | %s", name_ko)
 
         except Exception as exc:
-            logger.warning("그룹 보강 저장 실패 | id=%d: %s", g_info["id"], exc)
+            logger.warning("그룹 보강 실패 | %s: %s", name_ko, exc)
+            try:
+                _mark_enriched(Group, g_info["id"], now)
+            except Exception:
+                pass
 
-    logger.info("그룹 프로필 보강 완료 | 보강=%d / 대상=%d", count, len(groups))
+    logger.info("그룹 보강 완료 | 보강=%d / 대상=%d", count, len(groups))
     return count
+
+
+def _apply_group_fields(group, r: dict) -> bool:
+    """그룹 필드 적용. changed 여부 반환."""
+    changed = False
+
+    def _set(field: str, value):
+        nonlocal changed
+        if value and not getattr(group, field):
+            setattr(group, field, value)
+            changed = True
+
+    _set("name_en",        r.get("name_en"))
+    _set("debut_date",     r.get("debut_date"))
+    _set("label_ko",       r.get("label_ko"))
+    _set("label_en",       r.get("label_en"))
+    _set("fandom_name_ko", r.get("fandom_name_ko"))
+    _set("fandom_name_en", r.get("fandom_name_en"))
+    _set("bio_ko",         r.get("bio_ko"))
+    _set("bio_en",         r.get("bio_en"))
+
+    gender_val = r.get("gender")
+    if gender_val and not group.gender:
+        from database.models import ArtistGender
+        try:
+            group.gender = ArtistGender(gender_val)
+            changed = True
+        except ValueError:
+            pass
+
+    status_val = r.get("activity_status")
+    if status_val and group.activity_status is None:
+        from database.models import ActivityStatus
+        try:
+            group.activity_status = ActivityStatus(status_val)
+            changed = True
+        except ValueError:
+            pass
+
+    return changed
+
+
+def _mark_enriched(model_cls, entity_id: int, now: datetime) -> None:
+    """enriched_at 만 업데이트 (보강 없이 스킵 처리)."""
+    from core.db import get_db
+    with get_db() as session:
+        obj = session.get(model_cls, entity_id)
+        if obj:
+            obj.enriched_at = now
+            session.commit()
 
 
 def enrich_all_profiles() -> dict[str, int]:

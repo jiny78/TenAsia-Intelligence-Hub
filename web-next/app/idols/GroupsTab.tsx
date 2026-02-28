@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { idolsApi, type PublicGroup } from "@/lib/api";
-import { Check, Loader2, RefreshCw } from "lucide-react";
+import { Check, Loader2, RefreshCw, RotateCcw } from "lucide-react";
 
 const STATUS_OPTIONS = [
   { value: "ACTIVE",    label: "활동 중",    color: "text-emerald-500" },
@@ -15,9 +15,10 @@ export function GroupsTab() {
   const [groups, setGroups]   = useState<PublicGroup[]>([]);
   const [loading, setLoading] = useState(true);
   const [query, setQuery]     = useState("");
-  const [saving, setSaving]   = useState<Record<number, boolean>>({});
-  const [saved, setSaved]     = useState<Record<number, boolean>>({});
-  const [errors, setErrors]   = useState<Record<number, string>>({});
+  const [saving, setSaving]       = useState<Record<number, boolean>>({});
+  const [saved, setSaved]         = useState<Record<number, boolean>>({});
+  const [errors, setErrors]       = useState<Record<number, string>>({});
+  const [resetting, setResetting] = useState<Record<number, boolean>>({});
 
   async function load() {
     setLoading(true);
@@ -48,6 +49,26 @@ export function GroupsTab() {
       setErrors((p) => ({ ...p, [groupId]: String(e) }));
     } finally {
       setSaving((p) => ({ ...p, [groupId]: false }));
+    }
+  }
+
+  async function handleResetEnrichment(groupId: number) {
+    if (!confirm("이 그룹의 보강 데이터를 초기화하시겠습니까? 다음 보강 실행 시 재보강됩니다.")) return;
+    setResetting((p) => ({ ...p, [groupId]: true }));
+    try {
+      await idolsApi.resetGroupEnrichment(groupId);
+      // Clear enricher-filled fields locally
+      setGroups((prev) =>
+        prev.map((g) =>
+          g.id === groupId
+            ? { ...g, name_en: null, debut_date: null, label_ko: null, fandom_name_ko: null }
+            : g
+        )
+      );
+    } catch (e) {
+      setErrors((p) => ({ ...p, [groupId]: String(e) }));
+    } finally {
+      setResetting((p) => ({ ...p, [groupId]: false }));
     }
   }
 
@@ -84,19 +105,20 @@ export function GroupsTab() {
               <th className="px-4 py-3 text-left">데뷔</th>
               <th className="px-4 py-3 text-left">소속사</th>
               <th className="px-4 py-3 text-left w-48">활동 상태</th>
+              <th className="px-4 py-3 text-left w-20">보강</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-border">
             {loading && (
               <tr>
-                <td colSpan={4} className="px-4 py-10 text-center">
+                <td colSpan={5} className="px-4 py-10 text-center">
                   <Loader2 className="h-5 w-5 animate-spin mx-auto text-muted-foreground" />
                 </td>
               </tr>
             )}
             {!loading && filtered.length === 0 && (
               <tr>
-                <td colSpan={4} className="px-4 py-8 text-center text-xs text-muted-foreground">
+                <td colSpan={5} className="px-4 py-8 text-center text-xs text-muted-foreground">
                   그룹 없음
                 </td>
               </tr>
@@ -134,6 +156,19 @@ export function GroupsTab() {
                       {saved[group.id]  && <Check className="h-3.5 w-3.5 text-emerald-500" />}
                       {errors[group.id] && <span className="text-[10px] text-rose-500">오류</span>}
                     </div>
+                  </td>
+                  <td className="px-4 py-3">
+                    <button
+                      onClick={() => handleResetEnrichment(group.id)}
+                      disabled={resetting[group.id]}
+                      title="보강 데이터 초기화 (재보강 대상으로 설정)"
+                      className="inline-flex items-center gap-1 rounded-md border border-border px-2 py-1 text-[10px] text-muted-foreground hover:text-rose-500 hover:border-rose-400 disabled:opacity-50 transition-colors"
+                    >
+                      {resetting[group.id]
+                        ? <Loader2 className="h-3 w-3 animate-spin" />
+                        : <RotateCcw className="h-3 w-3" />}
+                      초기화
+                    </button>
                   </td>
                 </tr>
               );

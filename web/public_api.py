@@ -818,6 +818,95 @@ def create_entity_mapping(
 
 
 # ─────────────────────────────────────────────────────────────
+# 보강 데이터 초기화 (잘못된 Gemini 보강 데이터 리셋)
+# ─────────────────────────────────────────────────────────────
+
+_ENRICHED_GROUP_FIELDS = [
+    "name_en", "debut_date", "label_ko", "label_en",
+    "fandom_name_ko", "fandom_name_en", "gender", "bio_ko", "bio_en",
+]
+_ENRICHED_ARTIST_FIELDS = [
+    "name_en", "stage_name_ko", "stage_name_en", "birth_date",
+    "nationality_ko", "nationality_en", "mbti", "blood_type",
+    "height_cm", "weight_kg", "gender", "bio_ko", "bio_en",
+]
+
+
+@public_router.post("/groups/{group_id}/reset-enrichment", status_code=200)
+def reset_group_enrichment(
+    group_id: int,
+    fields: Optional[list[str]] = Body(None, embed=True,
+        description="초기화할 필드 목록. 미입력 시 전체 초기화"),
+) -> dict:
+    """
+    그룹의 Gemini 보강 데이터를 초기화합니다.
+    enriched_at을 NULL로 리셋해 다음 보강 실행 시 재처리됩니다.
+    """
+    try:
+        from core.db import get_db
+        from database.models import Group
+
+        with get_db() as session:
+            group = session.get(Group, group_id)
+            if group is None:
+                raise HTTPException(status_code=404, detail="그룹을 찾을 수 없습니다.")
+
+            target_fields = fields if fields else _ENRICHED_GROUP_FIELDS
+            cleared = []
+            for f in target_fields:
+                if f in _ENRICHED_GROUP_FIELDS and hasattr(group, f):
+                    setattr(group, f, None)
+                    cleared.append(f)
+
+            group.enriched_at = None  # 다음 보강 실행 시 재처리
+            session.commit()
+            return {"group_id": group_id, "cleared_fields": cleared, "enriched_at_reset": True}
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("그룹 보강 초기화 실패 id=%d: %s", group_id, exc)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@public_router.post("/artists/{artist_id}/reset-enrichment", status_code=200)
+def reset_artist_enrichment(
+    artist_id: int,
+    fields: Optional[list[str]] = Body(None, embed=True,
+        description="초기화할 필드 목록. 미입력 시 전체 초기화"),
+) -> dict:
+    """
+    아티스트의 Gemini 보강 데이터를 초기화합니다.
+    enriched_at을 NULL로 리셋해 다음 보강 실행 시 재처리됩니다.
+    """
+    try:
+        from core.db import get_db
+        from database.models import Artist
+
+        with get_db() as session:
+            artist = session.get(Artist, artist_id)
+            if artist is None:
+                raise HTTPException(status_code=404, detail="아티스트를 찾을 수 없습니다.")
+
+            target_fields = fields if fields else _ENRICHED_ARTIST_FIELDS
+            cleared = []
+            for f in target_fields:
+                if f in _ENRICHED_ARTIST_FIELDS and hasattr(artist, f):
+                    setattr(artist, f, None)
+                    cleared.append(f)
+
+            artist.enriched_at = None
+            session.commit()
+            return {"artist_id": artist_id, "cleared_fields": cleared, "enriched_at_reset": True}
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("아티스트 보강 초기화 실패 id=%d: %s", artist_id, exc)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+# ─────────────────────────────────────────────────────────────
 # 프로필 보강 (Gemini 기반 자동 데이터 수집)
 # ─────────────────────────────────────────────────────────────
 
