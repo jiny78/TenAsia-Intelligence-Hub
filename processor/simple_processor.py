@@ -98,15 +98,25 @@ def _call_gemini_batch(articles: list) -> list[dict]:
 
     prompt = _BATCH_PROMPT.format(n=len(articles), articles_json=articles_json)
     model = _get_model()
+
+    _t_api = time.perf_counter()
     response = model.generate_content(prompt)
+    _t_api_ms = round((time.perf_counter() - _t_api) * 1000)
 
     usage = getattr(response, "usage_metadata", None)
     total_tokens = getattr(usage, "total_token_count", 0)
+    prompt_tokens = getattr(usage, "prompt_token_count", 0)
+    completion_tokens = getattr(usage, "candidates_token_count", 0)
     if total_tokens:
         try:
             record_gemini_usage(total_tokens)
         except Exception:
             pass
+
+    logger.info(
+        "gemini_batch_call | n=%d t_api=%dms tokens=%d (prompt=%d completion=%d)",
+        len(articles), _t_api_ms, total_tokens, prompt_tokens, completion_tokens,
+    )
 
     raw = response.text.strip()
     result = json.loads(raw)
@@ -223,6 +233,7 @@ def process_scraped_batch(batch_size: int = BATCH_SIZE) -> int:
         logger.debug("처리할 SCRAPED 기사 없음")
         return 0
 
+    _t_batch = time.perf_counter()
     logger.info("배치 AI 처리 시작 | %d개 → Gemini 1회 호출", len(ids))
 
     try:
@@ -230,8 +241,13 @@ def process_scraped_batch(batch_size: int = BATCH_SIZE) -> int:
         valid_articles = [a for a in articles if a.title_ko]
         skip_ids = [a.id for a in articles if not a.title_ko]
 
+        _t_gemini = time.perf_counter()
         results = _call_gemini_batch(valid_articles) if valid_articles else []
+        _t_gemini_ms = round((time.perf_counter() - _t_gemini) * 1000)
+
+        _t_apply = time.perf_counter()
         status = _apply_results({a.id: a for a in articles}, results)
+        _t_apply_ms = round((time.perf_counter() - _t_apply) * 1000)
 
         # title_ko 없는 기사는 PROCESSED로 직접 마킹
         if skip_ids:
@@ -246,7 +262,11 @@ def process_scraped_batch(batch_size: int = BATCH_SIZE) -> int:
                 status[aid] = True
 
         done = sum(1 for v in status.values() if v)
-        logger.info("배치 AI 처리 완료 | 성공=%d / 대상=%d", done, len(ids))
+        _t_total_ms = round((time.perf_counter() - _t_batch) * 1000)
+        logger.info(
+            "배치 AI 처리 완료 | 성공=%d/%d | t_gemini=%dms t_apply=%dms t_total=%dms",
+            done, len(ids), _t_gemini_ms, _t_apply_ms, _t_total_ms,
+        )
         return done
 
     except Exception as exc:

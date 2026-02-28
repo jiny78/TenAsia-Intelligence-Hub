@@ -12,12 +12,12 @@ scraper/throttle.py — HTTP 요청 스로틀링
     throttle = DomainThrottle()
 
     # 요청 전 대기 (자동)
-    with throttle.acquire("https://tenasia.hankyung.com/article/123"):
+    with throttle.acquire("https://www.tenasia.co.kr/article/123"):
         resp = requests.get(url)
 
     # 세션에 자동 통합 (requests.Session)
     session = throttle.make_session()
-    resp = session.get("https://tenasia.hankyung.com/article/123")
+    resp = session.get("https://www.tenasia.co.kr/article/123")
 """
 
 from __future__ import annotations
@@ -42,8 +42,8 @@ logger = structlog.get_logger(__name__)
 
 # 도메인 → (최소 간격 초, 최대 RPM)
 _DOMAIN_RULES: dict[str, tuple[float, int]] = {
-    "tenasia.co.kr":        (1.0,  30),   # www.tenasia.co.kr (2026-02 이전)
-    "tenasia.hankyung.com": (1.0,  30),   # 구 도메인 (리다이렉트됨, 호환 유지)
+    "tenasia.co.kr":        (1.0,  30),   # www.tenasia.co.kr (현행 도메인)
+    "tenasia.hankyung.com": (1.0,  30),   # 구 도메인 (리다이렉트됨, DB 내 구 URL 호환 유지)
     "naver.com":            (0.5,  60),
     "entertain.naver.com":  (0.5,  60),
     "news.naver.com":       (0.5,  60),
@@ -177,7 +177,7 @@ class DomainThrottle:
 
         Usage:
             session = throttle.make_session()
-            resp = session.get("https://tenasia.hankyung.com/article/123")
+            resp = session.get("https://www.tenasia.co.kr/article/123")
         """
         return ThrottledSession(throttle=self, user_agent=user_agent, timeout=timeout)
 
@@ -276,7 +276,7 @@ def get_session(user_agent: Optional[str] = None) -> ThrottledSession:
 
     Usage:
         session = get_session()
-        html = session.get("https://tenasia.hankyung.com/...").text
+        html = session.get("https://www.tenasia.co.kr/...").text
     """
     kwargs = {}
     if user_agent:

@@ -46,7 +46,7 @@ RSS / 최신 감지:
 
 공개 클래스:
     BaseScraper      — 공통 Throttle·Backoff·배치 로직 (abstract)
-    TenAsiaScraper   — tenasia.hankyung.com 특화 파서
+    TenAsiaScraper   — www.tenasia.co.kr 특화 파서
 
 공개 예외:
     ScraperError     — 기본 스크래퍼 예외
@@ -713,6 +713,7 @@ class BaseScraper(abc.ABC):
             self.log.info("[DRY RUN] DB 커밋 없이 스크래핑·파싱만 수행합니다.")
 
         for idx, url in enumerate(to_scrape, start=1):
+            _t_article = time.perf_counter()
             self.log.info(
                 "batch_item",
                 current=idx,
@@ -722,11 +723,15 @@ class BaseScraper(abc.ABC):
 
             try:
                 # 1. HTTP 요청 (Throttle + Human Delay + Backoff 포함)
+                _t0 = time.perf_counter()
                 resp = self._fetch(url)
+                _t_fetch_ms = round((time.perf_counter() - _t0) * 1000)
 
                 # 2. HTML 파싱 — raw soup 을 _parse_article 에 전달
+                _t0 = time.perf_counter()
                 soup = BeautifulSoup(resp.text, "html.parser")
                 data = self._parse_article(url, soup)
+                _t_parse_ms = round((time.perf_counter() - _t0) * 1000)
 
                 # 3. 날짜 범위 필터 ──────────────────────────────
                 if _after or _before:
@@ -770,13 +775,21 @@ class BaseScraper(abc.ABC):
                         title=str(data.get("title_ko", ""))[:50],
                         content_len=len(data.get("content_ko") or ""),
                         published_at=str(data.get("published_at") or ""),
+                        t_fetch_ms=_t_fetch_ms,
+                        t_parse_ms=_t_parse_ms,
                     )
                 else:
                     # 5. DB 즉시 커밋 (UPSERT)
+                    _t0 = time.perf_counter()
                     article_id = upsert_article(url, data, job_id=job_id)
+                    _t_save_ms = round((time.perf_counter() - _t0) * 1000)
 
                     # 6. 후처리 훅 (이미지 저장 등 — 서브클래스에서 구현)
+                    _t0 = time.perf_counter()
                     self._on_article_saved(article_id, data)
+                    _t_hook_ms = round((time.perf_counter() - _t0) * 1000)
+
+                    _t_total_ms = round((time.perf_counter() - _t_article) * 1000)
 
                     result.success.append({
                         "url":        url,
@@ -789,6 +802,11 @@ class BaseScraper(abc.ABC):
                         article_id=article_id,
                         title=str(data.get("title_ko", ""))[:50],
                         content_len=len(data.get("content_ko") or ""),
+                        t_fetch_ms=_t_fetch_ms,
+                        t_parse_ms=_t_parse_ms,
+                        t_save_ms=_t_save_ms,
+                        t_hook_ms=_t_hook_ms,
+                        t_total_ms=_t_total_ms,
                     )
 
             except ForbiddenError as exc:
@@ -840,7 +858,7 @@ class BaseScraper(abc.ABC):
 
 class TenAsiaScraper(BaseScraper):
     """
-    tenasia.hankyung.com 특화 파서.
+    www.tenasia.co.kr 특화 파서.
 
     추출 전략 (우선순위 순):
         1. JSON-LD (application/ld+json) — 가장 신뢰도 높음
@@ -1552,6 +1570,7 @@ class TenAsiaScraper(BaseScraper):
 
         날짜 범위가 있으면:
           1. 범위 내 각 날짜의 사이트맵(/sitemap/YYYY/MM/DD)에서 URL 수집
+             - max_pages 는 최소 날짜 범위 일수만큼 자동 확장됨 (예: 28일 범위 → max_pages=28)
           2. RSS 로 추가 보완 (최신 기사 누락 방지)
         날짜 범위가 없으면 (scrape_rss 등):
           1. RSS 만 사용 (빠른 경로)
@@ -1568,8 +1587,11 @@ class TenAsiaScraper(BaseScraper):
         if _start:
             cur = _start.date() if hasattr(_start, "date") else _start
             end_d = (_end.date() if hasattr(_end, "date") else _end) if _end else cur
+            # 날짜 범위 일수를 자동 계산하여 max_pages 확장 (예: 28일 범위면 28)
+            day_span = (end_d - cur).days + 1
+            effective_max = max(max_pages, day_span)
             day_count = 0
-            while cur <= end_d and day_count < max_pages:
+            while cur <= end_d and day_count < effective_max:
                 sitemap_entries = self._fetch_sitemap_by_date(
                     datetime(cur.year, cur.month, cur.day)
                 )
