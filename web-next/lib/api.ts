@@ -219,4 +219,13 @@ export const idolsApi = {
       method: "POST",
       body: JSON.stringify({ confidence_score: 1.0, ...body }),
     }),
+
+  enrichProfiles: (target: "all" | "artists" | "groups" = "all", batchSize = 10) =>
+    request<{ enriched_artists: number; enriched_groups: number; total: number }>(
+      `/public/enrich-profiles`,
+      {
+        method: "POST",
+        body: JSON.stringify({ target, batch_size: batchSize }),
+      }
+    ),
 };

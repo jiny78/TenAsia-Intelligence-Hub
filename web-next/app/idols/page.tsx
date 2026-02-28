@@ -3,10 +3,12 @@
 import { useState } from "react";
 import { GroupsTab } from "./GroupsTab";
 import { MappingsTab } from "./MappingsTab";
+import { EnrichPanel } from "./EnrichPanel";
 
 const TABS = [
   { id: "groups",   label: "그룹 상태 관리" },
   { id: "mappings", label: "기사-아이돌 매핑" },
+  { id: "enrich",   label: "프로필 보강" },
 ] as const;
 
 type TabId = (typeof TABS)[number]["id"];
@@ -42,6 +44,7 @@ export default function IdolsPage() {
 
       {tab === "groups"   && <GroupsTab />}
       {tab === "mappings" && <MappingsTab />}
+      {tab === "enrich"   && <EnrichPanel />}
     </div>
   );
 }
