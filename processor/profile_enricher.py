@@ -7,6 +7,8 @@ Gemini 의 K-pop 지식을 활용해 DB에 비어있는 프로필 필드를 채�
   · 그룹     : debut_date, label_ko, label_en, fandom_name_ko, fandom_name_en,
               gender, activity_status, bio_ko, bio_en
 
+보강 완료 시 enriched_at 타임스탬프를 기록합니다.
+다음 실행에서는 enriched_at IS NULL인 항목만 처리합니다 (= 새로 생긴 프로필만).
 이미 값이 있는 필드는 덮어쓰지 않습니다 (보완 only).
 """
 
@@ -14,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -137,11 +140,12 @@ def _call_gemini(prompt: str) -> list[dict]:
 
 def enrich_artists(batch_size: int = ARTIST_BATCH_SIZE) -> int:
     """
-    bio_ko 또는 birth_date 가 NULL인 아티스트를 Gemini로 보강합니다.
+    enriched_at IS NULL인 아티스트를 Gemini로 보강합니다.
+    보강 완료 후 enriched_at = NOW() 기록 → 다음 실행 시 스킵됩니다.
     이미 값이 있는 필드는 덮어쓰지 않습니다.
     보강된 아티스트 수를 반환합니다.
     """
-    from sqlalchemy import or_, select
+    from sqlalchemy import select
     from core.db import get_db
     from database.models import Artist
 
@@ -149,20 +153,15 @@ def enrich_artists(batch_size: int = ARTIST_BATCH_SIZE) -> int:
         rows = list(
             session.scalars(
                 select(Artist)
-                .where(
-                    or_(Artist.bio_ko.is_(None), Artist.birth_date.is_(None))
-                )
+                .where(Artist.enriched_at.is_(None))
                 .order_by(Artist.global_priority.desc().nullslast(), Artist.id)
                 .limit(batch_size)
             )
         )
-        artists = [
-            {"id": a.id, "name_ko": a.name_ko}
-            for a in rows
-        ]
+        artists = [{"id": a.id, "name_ko": a.name_ko} for a in rows]
 
     if not artists:
-        logger.debug("보강할 아티스트 없음")
+        logger.debug("보강할 아티스트 없음 (모두 enriched_at 기록됨)")
         return 0
 
     logger.info("아티스트 프로필 보강 시작 | %d명", len(artists))
@@ -176,18 +175,16 @@ def enrich_artists(batch_size: int = ARTIST_BATCH_SIZE) -> int:
         logger.exception("Gemini 호출 실패: %s", exc)
         return 0
 
-    # name_ko → result 매핑
     result_map: dict[str, dict] = {}
     for r in results:
         if isinstance(r, dict) and r.get("name_ko"):
             result_map[r["name_ko"]] = r
 
+    now = datetime.now(timezone.utc)
     count = 0
+
     for a_info in artists:
         r = result_map.get(a_info["name_ko"])
-        if not r:
-            continue
-
         try:
             from core.db import get_db
             with get_db() as session:
@@ -203,45 +200,49 @@ def enrich_artists(batch_size: int = ARTIST_BATCH_SIZE) -> int:
                         setattr(artist, field, value)
                         changed = True
 
-                _set("stage_name_ko",   r.get("stage_name_ko"))
-                _set("stage_name_en",   r.get("stage_name_en"))
-                _set("name_en",         r.get("name_en"))
-                _set("birth_date",      r.get("birth_date"))
-                _set("nationality_ko",  r.get("nationality_ko"))
-                _set("nationality_en",  r.get("nationality_en"))
-                _set("mbti",            r.get("mbti"))
-                _set("blood_type",      r.get("blood_type"))
-                _set("bio_ko",          r.get("bio_ko"))
-                _set("bio_en",          r.get("bio_en"))
+                if r:
+                    _set("stage_name_ko",   r.get("stage_name_ko"))
+                    _set("stage_name_en",   r.get("stage_name_en"))
+                    _set("name_en",         r.get("name_en"))
+                    _set("birth_date",      r.get("birth_date"))
+                    _set("nationality_ko",  r.get("nationality_ko"))
+                    _set("nationality_en",  r.get("nationality_en"))
+                    _set("mbti",            r.get("mbti"))
+                    _set("blood_type",      r.get("blood_type"))
+                    _set("bio_ko",          r.get("bio_ko"))
+                    _set("bio_en",          r.get("bio_en"))
 
-                # 숫자 필드
-                if r.get("height_cm") and not artist.height_cm:
-                    try:
-                        artist.height_cm = int(r["height_cm"])
-                        changed = True
-                    except (ValueError, TypeError):
-                        pass
-                if r.get("weight_kg") and not artist.weight_kg:
-                    try:
-                        artist.weight_kg = int(r["weight_kg"])
-                        changed = True
-                    except (ValueError, TypeError):
-                        pass
+                    if r.get("height_cm") and not artist.height_cm:
+                        try:
+                            artist.height_cm = int(r["height_cm"])
+                            changed = True
+                        except (ValueError, TypeError):
+                            pass
+                    if r.get("weight_kg") and not artist.weight_kg:
+                        try:
+                            artist.weight_kg = int(r["weight_kg"])
+                            changed = True
+                        except (ValueError, TypeError):
+                            pass
 
-                # gender
-                gender_val = r.get("gender")
-                if gender_val and not artist.gender:
-                    from database.models import ArtistGender
-                    try:
-                        artist.gender = ArtistGender(gender_val)
-                        changed = True
-                    except ValueError:
-                        pass
+                    gender_val = r.get("gender")
+                    if gender_val and not artist.gender:
+                        from database.models import ArtistGender
+                        try:
+                            artist.gender = ArtistGender(gender_val)
+                            changed = True
+                        except ValueError:
+                            pass
+
+                # 보강 완료 표시 — Gemini가 모르더라도 enriched_at 기록 (재시도 방지)
+                artist.enriched_at = now
+                session.commit()
 
                 if changed:
-                    session.commit()
                     logger.info("아티스트 보강 ✓ | %s", artist.name_ko)
                     count += 1
+                else:
+                    logger.debug("아티스트 보강 스킵 (Gemini 정보 없음) | %s", artist.name_ko)
 
         except Exception as exc:
             logger.warning("아티스트 보강 저장 실패 | id=%d: %s", a_info["id"], exc)
@@ -254,11 +255,12 @@ def enrich_artists(batch_size: int = ARTIST_BATCH_SIZE) -> int:
 
 def enrich_groups(batch_size: int = GROUP_BATCH_SIZE) -> int:
     """
-    bio_ko, debut_date, activity_status 중 하나라도 NULL인 그룹을 Gemini로 보강합니다.
+    enriched_at IS NULL인 그룹을 Gemini로 보강합니다.
+    보강 완료 후 enriched_at = NOW() 기록 → 다음 실행 시 스킵됩니다.
     이미 값이 있는 필드는 덮어쓰지 않습니다.
     보강된 그룹 수를 반환합니다.
     """
-    from sqlalchemy import or_, select
+    from sqlalchemy import select
     from core.db import get_db
     from database.models import Group
 
@@ -266,13 +268,7 @@ def enrich_groups(batch_size: int = GROUP_BATCH_SIZE) -> int:
         rows = list(
             session.scalars(
                 select(Group)
-                .where(
-                    or_(
-                        Group.bio_ko.is_(None),
-                        Group.debut_date.is_(None),
-                        Group.activity_status.is_(None),
-                    )
-                )
+                .where(Group.enriched_at.is_(None))
                 .order_by(Group.global_priority.desc().nullslast(), Group.id)
                 .limit(batch_size)
             )
@@ -280,7 +276,7 @@ def enrich_groups(batch_size: int = GROUP_BATCH_SIZE) -> int:
         groups = [{"id": g.id, "name_ko": g.name_ko} for g in rows]
 
     if not groups:
-        logger.debug("보강할 그룹 없음")
+        logger.debug("보강할 그룹 없음 (모두 enriched_at 기록됨)")
         return 0
 
     logger.info("그룹 프로필 보강 시작 | %d개", len(groups))
@@ -299,12 +295,11 @@ def enrich_groups(batch_size: int = GROUP_BATCH_SIZE) -> int:
         if isinstance(r, dict) and r.get("name_ko"):
             result_map[r["name_ko"]] = r
 
+    now = datetime.now(timezone.utc)
     count = 0
+
     for g_info in groups:
         r = result_map.get(g_info["name_ko"])
-        if not r:
-            continue
-
         try:
             from core.db import get_db
             with get_db() as session:
@@ -320,39 +315,43 @@ def enrich_groups(batch_size: int = GROUP_BATCH_SIZE) -> int:
                         setattr(group, field, value)
                         changed = True
 
-                _set("name_en",         r.get("name_en"))
-                _set("debut_date",      r.get("debut_date"))
-                _set("label_ko",        r.get("label_ko"))
-                _set("label_en",        r.get("label_en"))
-                _set("fandom_name_ko",  r.get("fandom_name_ko"))
-                _set("fandom_name_en",  r.get("fandom_name_en"))
-                _set("bio_ko",          r.get("bio_ko"))
-                _set("bio_en",          r.get("bio_en"))
+                if r:
+                    _set("name_en",         r.get("name_en"))
+                    _set("debut_date",      r.get("debut_date"))
+                    _set("label_ko",        r.get("label_ko"))
+                    _set("label_en",        r.get("label_en"))
+                    _set("fandom_name_ko",  r.get("fandom_name_ko"))
+                    _set("fandom_name_en",  r.get("fandom_name_en"))
+                    _set("bio_ko",          r.get("bio_ko"))
+                    _set("bio_en",          r.get("bio_en"))
 
-                # gender
-                gender_val = r.get("gender")
-                if gender_val and not group.gender:
-                    from database.models import ArtistGender
-                    try:
-                        group.gender = ArtistGender(gender_val)
-                        changed = True
-                    except ValueError:
-                        pass
+                    gender_val = r.get("gender")
+                    if gender_val and not group.gender:
+                        from database.models import ArtistGender
+                        try:
+                            group.gender = ArtistGender(gender_val)
+                            changed = True
+                        except ValueError:
+                            pass
 
-                # activity_status — NULL인 경우에만 설정
-                status_val = r.get("activity_status")
-                if status_val and group.activity_status is None:
-                    from database.models import ActivityStatus
-                    try:
-                        group.activity_status = ActivityStatus(status_val)
-                        changed = True
-                    except ValueError:
-                        pass
+                    status_val = r.get("activity_status")
+                    if status_val and group.activity_status is None:
+                        from database.models import ActivityStatus
+                        try:
+                            group.activity_status = ActivityStatus(status_val)
+                            changed = True
+                        except ValueError:
+                            pass
+
+                # 보강 완료 표시 — Gemini가 모르더라도 enriched_at 기록 (재시도 방지)
+                group.enriched_at = now
+                session.commit()
 
                 if changed:
-                    session.commit()
                     logger.info("그룹 보강 ✓ | %s", group.name_ko)
                     count += 1
+                else:
+                    logger.debug("그룹 보강 스킵 (Gemini 정보 없음) | %s", group.name_ko)
 
         except Exception as exc:
             logger.warning("그룹 보강 저장 실패 | id=%d: %s", g_info["id"], exc)

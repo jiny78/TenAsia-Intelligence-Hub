@@ -381,6 +381,12 @@ class Artist(Base):
         ),
     )
 
+    # ── Gemini 보강 추적 ────────────────────────────────────────
+    enriched_at: Mapped[Optional[datetime]] = mapped_column(
+        TIMESTAMPTZ, nullable=True,
+        comment="Gemini 프로필 보강 완료 시각. NULL=미보강(보강 대상), NOT NULL=보강 완료(스킵)",
+    )
+
     # ── 시간 ──────────────────────────────────────────────────
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, nullable=False, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, nullable=False, server_default=func.now())
@@ -527,6 +533,12 @@ class Group(Base):
             "[Phase 2-D] 이 그룹 데이터의 누적 신뢰도 점수 (0.0~1.0). "
             "높을수록 여러 고신뢰도 기사에서 검증된 데이터."
         ),
+    )
+
+    # ── Gemini 보강 추적 ────────────────────────────────────────
+    enriched_at: Mapped[Optional[datetime]] = mapped_column(
+        TIMESTAMPTZ, nullable=True,
+        comment="Gemini 프로필 보강 완료 시각. NULL=미보강(보강 대상), NOT NULL=보강 완료(스킵)",
     )
 
     # ── 시간 ──────────────────────────────────────────────────
