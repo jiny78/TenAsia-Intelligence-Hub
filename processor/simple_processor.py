@@ -402,12 +402,17 @@ def process_all_with_retry() -> int:
     """
     reset_error_to_scraped()
     n = process_all_scraped()
-    # 번역 완료 후 엔티티 추출 (실패해도 번역 결과는 유지)
+    # 번역 완료 후 엔티티 추출 전체 실행 (실패해도 번역 결과는 유지)
     try:
-        entity_count, new_entity_article_ids = process_entity_extraction()
+        all_new_entity_article_ids: list[int] = []
+        while True:
+            entity_count, new_entity_article_ids = process_entity_extraction()
+            all_new_entity_article_ids.extend(new_entity_article_ids)
+            if entity_count == 0:
+                break
         # 신규 엔티티 발견 → 본문 짧은 기사 전체 스크래핑 예약 (하이브리드)
-        if new_entity_article_ids:
-            queue_fullscrape_for_new_entities(new_entity_article_ids)
+        if all_new_entity_article_ids:
+            queue_fullscrape_for_new_entities(all_new_entity_article_ids)
     except Exception as exc:
         logger.warning("엔티티 추출 실패 (번역 결과는 정상): %s", exc)
     return n
