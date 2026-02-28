@@ -59,7 +59,7 @@ def _article_detail(a: Any) -> dict:
     return d
 
 
-def _artist_dict(a: Any) -> dict:
+def _artist_dict(a: Any, photo_url: Optional[str] = None) -> dict:
     """아티스트 공개 프로필 딕셔너리 (내부 FK 제외)."""
     return {
         "id":               a.id,
@@ -79,10 +79,11 @@ def _artist_dict(a: Any) -> dict:
         "bio_en":           a.bio_en,
         "is_verified":      a.is_verified,
         "global_priority":  a.global_priority,
+        "photo_url":        photo_url,
     }
 
 
-def _group_dict(g: Any) -> dict:
+def _group_dict(g: Any, photo_url: Optional[str] = None) -> dict:
     """그룹 공개 프로필 딕셔너리."""
     return {
         "id":                g.id,
@@ -99,6 +100,7 @@ def _group_dict(g: Any) -> dict:
         "bio_en":            g.bio_en,
         "is_verified":       g.is_verified,
         "global_priority":   g.global_priority,
+        "photo_url":         photo_url,
     }
 
 
@@ -226,7 +228,27 @@ def list_artists(
                 stmt = stmt.where(Artist.global_priority == global_priority)
 
             rows = session.execute(stmt.limit(limit).offset(offset)).scalars().all()
-            return [_artist_dict(a) for a in rows]
+
+            # 아티스트별 최신 기사 썸네일을 photo_url 로 사용
+            photo_map: dict[int, str] = {}
+            artist_ids = [a.id for a in rows]
+            if artist_ids:
+                from database.models import EntityMapping, Article
+                photo_rows = session.execute(
+                    select(EntityMapping.artist_id, Article.thumbnail_url)
+                    .join(Article, Article.id == EntityMapping.article_id)
+                    .where(
+                        EntityMapping.artist_id.in_(artist_ids),
+                        EntityMapping.artist_id.isnot(None),
+                        Article.thumbnail_url.isnot(None),
+                    )
+                    .order_by(EntityMapping.artist_id, Article.published_at.desc())
+                ).all()
+                for aid, url in photo_rows:
+                    if aid not in photo_map:
+                        photo_map[aid] = url
+
+            return [_artist_dict(a, photo_url=photo_map.get(a.id)) for a in rows]
 
     except Exception as exc:
         logger.exception("공개 아티스트 목록 조회 실패: %s", exc)
@@ -246,7 +268,22 @@ def get_artist(artist_id: int) -> dict:
             if artist is None:
                 raise HTTPException(status_code=404, detail="아티스트를 찾을 수 없습니다.")
 
-            result = _artist_dict(artist)
+            # 최신 기사 썸네일을 photo_url 로
+            photo_url: Optional[str] = None
+            from database.models import EntityMapping, Article
+            photo_row = session.execute(
+                select(Article.thumbnail_url)
+                .join(EntityMapping, EntityMapping.article_id == Article.id)
+                .where(
+                    EntityMapping.artist_id == artist_id,
+                    Article.thumbnail_url.isnot(None),
+                )
+                .order_by(Article.published_at.desc())
+                .limit(1)
+            ).scalar_one_or_none()
+            photo_url = photo_row
+
+            result = _artist_dict(artist, photo_url=photo_url)
 
             # 소속 그룹 목록
             mo_rows = (
@@ -343,7 +380,27 @@ def list_groups(
                 )
 
             rows = session.execute(stmt.limit(limit).offset(offset)).scalars().all()
-            return [_group_dict(g) for g in rows]
+
+            # 그룹별 최신 기사 썸네일을 photo_url 로 사용
+            group_photo_map: dict[int, str] = {}
+            group_ids = [g.id for g in rows]
+            if group_ids:
+                from database.models import EntityMapping, Article
+                gphoto_rows = session.execute(
+                    select(EntityMapping.group_id, Article.thumbnail_url)
+                    .join(Article, Article.id == EntityMapping.article_id)
+                    .where(
+                        EntityMapping.group_id.in_(group_ids),
+                        EntityMapping.group_id.isnot(None),
+                        Article.thumbnail_url.isnot(None),
+                    )
+                    .order_by(EntityMapping.group_id, Article.published_at.desc())
+                ).all()
+                for gid, url in gphoto_rows:
+                    if gid not in group_photo_map:
+                        group_photo_map[gid] = url
+
+            return [_group_dict(g, photo_url=group_photo_map.get(g.id)) for g in rows]
 
     except Exception as exc:
         logger.exception("공개 그룹 목록 조회 실패: %s", exc)
@@ -364,7 +421,20 @@ def get_group(group_id: int) -> dict:
             if group is None:
                 raise HTTPException(status_code=404, detail="그룹을 찾을 수 없습니다.")
 
-            result = _group_dict(group)
+            # 최신 기사 썸네일을 photo_url 로
+            from database.models import EntityMapping, Article
+            gphoto_row = session.execute(
+                select(Article.thumbnail_url)
+                .join(EntityMapping, EntityMapping.article_id == Article.id)
+                .where(
+                    EntityMapping.group_id == group_id,
+                    Article.thumbnail_url.isnot(None),
+                )
+                .order_by(Article.published_at.desc())
+                .limit(1)
+            ).scalar_one_or_none()
+
+            result = _group_dict(group, photo_url=gphoto_row)
 
             # 멤버 목록 (Artist joinedload)
             mo_rows = (
@@ -482,11 +552,36 @@ def search(
             )
             groups = session.execute(group_stmt).scalars().all()
 
+            # 검색 결과에도 photo_url 포함
+            from database.models import EntityMapping, Article as ArticleModel
+            s_artist_ids = [a.id for a in artists]
+            s_group_ids  = [g.id for g in groups]
+            s_artist_photo: dict[int, str] = {}
+            s_group_photo:  dict[int, str] = {}
+            if s_artist_ids:
+                for aid, url in session.execute(
+                    select(EntityMapping.artist_id, ArticleModel.thumbnail_url)
+                    .join(ArticleModel, ArticleModel.id == EntityMapping.article_id)
+                    .where(EntityMapping.artist_id.in_(s_artist_ids), ArticleModel.thumbnail_url.isnot(None))
+                    .order_by(EntityMapping.artist_id, ArticleModel.published_at.desc())
+                ).all():
+                    if aid not in s_artist_photo:
+                        s_artist_photo[aid] = url
+            if s_group_ids:
+                for gid, url in session.execute(
+                    select(EntityMapping.group_id, ArticleModel.thumbnail_url)
+                    .join(ArticleModel, ArticleModel.id == EntityMapping.article_id)
+                    .where(EntityMapping.group_id.in_(s_group_ids), ArticleModel.thumbnail_url.isnot(None))
+                    .order_by(EntityMapping.group_id, ArticleModel.published_at.desc())
+                ).all():
+                    if gid not in s_group_photo:
+                        s_group_photo[gid] = url
+
             return {
                 "query":    q,
                 "articles": [_article_summary(a) for a in articles],
-                "artists":  [_artist_dict(a) for a in artists],
-                "groups":   [_group_dict(g) for g in groups],
+                "artists":  [_artist_dict(a, photo_url=s_artist_photo.get(a.id)) for a in artists],
+                "groups":   [_group_dict(g, photo_url=s_group_photo.get(g.id)) for g in groups],
             }
 
     except Exception as exc:
