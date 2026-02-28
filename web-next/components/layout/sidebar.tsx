@@ -1,12 +1,13 @@
 "use client";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { LayoutDashboard, Radio, BookOpen, ClipboardCheck, Zap, Bot } from "lucide-react";
+import { LayoutDashboard, Radio, BookOpen, ClipboardCheck, Zap, Bot, Star } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 const NAV = [
   { href: "/dashboard",     icon: LayoutDashboard, label: "Dashboard" },
   { href: "/scraper",       icon: Radio,           label: "Scraper" },
+  { href: "/idols",         icon: Star,            label: "Idols" },
   { href: "/glossary",      icon: BookOpen,        label: "Glossary" },
   { href: "/manual-review", icon: ClipboardCheck,  label: "Manual Review" },
   { href: "/automation",    icon: Bot,             label: "Automation" },

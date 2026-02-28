@@ -154,3 +154,69 @@ export const automationApi = {
       { method: "PATCH", body: JSON.stringify(body) },
     ),
 };
+
+// ── Idols (공개 API /public/*) ─────────────────────────────────
+export interface PublicGroup {
+  id: number;
+  name_ko: string;
+  name_en: string | null;
+  activity_status: string | null;
+  debut_date: string | null;
+  label_ko: string | null;
+  fandom_name_ko: string | null;
+  is_verified: boolean;
+  photo_url: string | null;
+}
+
+export interface PublicArtist {
+  id: number;
+  name_ko: string;
+  name_en: string | null;
+  stage_name_ko: string | null;
+  is_verified: boolean;
+  photo_url: string | null;
+}
+
+export interface EntityMappingItem {
+  id: number;
+  article_id: number;
+  article_title_ko: string | null;
+  article_url: string | null;
+  entity_type: string | null;
+  artist_id: number | null;
+  artist_name_ko: string | null;
+  group_id: number | null;
+  group_name_ko: string | null;
+  confidence_score: number | null;
+}
+
+export const idolsApi = {
+  listGroups: (q?: string) =>
+    request<PublicGroup[]>(`/public/groups${q ? `?q=${encodeURIComponent(q)}&limit=200` : "?limit=200"}`),
+
+  updateGroup: (id: number, body: { activity_status?: string; bio_ko?: string; bio_en?: string }) =>
+    request<PublicGroup>(`/public/groups/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    }),
+
+  listArtists: (q?: string) =>
+    request<PublicArtist[]>(`/public/artists${q ? `?q=${encodeURIComponent(q)}&limit=200` : "?limit=200"}`),
+
+  listMappings: (params?: { artist_id?: number; group_id?: number; article_id?: number }) => {
+    const q = new URLSearchParams({ limit: "100" });
+    if (params?.artist_id  !== undefined) q.set("artist_id",  String(params.artist_id));
+    if (params?.group_id   !== undefined) q.set("group_id",   String(params.group_id));
+    if (params?.article_id !== undefined) q.set("article_id", String(params.article_id));
+    return request<EntityMappingItem[]>(`/public/entity-mappings?${q}`);
+  },
+
+  deleteMapping: (id: number) =>
+    request<{ deleted: number }>(`/public/entity-mappings/${id}`, { method: "DELETE" }),
+
+  createMapping: (body: { article_id: number; artist_id?: number; group_id?: number }) =>
+    request<{ created: number }>(`/public/entity-mappings`, {
+      method: "POST",
+      body: JSON.stringify({ confidence_score: 1.0, ...body }),
+    }),
+};
