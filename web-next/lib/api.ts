@@ -228,4 +228,16 @@ export const idolsApi = {
         body: JSON.stringify({ target, batch_size: batchSize }),
       }
     ),
+
+  resetGroupEnrichment: (groupId: number) =>
+    request<{ group_id: number; cleared_fields: string[]; enriched_at_reset: boolean }>(
+      `/public/groups/${groupId}/reset-enrichment`,
+      { method: "POST", body: JSON.stringify({}) }
+    ),
+
+  resetArtistEnrichment: (artistId: number) =>
+    request<{ artist_id: number; cleared_fields: string[]; enriched_at_reset: boolean }>(
+      `/public/artists/${artistId}/reset-enrichment`,
+      { method: "POST", body: JSON.stringify({}) }
+    ),
 };
