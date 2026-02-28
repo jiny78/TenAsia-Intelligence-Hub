@@ -996,6 +996,12 @@ class Article(Base):
     # ── 미디어 ────────────────────────────────────────────────
     thumbnail_url: Mapped[Optional[str]] = mapped_column(Text)
 
+    # ── 감성 분류 ─────────────────────────────────────────────
+    sentiment: Mapped[Optional[str]] = mapped_column(
+        String(10), nullable=True,
+        comment="Gemini AI 감성 분류: POSITIVE/NEGATIVE/NEUTRAL/NULL(미처리)",
+    )
+
     # ── FK ────────────────────────────────────────────────────
     job_id: Mapped[Optional[int]] = mapped_column(
         Integer, ForeignKey("job_queue.id", ondelete="SET NULL"),

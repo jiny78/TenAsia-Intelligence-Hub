@@ -982,6 +982,17 @@ def trigger_entity_extraction(batch_size: int = 10) -> dict[str, Any]:
     return {"processed": count, "message": f"{count}개 기사 엔티티 추출 완료 (batch={batch_size})"}
 
 
+@app.post("/admin/extract-sentiment", status_code=200)
+def trigger_sentiment_extraction(batch_size: int = 20) -> dict[str, Any]:
+    """
+    sentiment가 NULL인 PROCESSED 기사 한 배치에서 감성(긍정/부정/중립)을 분류합니다.
+    신규 기사는 번역 시 자동 분류되며, 이 엔드포인트는 기존 기사 소급 처리용입니다.
+    """
+    from processor.simple_processor import process_sentiment_batch
+    count = process_sentiment_batch(batch_size=batch_size)
+    return {"processed": count, "message": f"{count}개 기사 감성 분류 완료 (batch={batch_size})"}
+
+
 @app.post("/admin/reset-stuck-jobs", status_code=200)
 def reset_stuck_jobs(minutes: int = 20) -> dict[str, Any]:
     """running 상태로 minutes분 이상 멈춰있는 잡을 pending으로 리셋합니다."""
