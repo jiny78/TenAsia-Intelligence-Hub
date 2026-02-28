@@ -25,6 +25,8 @@ logger = logging.getLogger(__name__)
 BATCH_SIZE = 20        # 번역 1회 Gemini 호출당 처리 기사 수
 ENTITY_BATCH_SIZE = 10  # 엔티티 추출 1회 Gemini 호출당 처리 기사 수
 MIN_CONTENT_LEN = 300  # RSS 본문 최소 길이 (이보다 짧으면 전체 페이지 스크래핑 대상)
+THUMBNAIL_BACKFILL_DAYS = 20   # 썸네일 백필 대상: 최근 N일치 기사
+THUMBNAIL_BACKFILL_BATCH = 30  # 썸네일 백필 1회 처리 기사 수
 
 # 배치 프롬프트: N개 기사를 JSON 배열로 일괄 반환
 _BATCH_PROMPT = """\
@@ -862,3 +864,119 @@ def process_sentiment_batch(batch_size: int = SENTIMENT_BATCH_SIZE) -> int:
     except Exception as exc:
         logger.exception("감성 분류 Gemini 호출 실패: %s", exc)
         return 0
+
+
+# ─────────────────────────────────────────────────────────────
+# 썸네일 백필 (최근 N일치 기사 원문 페이지 fetch → og:image 추출)
+# ─────────────────────────────────────────────────────────────
+
+def backfill_thumbnails_batch(
+    limit: int = THUMBNAIL_BACKFILL_BATCH,
+    days: int = THUMBNAIL_BACKFILL_DAYS,
+) -> int:
+    """
+    최근 days일치 기사 중 thumbnail_url이 없는 PROCESSED 기사의 원문 페이지를
+    직접 fetch하여 og:image / twitter:image를 추출하고 articles.thumbnail_url을 업데이트합니다.
+
+    RSS 수집 시 enclosure 이미지가 없었던 기사를 사후 보완합니다.
+
+    Returns:
+        업데이트된 기사 수
+    """
+    import requests as _requests
+    from bs4 import BeautifulSoup
+    from datetime import datetime, timedelta, timezone
+    from sqlalchemy import select
+
+    from core.db import get_db
+    from database.models import Article, ProcessStatus
+
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+
+    with get_db() as session:
+        rows = list(
+            session.scalars(
+                select(Article)
+                .where(Article.process_status == ProcessStatus.PROCESSED)
+                .where(Article.thumbnail_url.is_(None))
+                .where(Article.published_at >= since)
+                .where(Article.source_url.isnot(None))
+                .order_by(Article.published_at.desc().nullslast())
+                .limit(limit)
+            )
+        )
+        article_data = [{"id": a.id, "source_url": a.source_url} for a in rows]
+
+    if not article_data:
+        logger.debug("썸네일 백필할 기사 없음 (최근 %d일)", days)
+        return 0
+
+    logger.info(
+        "썸네일 백필 시작 | %d개 기사 (최근 %d일 thumbnail_url=NULL)",
+        len(article_data), days,
+    )
+
+    sess = _requests.Session()
+    sess.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    })
+
+    updated = 0
+    for art in article_data:
+        article_id = art["id"]
+        url = art["source_url"]
+        try:
+            resp = sess.get(url, timeout=15, allow_redirects=True)
+            if resp.status_code != 200:
+                logger.debug(
+                    "썸네일 fetch 실패 | id=%d status=%d", article_id, resp.status_code
+                )
+                time.sleep(0.5)
+                continue
+
+            soup = BeautifulSoup(resp.text, "html.parser")
+
+            # og:image / twitter:image 우선 순위로 추출
+            thumb: str | None = None
+            for meta in soup.find_all("meta"):
+                prop = meta.get("property") or meta.get("name") or ""
+                if prop in ("og:image", "twitter:image"):
+                    thumb = (meta.get("content") or "").strip() or None
+                    if thumb:
+                        break
+
+            if not thumb:
+                logger.debug("og:image 없음 | id=%d url=%s", article_id, url)
+                time.sleep(0.5)
+                continue
+
+            with get_db() as session:
+                art_obj = session.get(Article, article_id)
+                if art_obj and art_obj.thumbnail_url is None:
+                    art_obj.thumbnail_url = thumb
+                    session.commit()
+                    updated += 1
+                    logger.info(
+                        "썸네일 백필 완료 | id=%d thumb=%.80s", article_id, thumb
+                    )
+
+            time.sleep(0.5)  # 서버 부하 방지
+
+        except Exception as exc:
+            logger.warning(
+                "썸네일 백필 실패 | id=%d url=%s: %s", article_id, url, exc
+            )
+            time.sleep(0.5)
+
+    if updated:
+        logger.info(
+            "썸네일 백필 배치 완료 | 업데이트=%d / 대상=%d (최근 %d일)",
+            updated, len(article_data), days,
+        )
+    return updated

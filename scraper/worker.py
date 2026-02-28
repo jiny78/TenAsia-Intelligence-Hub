@@ -224,6 +224,15 @@ def _do_process_scraped() -> None:
         logger.warning("AI 후처리 실패 (스크래핑 결과는 정상 저장됨) | %s: %s", type(exc).__name__, exc)
 
 
+def _do_backfill_thumbnails() -> None:
+    """최근 20일치 기사 중 thumbnail_url이 없는 기사를 사후 fetch해 og:image를 보완합니다."""
+    try:
+        from processor.simple_processor import backfill_thumbnails_batch
+        backfill_thumbnails_batch()
+    except Exception as exc:
+        logger.warning("썸네일 백필 실패 (무시): %s", exc)
+
+
 def process_job(job: dict) -> None:
     """
     단일 작업을 처리하고 결과를 DB에 기록합니다.
@@ -335,8 +344,9 @@ def run_loop() -> None:
         job = get_pending_job(worker_id)
 
         if job is None:
-            # 스크래핑 잡이 없으면 SCRAPED 기사 AI 처리 시도
+            # 스크래핑 잡이 없으면 SCRAPED 기사 AI 처리 후 썸네일 백필 시도
             _do_process_scraped()
+            _do_backfill_thumbnails()
             logger.debug("대기 중… (큐 비어있음)")
             time.sleep(POLL_INTERVAL)
             continue
