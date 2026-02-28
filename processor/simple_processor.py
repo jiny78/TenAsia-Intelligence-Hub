@@ -27,7 +27,7 @@ ENTITY_BATCH_SIZE = 10  # 엔티티 추출 1회 Gemini 호출당 처리 기사 �
 
 # 배치 프롬프트: N개 기사를 JSON 배열로 일괄 반환
 _BATCH_PROMPT = """\
-You are a K-pop news translator. Process the following {n} Korean articles.
+You are a K-pop news translator and sentiment analyzer. Process the following {n} Korean articles.
 Return ONLY a JSON array — no markdown, no explanation.
 
 Articles:
@@ -40,9 +40,14 @@ Return this JSON array (one object per article):
     "title_en": "English translation of the Korean title",
     "summary_ko": "2-sentence Korean summary",
     "summary_en": "2-sentence English summary",
-    "hashtags_en": ["tag1", "tag2", "tag3"]
+    "hashtags_en": ["tag1", "tag2", "tag3"],
+    "sentiment": "POSITIVE" | "NEGATIVE" | "NEUTRAL"
   }}
-]"""
+]
+Sentiment rules:
+- POSITIVE: award wins, chart success, comeback, milestone, fan events, collaboration, praise
+- NEGATIVE: controversy, scandal, criticism, member departure, conflict, health crisis, allegations
+- NEUTRAL: general news, interviews, schedules, announcements, no strong positive/negative tone"""
 
 _model = None
 
@@ -142,6 +147,10 @@ def _apply_results(article_map: dict, results: list) -> dict[int, bool]:
                     tags = r.get("hashtags_en") or []
                     if isinstance(tags, list):
                         art.hashtags_en = [str(t).lstrip("#").strip() for t in tags if t]
+                # 감성 분류 저장 (POSITIVE/NEGATIVE/NEUTRAL)
+                sentiment = r.get("sentiment")
+                if sentiment in ("POSITIVE", "NEGATIVE", "NEUTRAL"):
+                    art.sentiment = sentiment
                 art.process_status = ProcessStatus.PROCESSED
                 session.commit()
                 logger.info("✓ id=%-6d %s", art.id, (art.title_ko or "")[:50])
@@ -593,3 +602,107 @@ def process_all_entity_extraction() -> int:
     if total:
         logger.info("전체 엔티티 추출 완료 | 총=%d", total)
     return total
+
+
+# ─────────────────────────────────────────────────────────────
+# 감성 분류 (기존 PROCESSED 기사 소급 처리)
+# ─────────────────────────────────────────────────────────────
+
+_SENTIMENT_PROMPT = """\
+You are a K-pop news sentiment analyzer. Classify each article as POSITIVE, NEGATIVE, or NEUTRAL.
+Return ONLY a JSON array — no markdown, no explanation.
+
+Articles:
+{articles_json}
+
+Return this JSON array:
+[
+  {{
+    "id": <article id>,
+    "sentiment": "POSITIVE" | "NEGATIVE" | "NEUTRAL"
+  }}
+]
+Rules:
+- POSITIVE: award wins, chart success, comeback, milestone, fan events, collaboration, praise
+- NEGATIVE: controversy, scandal, criticism, member departure, conflict, health crisis, allegations
+- NEUTRAL: general news, interviews, schedules, announcements, no strong positive/negative tone"""
+
+SENTIMENT_BATCH_SIZE = 20
+
+
+def process_sentiment_batch(batch_size: int = SENTIMENT_BATCH_SIZE) -> int:
+    """
+    sentiment가 NULL인 PROCESSED 기사를 Gemini 1회 호출로 감성 분류합니다.
+    완료된 기사 수를 반환합니다.
+    """
+    from sqlalchemy import select
+
+    from core.config import check_gemini_kill_switch, record_gemini_usage
+    from core.db import get_db
+    from database.models import Article, ProcessStatus
+
+    with get_db() as session:
+        rows = list(
+            session.scalars(
+                select(Article)
+                .where(Article.process_status == ProcessStatus.PROCESSED)
+                .where(Article.sentiment.is_(None))
+                .where(Article.title_ko.isnot(None))
+                .order_by(Article.published_at.desc().nullslast())
+                .limit(batch_size)
+            )
+        )
+        article_data = [
+            {"id": a.id, "title": a.title_ko or "", "content": (a.content_ko or "")[:300]}
+            for a in rows
+        ]
+
+    if not article_data:
+        logger.debug("감성 분류할 기사 없음")
+        return 0
+
+    logger.info("감성 분류 시작 | %d개 기사 → Gemini 1회 호출", len(article_data))
+
+    try:
+        check_gemini_kill_switch()
+
+        articles_json = json.dumps(article_data, ensure_ascii=False)
+        prompt = _SENTIMENT_PROMPT.format(articles_json=articles_json)
+        model = _get_model()
+        response = model.generate_content(prompt)
+
+        usage = getattr(response, "usage_metadata", None)
+        total_tokens = getattr(usage, "total_token_count", 0)
+        if total_tokens:
+            try:
+                record_gemini_usage(total_tokens)
+            except Exception:
+                pass
+
+        results = json.loads(response.text.strip())
+        if isinstance(results, dict):
+            results = [results]
+
+        count = 0
+        for r in results:
+            article_id = r.get("id")
+            sentiment = r.get("sentiment")
+            if not article_id or sentiment not in ("POSITIVE", "NEGATIVE", "NEUTRAL"):
+                continue
+            try:
+                from core.db import get_db
+                with get_db() as session:
+                    art = session.get(Article, article_id)
+                    if art and art.sentiment is None:
+                        art.sentiment = sentiment
+                        session.commit()
+                        count += 1
+            except Exception as exc:
+                logger.warning("감성 저장 실패 | id=%d: %s", article_id, exc)
+
+        logger.info("감성 분류 완료 | 처리=%d / 대상=%d", count, len(article_data))
+        return count
+
+    except Exception as exc:
+        logger.exception("감성 분류 Gemini 호출 실패: %s", exc)
+        return 0

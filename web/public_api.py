@@ -49,6 +49,7 @@ def _article_summary(a: Any) -> dict:
         "thumbnail_url":   a.thumbnail_url,
         "source_url":      a.source_url,
         "language":        a.language,
+        "sentiment":       a.sentiment,
     }
 
 
@@ -229,24 +230,44 @@ def list_artists(
 
             rows = session.execute(stmt.limit(limit).offset(offset)).scalars().all()
 
-            # 아티스트별 최신 기사 썸네일을 photo_url 로 사용
+            # 아티스트별 photo_url: 해당 아티스트가 주인공인 기사 우선, 없으면 관련 기사
             photo_map: dict[int, str] = {}
             artist_ids = [a.id for a in rows]
             if artist_ids:
-                from database.models import EntityMapping, Article
-                photo_rows = session.execute(
+                from database.models import Article, EntityMapping
+                # 1순위: article.artist_name_ko = artist.name_ko (이 아티스트가 주인공)
+                primary_rows = session.execute(
                     select(EntityMapping.artist_id, Article.thumbnail_url)
                     .join(Article, Article.id == EntityMapping.article_id)
+                    .join(Artist, Artist.id == EntityMapping.artist_id)
                     .where(
                         EntityMapping.artist_id.in_(artist_ids),
                         EntityMapping.artist_id.isnot(None),
                         Article.thumbnail_url.isnot(None),
+                        Article.artist_name_ko == Artist.name_ko,
                     )
                     .order_by(EntityMapping.artist_id, Article.published_at.desc())
                 ).all()
-                for aid, url in photo_rows:
+                for aid, url in primary_rows:
                     if aid not in photo_map:
                         photo_map[aid] = url
+
+                # 2순위: 관련 기사 아무거나 (fallback)
+                missing_ids = [aid for aid in artist_ids if aid not in photo_map]
+                if missing_ids:
+                    fallback_rows = session.execute(
+                        select(EntityMapping.artist_id, Article.thumbnail_url)
+                        .join(Article, Article.id == EntityMapping.article_id)
+                        .where(
+                            EntityMapping.artist_id.in_(missing_ids),
+                            EntityMapping.artist_id.isnot(None),
+                            Article.thumbnail_url.isnot(None),
+                        )
+                        .order_by(EntityMapping.artist_id, Article.published_at.desc())
+                    ).all()
+                    for aid, url in fallback_rows:
+                        if aid not in photo_map:
+                            photo_map[aid] = url
 
             return [_artist_dict(a, photo_url=photo_map.get(a.id)) for a in rows]
 
@@ -268,20 +289,30 @@ def get_artist(artist_id: int) -> dict:
             if artist is None:
                 raise HTTPException(status_code=404, detail="아티스트를 찾을 수 없습니다.")
 
-            # 최신 기사 썸네일을 photo_url 로
-            photo_url: Optional[str] = None
-            from database.models import EntityMapping, Article
-            photo_row = session.execute(
+            # photo_url: 아티스트 이름이 주인공인 기사 우선, fallback은 관련 기사
+            from database.models import Article, EntityMapping
+            photo_url: Optional[str] = session.execute(
                 select(Article.thumbnail_url)
                 .join(EntityMapping, EntityMapping.article_id == Article.id)
                 .where(
                     EntityMapping.artist_id == artist_id,
                     Article.thumbnail_url.isnot(None),
+                    Article.artist_name_ko == artist.name_ko,
                 )
                 .order_by(Article.published_at.desc())
                 .limit(1)
             ).scalar_one_or_none()
-            photo_url = photo_row
+            if not photo_url:
+                photo_url = session.execute(
+                    select(Article.thumbnail_url)
+                    .join(EntityMapping, EntityMapping.article_id == Article.id)
+                    .where(
+                        EntityMapping.artist_id == artist_id,
+                        Article.thumbnail_url.isnot(None),
+                    )
+                    .order_by(Article.published_at.desc())
+                    .limit(1)
+                ).scalar_one_or_none()
 
             result = _artist_dict(artist, photo_url=photo_url)
 
