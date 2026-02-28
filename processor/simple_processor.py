@@ -1104,3 +1104,70 @@ def backfill_artist_photos(limit: int = 100) -> tuple[int, int]:
             artist_updated, group_updated,
         )
     return artist_updated, group_updated
+
+
+# ─────────────────────────────────────────────────────────────
+# 아티스트 gender 백필 (그룹 소속 기반 추론)
+# ─────────────────────────────────────────────────────────────
+
+def backfill_artist_gender() -> int:
+    """
+    gender=NULL 또는 UNKNOWN인 아티스트에 대해
+    소속 그룹의 gender로 성별을 추론하여 업데이트합니다.
+
+    - 소속 그룹이 모두 MALE → MALE
+    - 소속 그룹이 모두 FEMALE → FEMALE
+    - 혼재하거나 그룹 gender도 NULL → 변경 안 함
+
+    Returns:
+        updated: 업데이트된 아티스트 수
+    """
+    from sqlalchemy import select
+
+    from core.db import get_db
+    from database.models import Artist, ArtistGender, Group, MemberOf
+
+    updated = 0
+
+    with get_db() as session:
+        # gender가 NULL 또는 UNKNOWN인 아티스트 목록
+        artists = list(
+            session.scalars(
+                select(Artist).where(
+                    (Artist.gender.is_(None)) | (Artist.gender == ArtistGender.UNKNOWN)
+                )
+            )
+        )
+
+        for artist in artists:
+            # 소속 그룹 조회
+            memberships = list(
+                session.scalars(
+                    select(MemberOf).where(MemberOf.artist_id == artist.id)
+                )
+            )
+            if not memberships:
+                continue
+
+            # 소속 그룹들의 gender 수집
+            group_genders: set[ArtistGender] = set()
+            for mo in memberships:
+                group = session.get(Group, mo.group_id)
+                if group and group.gender and group.gender != ArtistGender.UNKNOWN:
+                    group_genders.add(group.gender)
+
+            if len(group_genders) == 1:
+                inferred = next(iter(group_genders))
+                if inferred in (ArtistGender.MALE, ArtistGender.FEMALE):
+                    artist.gender = inferred
+                    updated += 1
+                    logger.info(
+                        "아티스트 gender 추론 | id=%d name=%s → %s",
+                        artist.id, artist.name_ko, inferred.value,
+                    )
+
+        if updated:
+            session.commit()
+
+    logger.info("아티스트 gender 백필 완료 | 업데이트=%d", updated)
+    return updated

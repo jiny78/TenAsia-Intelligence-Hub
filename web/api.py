@@ -1107,6 +1107,25 @@ def trigger_artist_photo_backfill(limit: int = 100) -> dict[str, Any]:
     return {"message": f"아티스트/그룹 photo_url 백필 시작 (배치={limit})", "status": "accepted"}
 
 
+@app.post("/admin/backfill-artist-gender", status_code=202)
+def trigger_artist_gender_backfill() -> dict[str, Any]:
+    """
+    gender=NULL 또는 UNKNOWN인 아티스트를 소속 그룹 gender로 추론하여 업데이트합니다.
+    백그라운드 스레드에서 실행됩니다.
+    """
+    def _run() -> None:
+        try:
+            from processor.simple_processor import backfill_artist_gender
+            updated = backfill_artist_gender()
+            logger.info("아티스트 gender 전체 백필 완료 | 업데이트=%d", updated)
+        except Exception as exc:
+            logger.exception("아티스트 gender 백필 오류: %s", exc)
+
+    t = _threading.Thread(target=_run, daemon=True)
+    t.start()
+    return {"message": "아티스트 gender 백필 시작 (그룹 소속 기반 추론)", "status": "accepted"}
+
+
 @app.post("/admin/backfill-thumbnails", status_code=202)
 def trigger_thumbnail_backfill(limit: int = 30, days: int = 20) -> dict[str, Any]:
     """
