@@ -1,15 +1,15 @@
 "use client";
 
-import { useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { idolsApi } from "@/lib/api";
-import { Sparkles, Loader2, Users, User } from "lucide-react";
+import { Sparkles, Loader2, Users, User, RotateCcw, AlertTriangle } from "lucide-react";
 
 type Target = "all" | "artists" | "groups";
 
 const TARGET_OPTIONS: { id: Target; label: string; desc: string }[] = [
-  { id: "all",     label: "전체",         desc: "아티스트 + 그룹 모두 보강" },
-  { id: "artists", label: "아티스트만",   desc: "솔로 아티스트 프로필만" },
-  { id: "groups",  label: "그룹만",       desc: "그룹/밴드 프로필만" },
+  { id: "all",     label: "전체",       desc: "아티스트 + 그룹 모두 보강" },
+  { id: "artists", label: "아티스트만", desc: "솔로 아티스트 프로필만" },
+  { id: "groups",  label: "그룹만",     desc: "그룹/밴드 프로필만" },
 ];
 
 interface EnrichResult {
@@ -19,6 +19,7 @@ interface EnrichResult {
 }
 
 export function EnrichPanel() {
+  // ── 배치 보강 ──────────────────────────────────────────────
   const [target,    setTarget]    = useState<Target>("all");
   const [batchSize, setBatchSize] = useState(10);
   const [loading,   setLoading]   = useState(false);
@@ -39,17 +40,161 @@ export function EnrichPanel() {
     }
   }
 
+  // ── 전체 재보강 ────────────────────────────────────────────
+  const [resetLoading,  setResetLoading]  = useState(false);
+  const [resetResult,   setResetResult]   = useState<{ reset_groups: number; reset_artists: number } | null>(null);
+  const [enrichAllMsg,  setEnrichAllMsg]  = useState("");
+  const [enrichAllErr,  setEnrichAllErr]  = useState("");
+  const [bgRunning,     setBgRunning]     = useState(false);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // 폴링: 백그라운드 보강 상태 확인
+  const pollStatus = useCallback(async () => {
+    try {
+      const s = await idolsApi.enrichStatus();
+      setBgRunning(s.running);
+      if (!s.running && pollRef.current) {
+        clearInterval(pollRef.current);
+        pollRef.current = null;
+        setEnrichAllMsg("전체 보강 완료!");
+      }
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  useEffect(() => {
+    // 마운트 시 현재 실행 상태 확인
+    idolsApi.enrichStatus().then((s) => {
+      setBgRunning(s.running);
+      if (s.running) {
+        setEnrichAllMsg("백그라운드에서 전체 보강 진행 중...");
+        pollRef.current = setInterval(pollStatus, 4000);
+      }
+    }).catch(() => {});
+    return () => {
+      if (pollRef.current) clearInterval(pollRef.current);
+    };
+  }, [pollStatus]);
+
+  async function handleResetAll() {
+    if (!confirm(
+      "⚠️ 전체 보강 데이터 초기화\n\n모든 아티스트/그룹의 이름(영문), 데뷔일, 소속사, 팬덤명, 성별, 활동상태, 소개글이 삭제됩니다.\n\n계속하시겠습니까?"
+    )) return;
+    setResetLoading(true);
+    setResetResult(null);
+    setEnrichAllErr("");
+    try {
+      const res = await idolsApi.resetAllEnrichment();
+      setResetResult(res);
+    } catch (e) {
+      setEnrichAllErr(`초기화 오류: ${e}`);
+    } finally {
+      setResetLoading(false);
+    }
+  }
+
+  async function handleEnrichAll() {
+    setEnrichAllErr("");
+    setEnrichAllMsg("");
+    setBgRunning(true);
+    try {
+      const res = await idolsApi.enrichAll();
+      setEnrichAllMsg(res.message ?? "전체 보강 시작됨");
+      // 폴링 시작
+      if (pollRef.current) clearInterval(pollRef.current);
+      pollRef.current = setInterval(pollStatus, 4000);
+    } catch (e: unknown) {
+      setBgRunning(false);
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg.includes("409")) {
+        setEnrichAllMsg("이미 전체 보강 작업이 실행 중입니다.");
+        pollRef.current = setInterval(pollStatus, 4000);
+      } else {
+        setEnrichAllErr(`보강 시작 오류: ${e}`);
+      }
+    }
+  }
+
   return (
     <div className="space-y-5">
+
+      {/* ── 전체 재보강 (맨 위) ── */}
+      <div className="rounded-xl border border-amber-500/30 bg-amber-500/5 p-5 space-y-4">
+        <div>
+          <h2 className="font-semibold text-sm flex items-center gap-1.5">
+            <RotateCcw className="h-4 w-4 text-amber-400" />
+            전체 재보강
+          </h2>
+          <p className="mt-1 text-xs text-muted-foreground leading-relaxed">
+            기존 보강 데이터를 전부 초기화하고 Wikipedia + Gemini로 다시 채웁니다.
+            초기화 후 <strong>전체 보강 실행</strong>을 눌러 백그라운드에서 처리합니다.
+          </p>
+        </div>
+
+        <div className="flex flex-wrap gap-3">
+          {/* 1단계: 전체 초기화 */}
+          <button
+            onClick={handleResetAll}
+            disabled={resetLoading || bgRunning}
+            className="inline-flex items-center gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-2 text-xs font-semibold text-amber-400 hover:bg-amber-500/20 disabled:opacity-50 transition-colors"
+          >
+            {resetLoading
+              ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              : <AlertTriangle className="h-3.5 w-3.5" />}
+            ① 전체 초기화
+          </button>
+
+          {/* 2단계: 백그라운드 보강 실행 */}
+          <button
+            onClick={handleEnrichAll}
+            disabled={bgRunning}
+            className="inline-flex items-center gap-2 rounded-lg bg-primary px-4 py-2 text-xs font-semibold text-primary-foreground hover:bg-primary/90 disabled:opacity-50 transition-colors"
+          >
+            {bgRunning
+              ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              : <Sparkles className="h-3.5 w-3.5" />}
+            ② 전체 보강 실행
+          </button>
+        </div>
+
+        {/* 초기화 결과 */}
+        {resetResult && (
+          <div className="rounded-lg bg-muted/50 border border-border p-3 text-xs text-muted-foreground">
+            초기화 완료 — 그룹 <span className="font-bold text-foreground">{resetResult.reset_groups}개</span>
+            {" "}· 아티스트 <span className="font-bold text-foreground">{resetResult.reset_artists}명</span>
+            <span className="ml-2 text-emerald-400">→ 이제 ② 전체 보강 실행을 누르세요</span>
+          </div>
+        )}
+
+        {/* 보강 진행 상태 */}
+        {enrichAllMsg && (
+          <div className={`rounded-lg border p-3 text-xs font-medium ${
+            enrichAllMsg.includes("완료")
+              ? "bg-emerald-500/10 border-emerald-500/20 text-emerald-400"
+              : "bg-primary/10 border-primary/20 text-primary"
+          }`}>
+            {bgRunning && <Loader2 className="inline h-3 w-3 animate-spin mr-1.5" />}
+            {enrichAllMsg}
+          </div>
+        )}
+
+        {enrichAllErr && (
+          <p className="text-xs text-rose-500 rounded-lg bg-rose-500/10 border border-rose-500/20 p-3">
+            {enrichAllErr}
+          </p>
+        )}
+      </div>
+
+      {/* ── 배치 보강 (기존) ── */}
       <div className="rounded-xl border border-border bg-card p-5 space-y-5">
         <div>
           <h2 className="font-semibold text-sm flex items-center gap-1.5">
             <Sparkles className="h-4 w-4 text-yellow-400" />
-            Gemini 프로필 자동 보강
+            Gemini 프로필 자동 보강 (배치)
           </h2>
           <p className="mt-1 text-xs text-muted-foreground leading-relaxed">
-            비어있는 프로필 필드(생년월일, 국적, MBTI, 소속사, 데뷔일 등)를
-            Gemini의 K-pop 지식으로 자동으로 채웁니다.
+            미보강 항목 중 일부를 지금 즉시 보강합니다.
             이미 값이 있는 필드는 덮어쓰지 않습니다.
           </p>
         </div>
@@ -78,7 +223,7 @@ export function EnrichPanel() {
         {/* Batch size */}
         <div className="space-y-1.5">
           <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
-            한 번에 처리할 수 (배치 크기)
+            배치 크기
           </p>
           <div className="flex items-center gap-3">
             <input
@@ -90,13 +235,9 @@ export function EnrichPanel() {
               className="w-40 accent-primary"
             />
             <span className="text-sm font-mono font-semibold w-6">{batchSize}</span>
-            <span className="text-[10px] text-muted-foreground">
-              (크게 할수록 1회 Gemini 호출로 더 많이 처리)
-            </span>
           </div>
         </div>
 
-        {/* 실행 버튼 */}
         <button
           onClick={handleEnrich}
           disabled={loading}
@@ -108,7 +249,6 @@ export function EnrichPanel() {
           {loading ? "Gemini로 보강 중..." : "프로필 보강 실행"}
         </button>
 
-        {/* 결과 */}
         {result && (
           <div className="rounded-lg bg-emerald-500/10 border border-emerald-500/20 p-4 space-y-2">
             <p className="text-sm font-semibold text-emerald-400">보강 완료</p>
@@ -124,7 +264,7 @@ export function EnrichPanel() {
             </div>
             {result.total === 0 && (
               <p className="text-xs text-muted-foreground">
-                보강할 항목이 없습니다 (이미 모두 채워져 있거나 Gemini가 해당 이름을 모름).
+                보강할 항목이 없습니다 (이미 모두 채워져 있거나 새 항목 없음).
               </p>
             )}
           </div>

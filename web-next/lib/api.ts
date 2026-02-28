@@ -240,4 +240,19 @@ export const idolsApi = {
       `/public/artists/${artistId}/reset-enrichment`,
       { method: "POST", body: JSON.stringify({}) }
     ),
+
+  resetAllEnrichment: () =>
+    request<{ reset_groups: number; reset_artists: number; message: string }>(
+      `/admin/reset-all-enrichment`,
+      { method: "POST", body: JSON.stringify({}) },
+    ),
+
+  enrichAll: () =>
+    request<{ status: string; message: string }>(
+      `/admin/enrich-all`,
+      { method: "POST", body: JSON.stringify({}) },
+    ),
+
+  enrichStatus: () =>
+    request<{ running: boolean }>(`/admin/enrich-status`),
 };
