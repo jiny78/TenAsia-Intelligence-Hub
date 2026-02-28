@@ -2,8 +2,10 @@
 processor/profile_enricher.py — Wikipedia + Gemini 기반 아티스트/그룹 프로필 자동 보강
 
 보강 순서:
-  1. Wikipedia 한국어 API 에서 실제 위키 텍스트를 가져옴 (최신, 정확)
-  2. Gemini 가 위키 텍스트를 파싱해 구조화된 필드로 변환
+  1. Wikipedia 한국어 API 에서 인트로 텍스트(소개글) + 위키텍스트(인포박스) 를 가져옴
+     - exintro=1 extract: 소개글(bio) 용 깔끔한 텍스트
+     - revisions wikitext: 인포박스(데뷔일·소속사·팬덤명 등 구조화 데이터) 포함 원문
+  2. Gemini 가 결합 텍스트를 파싱해 구조화된 필드로 변환
   3. Wikipedia 페이지가 없으면 Gemini 기본 지식만 사용 (불확실 → null 반환)
 
 보강 완료 시 enriched_at 타임스탬프 기록.
@@ -26,15 +28,15 @@ GROUP_BATCH_SIZE  = 10
 
 # ── Wikipedia 한국어 API ──────────────────────────────────────
 
-def _fetch_wikipedia_extract(name_ko: str) -> str | None:
+def _fetch_wikipedia_extract(name: str) -> str | None:
     """
-    Wikipedia 한국어 API 에서 인물/그룹 소개글을 가져옵니다.
+    Wikipedia 한국어 API 에서 인물/그룹 소개글(인트로 단락)을 가져옵니다.
     페이지가 없거나 오류 시 None 반환.
     """
     try:
         params = urllib.parse.urlencode({
             "action":      "query",
-            "titles":      name_ko,
+            "titles":      name,
             "prop":        "extracts",
             "exintro":     "1",
             "explaintext": "1",
@@ -54,18 +56,69 @@ def _fetch_wikipedia_extract(name_ko: str) -> str | None:
             extract = page.get("extract", "").strip()
             return extract if len(extract) > 20 else None
     except Exception as exc:
-        logger.debug("Wikipedia 조회 실패 | %s: %s", name_ko, exc)
+        logger.debug("Wikipedia 인트로 조회 실패 | %s: %s", name, exc)
         return None
+
+
+def _fetch_wikipedia_wikitext(name: str) -> str | None:
+    """
+    Wikipedia 한국어 위키텍스트 원문(인포박스 포함)을 가져옵니다.
+    인포박스에서 데뷔일·소속사·팬덤명 등 구조화된 데이터를 추출하기 위해 사용.
+    페이지가 없거나 오류 시 None 반환.
+    """
+    try:
+        params = urllib.parse.urlencode({
+            "action":    "query",
+            "titles":    name,
+            "prop":      "revisions",
+            "rvprop":    "content",
+            "rvslots":   "main",
+            "redirects": "1",
+            "format":    "json",
+            "utf8":      "1",
+        })
+        url = f"https://ko.wikipedia.org/w/api.php?{params}"
+        req = urllib.request.Request(url, headers={"User-Agent": "TenAsiaBot/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+
+        pages = data.get("query", {}).get("pages", {})
+        for pid, page in pages.items():
+            if pid == "-1":
+                return None
+            revisions = page.get("revisions", [])
+            if not revisions:
+                return None
+            content = revisions[0].get("slots", {}).get("main", {}).get("*", "").strip()
+            return content if len(content) > 50 else None
+    except Exception as exc:
+        logger.debug("Wikipedia 위키텍스트 조회 실패 | %s: %s", name, exc)
+        return None
+
+
+def _build_wiki_content(extract: str | None, wikitext: str | None) -> str | None:
+    """
+    인트로 extract + 위키텍스트를 결합해 Gemini 에 전달할 Wikipedia 내용을 생성합니다.
+    - extract: 소개글(bio)에 활용
+    - wikitext: 인포박스 파싱(데뷔일·소속사·팬덤명 등)에 활용
+    """
+    parts: list[str] = []
+    if extract:
+        parts.append(extract[:1500])
+    if wikitext:
+        parts.append(f"\n\n[위키텍스트 원문 — 인포박스 포함]\n{wikitext[:4500]}")
+    return "".join(parts) if parts else None
 
 
 # ── Gemini 프롬프트 ──────────────────────────────────────────
 
 _ARTIST_PROMPT_WITH_WIKI = """\
-You are a K-pop data extractor. Extract structured profile information from the Wikipedia text below.
+You are a K-pop data extractor. Extract structured profile information from the Wikipedia content below.
+The content may include Korean Wikipedia markup (wikitext) with infobox templates — parse these for structured fields.
 Return ONLY a valid JSON object — no markdown, no explanation.
 
 Artist name: {name_ko}
-Wikipedia text:
+Wikipedia content:
 {wiki_text}
 
 Return this JSON object:
@@ -124,11 +177,12 @@ Rules:
 - weight_kg: null (privacy)"""
 
 _GROUP_PROMPT_WITH_WIKI = """\
-You are a K-pop data extractor. Extract structured profile information from the Wikipedia text below.
+You are a K-pop data extractor. Extract structured profile information from the Wikipedia content below.
+The content may include Korean Wikipedia markup (wikitext) with infobox templates — parse these for structured fields like debut date, label, and fandom name.
 Return ONLY a valid JSON object — no markdown, no explanation.
 
 Group name: {name_ko}
-Wikipedia text:
+Wikipedia content:
 {wiki_text}
 
 Return this JSON object:
@@ -252,19 +306,27 @@ def enrich_artists(batch_size: int = ARTIST_BATCH_SIZE, overwrite_bio: bool = Fa
     for a_info in artists:
         name_ko = a_info["name_ko"]
         try:
-            # 1. Wikipedia 조회 (stage_name_ko 우선, 없으면 name_ko)
+            # 1. Wikipedia 조회: stage_name_ko 우선 → name_ko 폴백
+            #    extract(소개글) + wikitext(인포박스) 모두 가져와서 결합
             stage_name = a_info.get("stage_name_ko")
-            wiki_text = None
+            lookup_names = []
             if stage_name and stage_name != name_ko:
-                wiki_text = _fetch_wikipedia_extract(stage_name)
-            if not wiki_text:
-                wiki_text = _fetch_wikipedia_extract(name_ko)
+                lookup_names.append(stage_name)
+            lookup_names.append(name_ko)
 
-            # 2. Gemini 호출 (Wikipedia 텍스트 유무에 따라 프롬프트 분기)
+            wiki_text = None
+            for lookup in lookup_names:
+                extract  = _fetch_wikipedia_extract(lookup)
+                wikitext = _fetch_wikipedia_wikitext(lookup)
+                wiki_text = _build_wiki_content(extract, wikitext)
+                if wiki_text:
+                    break
+
+            # 2. Gemini 호출 (Wikipedia 콘텐츠 유무에 따라 프롬프트 분기)
             if wiki_text:
                 prompt = _ARTIST_PROMPT_WITH_WIKI.format(
                     name_ko=name_ko,
-                    wiki_text=wiki_text[:3000],
+                    wiki_text=wiki_text,
                 )
                 logger.debug("아티스트 Wikipedia 활용 | %s (%d자)", name_ko, len(wiki_text))
             else:
@@ -395,15 +457,24 @@ def enrich_groups(batch_size: int = GROUP_BATCH_SIZE, overwrite_bio: bool = Fals
         name_ko = g_info["name_ko"]
         name_en = g_info.get("name_en")
         try:
-            # Wikipedia 조회: name_ko 우선 → name_en 폴백 (영문명으로 한국어 Wikipedia 검색)
-            wiki_text = _fetch_wikipedia_extract(name_ko)
-            if not wiki_text and name_en:
-                wiki_text = _fetch_wikipedia_extract(name_en)
+            # Wikipedia 조회: name_ko 우선 → name_en 폴백
+            # extract(소개글) + wikitext(인포박스) 모두 가져와서 결합
+            lookup_names = [name_ko]
+            if name_en:
+                lookup_names.append(name_en)
+
+            wiki_text = None
+            for lookup in lookup_names:
+                extract  = _fetch_wikipedia_extract(lookup)
+                wikitext = _fetch_wikipedia_wikitext(lookup)
+                wiki_text = _build_wiki_content(extract, wikitext)
+                if wiki_text:
+                    break
 
             if wiki_text:
                 prompt = _GROUP_PROMPT_WITH_WIKI.format(
                     name_ko=name_ko,
-                    wiki_text=wiki_text[:3000],
+                    wiki_text=wiki_text,
                 )
                 logger.debug("그룹 Wikipedia 활용 | %s (%d자)", name_ko, len(wiki_text))
             else:
