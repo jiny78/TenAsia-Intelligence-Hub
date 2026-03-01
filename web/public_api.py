@@ -666,6 +666,54 @@ def update_group_status(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+@public_router.delete("/groups/{group_id}", status_code=200)
+def delete_group(group_id: int) -> dict:
+    """그룹 삭제 (관리자용). 관련 entity_mappings·멤버십도 cascade 삭제."""
+    try:
+        from core.db import get_db
+        from database.models import Group
+
+        with get_db() as session:
+            group = session.get(Group, group_id)
+            if group is None:
+                raise HTTPException(status_code=404, detail="그룹을 찾을 수 없습니다.")
+            name = group.name_ko
+            session.delete(group)
+            session.commit()
+            logger.info("그룹 삭제 | id=%d name=%s", group_id, name)
+            return {"deleted": group_id, "name": name}
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("그룹 삭제 실패 id=%d: %s", group_id, exc)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@public_router.delete("/artists/{artist_id}", status_code=200)
+def delete_artist(artist_id: int) -> dict:
+    """아티스트 삭제 (관리자용). 관련 entity_mappings·멤버십도 cascade 삭제."""
+    try:
+        from core.db import get_db
+        from database.models import Artist
+
+        with get_db() as session:
+            artist = session.get(Artist, artist_id)
+            if artist is None:
+                raise HTTPException(status_code=404, detail="아티스트를 찾을 수 없습니다.")
+            name = artist.name_ko
+            session.delete(artist)
+            session.commit()
+            logger.info("아티스트 삭제 | id=%d name=%s", artist_id, name)
+            return {"deleted": artist_id, "name": name}
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("아티스트 삭제 실패 id=%d: %s", artist_id, exc)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
 @public_router.patch("/artists/{artist_id}")
 def update_artist(
     artist_id: int,

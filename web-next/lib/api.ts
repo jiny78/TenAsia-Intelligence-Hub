@@ -200,8 +200,14 @@ export const idolsApi = {
       body: JSON.stringify(body),
     }),
 
+  deleteGroup: (id: number) =>
+    request<{ deleted: number; name: string }>(`/public/groups/${id}`, { method: "DELETE" }),
+
   listArtists: (q?: string) =>
     request<PublicArtist[]>(`/public/artists${q ? `?q=${encodeURIComponent(q)}&limit=200` : "?limit=200"}`),
+
+  deleteArtist: (id: number) =>
+    request<{ deleted: number; name: string }>(`/public/artists/${id}`, { method: "DELETE" }),
 
   listMappings: (params?: { artist_id?: number; group_id?: number; article_id?: number; q?: string; limit?: number; offset?: number }) => {
     const qs = new URLSearchParams({ limit: String(params?.limit ?? 50) });
