@@ -164,6 +164,7 @@ jobs:
 
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
           ECR_ROLE="arn:aws:iam::${ACCOUNT_ID}:role/AppRunnerECRAccessRole"
+          INSTANCE_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/tih-app-role"
           SERVICE_NAME="tenasia-intelligence-hub"
 
           SERVICE_ARN=$(aws apprunner list-services \
@@ -189,14 +190,18 @@ jobs:
                     \"Port\": \"8000\",
                     \"RuntimeEnvironmentVariables\": {
                       \"DATABASE_URL\": \"$DATABASE_URL\",
-                      \"GEMINI_API_KEY\": \"$GEMINI_API_KEY\"
+                      \"GEMINI_API_KEY\": \"$GEMINI_API_KEY\",
+                      \"ENVIRONMENT\": \"production\",
+                      \"AWS_REGION\": \"ap-northeast-1\",
+                      \"S3_BUCKET_NAME\": \"tenasia-thumbnails\"
                     }
                   },
                   \"ImageRepositoryType\": \"ECR\"
                 },
                 \"AuthenticationConfiguration\": {\"AccessRoleArn\": \"$ECR_ROLE\"},
                 \"AutoDeploymentsEnabled\": false
-              }"
+              }" \
+              --instance-configuration "{\"Cpu\":\"1024\",\"Memory\":\"2048\",\"InstanceRoleArn\":\"$INSTANCE_ROLE_ARN\"}"
             echo "service-arn=$SERVICE_ARN" >> "$GITHUB_OUTPUT"
 
           else
@@ -228,7 +233,10 @@ jobs:
                     Port: "8000",
                     RuntimeEnvironmentVariables: {
                       DATABASE_URL:   $db,
-                      GEMINI_API_KEY: $gemini
+                      GEMINI_API_KEY: $gemini,
+                      ENVIRONMENT:    "production",
+                      AWS_REGION:     "ap-northeast-1",
+                      S3_BUCKET_NAME: "tenasia-thumbnails"
                     }
                   },
                   ImageRepositoryType: "ECR"
@@ -242,7 +250,7 @@ jobs:
               NEW_ARN=$(aws apprunner create-service \
                 --service-name "$SERVICE_NAME" \
                 --source-configuration file:///tmp/api-config.json \
-                --instance-configuration '{"Cpu":"1 vCPU","Memory":"2 GB"}' \
+                --instance-configuration "{\"Cpu\":\"1 vCPU\",\"Memory\":\"2 GB\",\"InstanceRoleArn\":\"$INSTANCE_ROLE_ARN\"}" \
                 --health-check-configuration \
                   '{"Protocol":"HTTP","Path":"/health","Interval":10,"Timeout":5,"HealthyThreshold":1,"UnhealthyThreshold":5}' \
                 --query 'Service.ServiceArn' --output text 2>&1) && break
@@ -312,6 +320,7 @@ jobs:
 
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
           ECR_ROLE="arn:aws:iam::${ACCOUNT_ID}:role/AppRunnerECRAccessRole"
+          INSTANCE_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/tih-app-role"
           SERVICE_NAME="tenasia-scraper-worker"
 
           SERVICE_ARN=$(aws apprunner list-services \
@@ -342,7 +351,10 @@ jobs:
                     DATABASE_URL:   $db,
                     GEMINI_API_KEY: $gemini,
                     SKIP_MIGRATE:   "true",
-                    WORKER_ID:      "apprunner-worker"
+                    WORKER_ID:      "apprunner-worker",
+                    ENVIRONMENT:    "production",
+                    AWS_REGION:     "ap-northeast-1",
+                    S3_BUCKET_NAME: "tenasia-thumbnails"
                   }
                 },
                 ImageRepositoryType: "ECR"
@@ -354,7 +366,8 @@ jobs:
           if [ "$STATUS" = "RUNNING" ]; then
             aws apprunner update-service \
               --service-arn "$SERVICE_ARN" \
-              --source-configuration file:///tmp/worker-config.json
+              --source-configuration file:///tmp/worker-config.json \
+              --instance-configuration "{\"Cpu\":\"0.25 vCPU\",\"Memory\":\"0.5 GB\",\"InstanceRoleArn\":\"$INSTANCE_ROLE_ARN\"}"
             echo "service-arn=$SERVICE_ARN" >> "$GITHUB_OUTPUT"
 
           else
@@ -377,7 +390,7 @@ jobs:
             NEW_ARN=$(aws apprunner create-service \
               --service-name "$SERVICE_NAME" \
               --source-configuration file:///tmp/worker-config.json \
-              --instance-configuration '{"Cpu":"0.25 vCPU","Memory":"0.5 GB"}' \
+              --instance-configuration "{\"Cpu\":\"0.25 vCPU\",\"Memory\":\"0.5 GB\",\"InstanceRoleArn\":\"$INSTANCE_ROLE_ARN\"}" \
               --health-check-configuration \
                 '{"Protocol":"HTTP","Path":"/health","Interval":20,"Timeout":5,"HealthyThreshold":1,"UnhealthyThreshold":5}' \
               --query 'Service.ServiceArn' --output text 2>&1)
