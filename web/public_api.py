@@ -34,6 +34,23 @@ public_router = APIRouter(prefix="/public", tags=["public"])
 
 def _article_summary(a: Any) -> dict:
     """기사 목록용 요약 딕셔너리 (content_ko 제외)."""
+    from core.config import settings
+    s3_base = settings.s3_base_url
+
+    extra_images: list[dict] = []
+    for img in (getattr(a, "images", None) or []):
+        if img.is_representative:
+            continue
+        url = (
+            f"{s3_base}/{img.thumbnail_path}"
+            if img.thumbnail_path
+            else img.original_url
+        )
+        if url:
+            extra_images.append({"url": url})
+        if len(extra_images) >= 10:
+            break
+
     return {
         "id":              a.id,
         "title_ko":        a.title_ko,
@@ -50,6 +67,7 @@ def _article_summary(a: Any) -> dict:
         "source_url":      a.source_url,
         "language":        a.language,
         "sentiment":       a.sentiment,
+        "extra_images":    extra_images,
     }
 
 
@@ -146,8 +164,10 @@ def list_articles(
         from sqlalchemy import select
 
         with get_db() as session:
+            from sqlalchemy.orm import selectinload
             stmt = (
                 select(Article)
+                .options(selectinload(Article.images))
                 .where(Article.process_status == "PROCESSED")
                 .order_by(Article.published_at.desc())
             )
