@@ -45,7 +45,7 @@ from typing import Any, Literal, Optional
 import boto3
 import psycopg2
 import psycopg2.extras
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -1676,3 +1676,199 @@ def resolve_conflict(
     except Exception as exc:
         logger.error("[Phase5B] /automation/conflicts/%d 오류: %s", conflict_id, exc)
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ─────────────────────────────────────────────────────────────
+# 이미지 수동 업로드 엔드포인트
+# ─────────────────────────────────────────────────────────────
+
+
+@app.post("/admin/artists/{artist_id}/photo")
+async def upload_artist_photo(artist_id: int, file: UploadFile = File(...)):
+    """아티스트 프로필 사진 업로드 → S3 저장 → artists.photo_url 업데이트."""
+    file_bytes = await file.read()
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="파일이 비어 있습니다.")
+
+    from core.image_utils import process_and_upload_image
+    from core.config import settings
+
+    s3_key = f"artists/{settings.ENVIRONMENT}/{artist_id}.webp"
+    try:
+        url = process_and_upload_image(file_bytes, s3_key, max_width=600)
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    conn = psycopg2.connect(settings.DATABASE_URL)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE artists SET photo_url = %s, updated_at = NOW() WHERE id = %s RETURNING id",
+                (url, artist_id),
+            )
+            if cur.fetchone() is None:
+                raise HTTPException(status_code=404, detail="아티스트를 찾을 수 없습니다.")
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {"photo_url": url}
+
+
+@app.post("/admin/groups/{group_id}/photo")
+async def upload_group_photo(group_id: int, file: UploadFile = File(...)):
+    """그룹 썸네일 업로드 → S3 저장 → groups.photo_url 업데이트."""
+    file_bytes = await file.read()
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="파일이 비어 있습니다.")
+
+    from core.image_utils import process_and_upload_image
+    from core.config import settings
+
+    s3_key = f"groups/{settings.ENVIRONMENT}/{group_id}.webp"
+    try:
+        url = process_and_upload_image(file_bytes, s3_key, max_width=600)
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    conn = psycopg2.connect(settings.DATABASE_URL)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE groups SET photo_url = %s, updated_at = NOW() WHERE id = %s RETURNING id",
+                (url, group_id),
+            )
+            if cur.fetchone() is None:
+                raise HTTPException(status_code=404, detail="그룹을 찾을 수 없습니다.")
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {"photo_url": url}
+
+
+@app.post("/admin/articles/{article_id}/images")
+async def upload_article_image(article_id: int, file: UploadFile = File(...)):
+    """기사에 이미지 추가 → S3 저장 → article_images 테이블 INSERT."""
+    file_bytes = await file.read()
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="파일이 비어 있습니다.")
+
+    from core.image_utils import process_and_upload_image
+    from core.config import settings
+
+    timestamp = int(time.time())
+    s3_key = f"thumbnails/{settings.ENVIRONMENT}/{article_id}_upload_{timestamp}.webp"
+    try:
+        url = process_and_upload_image(file_bytes, s3_key)
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    # article_images UPSERT (original_url = S3 URL, thumbnail_path = s3_key)
+    from scraper.db import upsert_article_image
+    try:
+        img_id = upsert_article_image(
+            article_id=article_id,
+            original_url=url,
+            thumbnail_path=s3_key,
+            is_representative=False,
+        )
+    except Exception as exc:
+        logger.error("upload_article_image DB 저장 실패: %s", exc)
+        raise HTTPException(status_code=500, detail="DB 저장에 실패했습니다.")
+
+    return {"id": img_id, "url": url, "article_id": article_id}
+
+
+@app.post("/admin/gallery/photos")
+async def upload_gallery_photo(
+    file: UploadFile = File(...),
+    title: Optional[str] = Form(None),
+    article_id: Optional[int] = Form(None),
+):
+    """독립 갤러리 사진 업로드 → S3 저장 → gallery_photos 테이블 INSERT."""
+    file_bytes = await file.read()
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="파일이 비어 있습니다.")
+
+    from core.image_utils import process_and_upload_image
+    from core.config import settings
+    import hashlib as _hl
+
+    timestamp = int(time.time())
+    file_hash = _hl.md5(file_bytes[:256]).hexdigest()[:8]
+    s3_key = f"gallery/{settings.ENVIRONMENT}/{timestamp}_{file_hash}.webp"
+    try:
+        url = process_and_upload_image(file_bytes, s3_key, max_width=1200)
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    conn = psycopg2.connect(settings.DATABASE_URL)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO gallery_photos (s3_url, title, article_id) VALUES (%s, %s, %s) RETURNING id",
+                (url, title, article_id),
+            )
+            photo_id = cur.fetchone()[0]
+        conn.commit()
+    finally:
+        conn.close()
+
+    return {"id": photo_id, "s3_url": url, "title": title, "article_id": article_id}
+
+
+@app.get("/admin/gallery/photos")
+def list_gallery_photos(
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    article_id: Optional[int] = Query(None),
+):
+    """독립 갤러리 사진 목록 조회."""
+    from core.config import settings
+
+    conn = psycopg2.connect(settings.DATABASE_URL)
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            if article_id is not None:
+                cur.execute(
+                    "SELECT id, s3_url, title, article_id, created_at FROM gallery_photos"
+                    " WHERE article_id = %s ORDER BY created_at DESC LIMIT %s OFFSET %s",
+                    (article_id, limit, offset),
+                )
+            else:
+                cur.execute(
+                    "SELECT id, s3_url, title, article_id, created_at FROM gallery_photos"
+                    " ORDER BY created_at DESC LIMIT %s OFFSET %s",
+                    (limit, offset),
+                )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    return [
+        {
+            "id":         r["id"],
+            "s3_url":     r["s3_url"],
+            "title":      r["title"],
+            "article_id": r["article_id"],
+            "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+        }
+        for r in rows
+    ]
+
+
+@app.delete("/admin/gallery/photos/{photo_id}", status_code=204)
+def delete_gallery_photo(photo_id: int):
+    """갤러리 사진 삭제 (DB만 삭제, S3 파일은 유지)."""
+    from core.config import settings
+
+    conn = psycopg2.connect(settings.DATABASE_URL)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM gallery_photos WHERE id = %s RETURNING id", (photo_id,))
+            if cur.fetchone() is None:
+                raise HTTPException(status_code=404, detail="갤러리 사진을 찾을 수 없습니다.")
+        conn.commit()
+    finally:
+        conn.close()

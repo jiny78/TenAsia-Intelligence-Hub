@@ -22,6 +22,16 @@ async function request<T>(
   return res.json() as Promise<T>;
 }
 
+// multipart 파일 업로드 헬퍼 — Content-Type을 수동 설정하지 않음 (브라우저가 boundary 포함하여 자동 설정)
+async function uploadFile<T = unknown>(path: string, formData: FormData): Promise<T> {
+  const res = await fetch(`${BASE}${path}`, { method: "POST", body: formData });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`${res.status} ${res.statusText}: ${text}`);
+  }
+  return res.json() as Promise<T>;
+}
+
 // ── Articles ───────────────────────────────────────────────────
 export const articlesApi = {
   list: (params?: { translation_pending?: boolean; process_status?: string; limit?: number; offset?: number }) => {
@@ -275,4 +285,47 @@ export const idolsApi = {
       `/admin/backfill-thumbnails?limit=${limit}&days=${days}`,
       { method: "POST", body: JSON.stringify({}) },
     ),
+
+  uploadArtistPhoto: (artistId: number, file: File) => {
+    const fd = new FormData();
+    fd.append("file", file);
+    return uploadFile<{ photo_url: string }>(`/admin/artists/${artistId}/photo`, fd);
+  },
+
+  uploadGroupPhoto: (groupId: number, file: File) => {
+    const fd = new FormData();
+    fd.append("file", file);
+    return uploadFile<{ photo_url: string }>(`/admin/groups/${groupId}/photo`, fd);
+  },
+};
+
+// ── Gallery ────────────────────────────────────────────────────
+export const galleryApi = {
+  list: (params?: { limit?: number; offset?: number; article_id?: number }) => {
+    const q = new URLSearchParams();
+    if (params?.limit    !== undefined) q.set("limit",      String(params.limit));
+    if (params?.offset   !== undefined) q.set("offset",     String(params.offset));
+    if (params?.article_id !== undefined) q.set("article_id", String(params.article_id));
+    return request<import("./types").GalleryPhoto[]>(`/admin/gallery/photos?${q}`);
+  },
+
+  upload: (file: File, title?: string, articleId?: number) => {
+    const fd = new FormData();
+    fd.append("file", file);
+    if (title)     fd.append("title",      title);
+    if (articleId !== undefined) fd.append("article_id", String(articleId));
+    return uploadFile<import("./types").GalleryPhoto>(`/admin/gallery/photos`, fd);
+  },
+
+  uploadToArticle: (articleId: number, file: File) => {
+    const fd = new FormData();
+    fd.append("file", file);
+    return uploadFile<{ id: number; url: string; article_id: number }>(
+      `/admin/articles/${articleId}/images`,
+      fd,
+    );
+  },
+
+  delete: (id: number) =>
+    request<void>(`/admin/gallery/photos/${id}`, { method: "DELETE" }),
 };

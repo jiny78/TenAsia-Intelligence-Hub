@@ -174,3 +174,11 @@ export interface ConflictResolveRequest {
   action: "RESOLVED" | "DISMISSED";
   resolved_by: string;
 }
+
+export interface GalleryPhoto {
+  id: number;
+  s3_url: string;
+  title: string | null;
+  article_id: number | null;
+  created_at: string | null;
+}
