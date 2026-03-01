@@ -26,6 +26,7 @@ core/image_utils.py — 이미지 다운로드, 썸네일 생성, S3 업로드
 
 공개 함수:
     generate_thumbnail(image_url, article_id, session=None, timeout=15) -> Optional[str]
+    process_and_upload_image(file_bytes, s3_key, max_width=600) -> str
 
 공개 상수:
     THUMBNAIL_MAX_WIDTH   — 최대 가로 폭 px (300)
@@ -240,6 +241,94 @@ def generate_thumbnail(
     finally:
         # 예외 발생 여부와 무관하게 메모리 정리
         for obj, name in ((img, "img"), (buf, "buf"), (webp_buf, "webp_buf")):
+            if obj is not None:
+                try:
+                    obj.close()
+                except Exception:
+                    pass
+
+
+def process_and_upload_image(
+    file_bytes: bytes,
+    s3_key: str,
+    max_width: int = 600,
+) -> str:
+    """
+    업로드된 이미지 bytes를 WEBP로 변환하여 S3에 업로드합니다.
+
+    generate_thumbnail()과 달리 URL에서 다운로드하지 않고 이미 메모리에 있는
+    bytes를 직접 처리합니다. 아티스트/그룹 프로필 사진, 갤러리 수동 업로드에 사용.
+
+    Args:
+        file_bytes: 업로드된 이미지 원본 bytes
+        s3_key:     S3에 저장할 키 (예: "artists/development/42.webp")
+        max_width:  최대 가로 폭 px (기본 600 — 썸네일보다 크게)
+
+    Returns:
+        업로드된 이미지의 S3 퍼블릭 URL 문자열
+
+    Raises:
+        ValueError:   지원하지 않는 이미지 포맷
+        RuntimeError: S3 업로드 실패
+    """
+    try:
+        from PIL import Image, UnidentifiedImageError  # type: ignore[import]
+    except ImportError as exc:
+        raise RuntimeError("Pillow 미설치 — `pip install Pillow` 를 실행하세요.") from exc
+
+    try:
+        s3 = _get_s3_client()
+    except Exception as exc:
+        raise RuntimeError(f"S3 클라이언트 초기화 실패: {exc}") from exc
+
+    from core.config import settings
+
+    buf: Optional[io.BytesIO] = None
+    img = None
+    webp_buf: Optional[io.BytesIO] = None
+    try:
+        buf = io.BytesIO(file_bytes)
+        img = Image.open(buf)
+        img.load()
+
+        if img.mode not in ("RGB", "RGBA"):
+            img = img.convert("RGB")
+
+        orig_w, orig_h = img.size
+        if orig_w > max_width:
+            new_h = max(1, round(orig_h * max_width / orig_w))
+            img = img.resize((max_width, new_h), Image.LANCZOS)
+
+        webp_buf = io.BytesIO()
+        img.save(webp_buf, format="WEBP", quality=85)
+
+        img.close()
+        del img
+        img = None
+        buf.close()
+        del buf
+        buf = None
+
+        s3.put_object(
+            Bucket=settings.S3_BUCKET_NAME,
+            Key=s3_key,
+            Body=webp_buf.getvalue(),
+            ContentType=THUMBNAIL_CONTENT_TYPE,
+            CacheControl=THUMBNAIL_CACHE_CONTROL,
+        )
+
+        public_url = f"{settings.s3_base_url}/{s3_key}"
+        log.debug("image_uploaded | key=%s | size=%d bytes", s3_key, len(webp_buf.getvalue()))
+        return public_url
+
+    except (UnidentifiedImageError, OSError) as exc:
+        raise ValueError(f"이미지 처리 실패: {exc}") from exc
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(f"이미지 업로드 실패: {exc}") from exc
+    finally:
+        for obj in (img, buf, webp_buf):
             if obj is not None:
                 try:
                     obj.close()

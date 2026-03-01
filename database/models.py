@@ -387,6 +387,12 @@ class Artist(Base):
         comment="Gemini 프로필 보강 완료 시각. NULL=미보강(보강 대상), NOT NULL=보강 완료(스킵)",
     )
 
+    # ── 수동 업로드 프로필 사진 ─────────────────────────────────
+    photo_url: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True,
+        comment="수동 업로드된 프로필 사진 S3 URL. 기사 썸네일보다 우선 표시",
+    )
+
     # ── 시간 ──────────────────────────────────────────────────
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, nullable=False, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, nullable=False, server_default=func.now())
@@ -539,6 +545,12 @@ class Group(Base):
     enriched_at: Mapped[Optional[datetime]] = mapped_column(
         TIMESTAMPTZ, nullable=True,
         comment="Gemini 프로필 보강 완료 시각. NULL=미보강(보강 대상), NOT NULL=보강 완료(스킵)",
+    )
+
+    # ── 수동 업로드 썸네일 ──────────────────────────────────────
+    photo_url: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True,
+        comment="수동 업로드된 그룹 썸네일 S3 URL. 기사 썸네일보다 우선 표시",
     )
 
     # ── 시간 ──────────────────────────────────────────────────
@@ -1125,6 +1137,50 @@ class ArticleImage(Base):
             f"<ArticleImage id={self.id} article={self.article_id}"
             f"{flag} url={str(self.original_url)[:50]!r}>"
         )
+
+
+# ═════════════════════════════════════════════════════════════
+# GalleryPhoto — 수동 업로드 독립 갤러리 이미지
+# ═════════════════════════════════════════════════════════════
+
+class GalleryPhoto(Base):
+    """
+    관리자가 수동으로 업로드한 독립 갤러리 이미지.
+
+    기사와 연결할 수도 있고(article_id 설정), 독립적으로 관리할 수도 있음.
+    기사 삭제 시 article_id는 SET NULL (갤러리 이미지 유지).
+    """
+    __tablename__ = "gallery_photos"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+
+    s3_url: Mapped[str] = mapped_column(
+        Text, nullable=False,
+        comment="S3에 업로드된 이미지 퍼블릭 URL",
+    )
+    title: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True,
+        comment="선택적 이미지 제목",
+    )
+    article_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("articles.id", ondelete="SET NULL"), nullable=True,
+        comment="연결된 기사 ID (선택적). 기사 삭제 시 SET NULL",
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMPTZ, nullable=False, server_default=func.now(),
+    )
+
+    # ── 관계 ──────────────────────────────────────────────────
+    article: Mapped[Optional["Article"]] = relationship(foreign_keys=[article_id])
+
+    __table_args__ = (
+        Index("idx_gallery_photos_created_at", "created_at"),
+        Index("idx_gallery_photos_article_id",  "article_id"),
+    )
+
+    def __repr__(self) -> str:
+        return f"<GalleryPhoto id={self.id} title={self.title!r}>"
 
 
 # ═════════════════════════════════════════════════════════════
