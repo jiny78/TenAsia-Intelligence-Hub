@@ -21,7 +21,8 @@ async function proxy(
     if (ct) init.headers = { "content-type": ct };
 
     if (request.method !== "GET" && request.method !== "HEAD") {
-      init.body = await request.text();
+      // text()는 바이너리(이미지 등 multipart) 데이터를 깨뜨림 → arrayBuffer() 사용
+      init.body = await request.arrayBuffer();
     }
 
     const upstream = await fetch(url, init);
