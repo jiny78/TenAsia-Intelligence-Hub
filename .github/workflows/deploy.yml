@@ -200,8 +200,7 @@ jobs:
                 },
                 \"AuthenticationConfiguration\": {\"AccessRoleArn\": \"$ECR_ROLE\"},
                 \"AutoDeploymentsEnabled\": false
-              }" \
-              --instance-configuration "{\"Cpu\":\"1024\",\"Memory\":\"2048\",\"InstanceRoleArn\":\"$INSTANCE_ROLE_ARN\"}"
+              }"
             echo "service-arn=$SERVICE_ARN" >> "$GITHUB_OUTPUT"
 
           else
@@ -366,8 +365,7 @@ jobs:
           if [ "$STATUS" = "RUNNING" ]; then
             aws apprunner update-service \
               --service-arn "$SERVICE_ARN" \
-              --source-configuration file:///tmp/worker-config.json \
-              --instance-configuration "{\"Cpu\":\"0.25 vCPU\",\"Memory\":\"0.5 GB\",\"InstanceRoleArn\":\"$INSTANCE_ROLE_ARN\"}"
+              --source-configuration file:///tmp/worker-config.json
             echo "service-arn=$SERVICE_ARN" >> "$GITHUB_OUTPUT"
 
           else
