@@ -713,7 +713,12 @@ def list_entity_mappings(
 
         with get_db() as session:
             # 기본 필터 목록 구성
-            base_filters = []
+            # sentinel(EVENT, confidence=0.0)은 파이프라인 재추출 방지용 — 목록에서 제외
+            from database.models import EntityType as _EntityType
+            base_filters = [
+                ~((EntityMapping.entity_type == _EntityType.EVENT) &
+                  (EntityMapping.confidence_score == 0.0))
+            ]
             if article_id is not None:
                 base_filters.append(EntityMapping.article_id == article_id)
             if artist_id is not None:
@@ -806,16 +811,39 @@ def list_entity_mappings(
 
 @public_router.delete("/entity-mappings/{mapping_id}", status_code=200)
 def delete_entity_mapping(mapping_id: int) -> dict:
-    """엔티티 매핑 삭제 (관리자용)."""
+    """엔티티 매핑 삭제 (관리자용).
+
+    삭제 후 해당 기사에 남은 매핑이 없으면 sentinel(EVENT, confidence=0.0)을 삽입.
+    → 파이프라인이 '매핑 없는 기사'로 인식해 재추출·재생성하는 것을 방지.
+    """
     try:
+        from sqlalchemy import select
         from core.db import get_db
-        from database.models import EntityMapping
+        from database.models import EntityMapping, EntityType
 
         with get_db() as session:
             mapping = session.get(EntityMapping, mapping_id)
             if mapping is None:
                 raise HTTPException(status_code=404, detail="매핑을 찾을 수 없습니다.")
+
+            article_id = mapping.article_id
             session.delete(mapping)
+            session.flush()  # DELETE 반영 후 remaining 확인
+
+            # 남은 매핑 확인 (sentinel 포함)
+            remaining = session.scalars(
+                select(EntityMapping).where(EntityMapping.article_id == article_id).limit(1)
+            ).first()
+
+            if remaining is None:
+                # 파이프라인 재추출 방지용 sentinel 삽입
+                session.add(EntityMapping(
+                    article_id=article_id,
+                    entity_type=EntityType.EVENT,
+                    confidence_score=0.0,
+                ))
+                logger.info("매핑 삭제 후 sentinel 삽입 | article_id=%d", article_id)
+
             session.commit()
             return {"deleted": mapping_id}
 
