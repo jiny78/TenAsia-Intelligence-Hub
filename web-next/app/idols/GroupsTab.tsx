@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { idolsApi, type PublicGroup } from "@/lib/api";
-import { Check, Loader2, RefreshCw, RotateCcw } from "lucide-react";
+import { Check, Loader2, RefreshCw, RotateCcw, Trash2 } from "lucide-react";
 
 const STATUS_OPTIONS = [
   { value: "ACTIVE",    label: "활동 중",    color: "text-emerald-500" },
@@ -19,6 +19,7 @@ export function GroupsTab() {
   const [saved, setSaved]         = useState<Record<number, boolean>>({});
   const [errors, setErrors]       = useState<Record<number, string>>({});
   const [resetting, setResetting] = useState<Record<number, boolean>>({});
+  const [deleting, setDeleting]   = useState<Record<number, boolean>>({});
 
   async function load() {
     setLoading(true);
@@ -49,6 +50,19 @@ export function GroupsTab() {
       setErrors((p) => ({ ...p, [groupId]: String(e) }));
     } finally {
       setSaving((p) => ({ ...p, [groupId]: false }));
+    }
+  }
+
+  async function handleDelete(groupId: number, name: string) {
+    if (!confirm(`"${name}" 그룹을 삭제하시겠습니까?\n관련 기사 매핑도 함께 삭제됩니다.`)) return;
+    setDeleting((p) => ({ ...p, [groupId]: true }));
+    try {
+      await idolsApi.deleteGroup(groupId);
+      setGroups((prev) => prev.filter((g) => g.id !== groupId));
+    } catch (e) {
+      alert(`삭제 실패: ${e}`);
+    } finally {
+      setDeleting((p) => ({ ...p, [groupId]: false }));
     }
   }
 
@@ -106,19 +120,20 @@ export function GroupsTab() {
               <th className="px-4 py-3 text-left">소속사</th>
               <th className="px-4 py-3 text-left w-48">활동 상태</th>
               <th className="px-4 py-3 text-left w-20">보강</th>
+              <th className="px-4 py-3 w-12"></th>
             </tr>
           </thead>
           <tbody className="divide-y divide-border">
             {loading && (
               <tr>
-                <td colSpan={5} className="px-4 py-10 text-center">
+                <td colSpan={6} className="px-4 py-10 text-center">
                   <Loader2 className="h-5 w-5 animate-spin mx-auto text-muted-foreground" />
                 </td>
               </tr>
             )}
             {!loading && filtered.length === 0 && (
               <tr>
-                <td colSpan={5} className="px-4 py-8 text-center text-xs text-muted-foreground">
+                <td colSpan={6} className="px-4 py-8 text-center text-xs text-muted-foreground">
                   그룹 없음
                 </td>
               </tr>
@@ -168,6 +183,19 @@ export function GroupsTab() {
                         ? <Loader2 className="h-3 w-3 animate-spin" />
                         : <RotateCcw className="h-3 w-3" />}
                       초기화
+                    </button>
+                  </td>
+                  <td className="px-4 py-3">
+                    <button
+                      type="button"
+                      onClick={() => handleDelete(group.id, group.name_ko)}
+                      disabled={deleting[group.id]}
+                      title="그룹 삭제"
+                      className="inline-flex items-center justify-center rounded-md border border-border p-1.5 text-muted-foreground hover:text-rose-500 hover:border-rose-400 disabled:opacity-50 transition-colors"
+                    >
+                      {deleting[group.id]
+                        ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        : <Trash2 className="h-3.5 w-3.5" />}
                     </button>
                   </td>
                 </tr>

@@ -2,11 +2,13 @@
 
 import { useState } from "react";
 import { GroupsTab } from "./GroupsTab";
+import { ArtistsTab } from "./ArtistsTab";
 import { MappingsTab } from "./MappingsTab";
 import { EnrichPanel } from "./EnrichPanel";
 
 const TABS = [
-  { id: "groups",   label: "그룹 상태 관리" },
+  { id: "groups",   label: "그룹 관리" },
+  { id: "artists",  label: "아티스트 관리" },
   { id: "mappings", label: "기사-아이돌 매핑" },
   { id: "enrich",   label: "프로필 보강" },
 ] as const;
@@ -43,6 +45,7 @@ export default function IdolsPage() {
       </div>
 
       {tab === "groups"   && <GroupsTab />}
+      {tab === "artists"  && <ArtistsTab />}
       {tab === "mappings" && <MappingsTab />}
       {tab === "enrich"   && <EnrichPanel />}
     </div>
