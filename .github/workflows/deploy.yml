@@ -156,9 +156,11 @@ jobs:
       - name: Deploy API (start-deployment or recreate if needed)
         id: deploy
         env:
-          IMAGE_URI:      ${{ needs.build-api.outputs.image-uri }}
-          DATABASE_URL:   ${{ secrets.DATABASE_URL }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          IMAGE_URI:            ${{ needs.build-api.outputs.image-uri }}
+          DATABASE_URL:         ${{ secrets.DATABASE_URL }}
+          GEMINI_API_KEY:       ${{ secrets.GEMINI_API_KEY }}
+          S3_ACCESS_KEY_ID:     ${{ secrets.S3_ACCESS_KEY_ID }}
+          S3_SECRET_ACCESS_KEY: ${{ secrets.S3_SECRET_ACCESS_KEY }}
         run: |
           set -euo pipefail
 
@@ -193,7 +195,9 @@ jobs:
                       \"GEMINI_API_KEY\": \"$GEMINI_API_KEY\",
                       \"ENVIRONMENT\": \"production\",
                       \"AWS_REGION\": \"ap-northeast-1\",
-                      \"S3_BUCKET_NAME\": \"tenasia-thumbnails\"
+                      \"S3_BUCKET_NAME\": \"tenasia-thumbnails\",
+                      \"AWS_ACCESS_KEY_ID\": \"$S3_ACCESS_KEY_ID\",
+                      \"AWS_SECRET_ACCESS_KEY\": \"$S3_SECRET_ACCESS_KEY\"
                     }
                   },
                   \"ImageRepositoryType\": \"ECR\"
@@ -225,17 +229,21 @@ jobs:
               --arg db     "$DATABASE_URL" \
               --arg gemini "$GEMINI_API_KEY" \
               --arg role   "$ECR_ROLE" \
+              --arg s3key  "$S3_ACCESS_KEY_ID" \
+              --arg s3sec  "$S3_SECRET_ACCESS_KEY" \
               '{
                 ImageRepository: {
                   ImageIdentifier: $image,
                   ImageConfiguration: {
                     Port: "8000",
                     RuntimeEnvironmentVariables: {
-                      DATABASE_URL:   $db,
-                      GEMINI_API_KEY: $gemini,
-                      ENVIRONMENT:    "production",
-                      AWS_REGION:     "ap-northeast-1",
-                      S3_BUCKET_NAME: "tenasia-thumbnails"
+                      DATABASE_URL:          $db,
+                      GEMINI_API_KEY:        $gemini,
+                      ENVIRONMENT:           "production",
+                      AWS_REGION:            "ap-northeast-1",
+                      S3_BUCKET_NAME:        "tenasia-thumbnails",
+                      AWS_ACCESS_KEY_ID:     $s3key,
+                      AWS_SECRET_ACCESS_KEY: $s3sec
                     }
                   },
                   ImageRepositoryType: "ECR"
@@ -311,9 +319,11 @@ jobs:
       - name: Deploy Worker
         id: deploy
         env:
-          IMAGE_URI:      ${{ needs.build-api.outputs.image-uri }}
-          DATABASE_URL:   ${{ secrets.DATABASE_URL }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          IMAGE_URI:            ${{ needs.build-api.outputs.image-uri }}
+          DATABASE_URL:         ${{ secrets.DATABASE_URL }}
+          GEMINI_API_KEY:       ${{ secrets.GEMINI_API_KEY }}
+          S3_ACCESS_KEY_ID:     ${{ secrets.S3_ACCESS_KEY_ID }}
+          S3_SECRET_ACCESS_KEY: ${{ secrets.S3_SECRET_ACCESS_KEY }}
         run: |
           set -euo pipefail
 
@@ -340,6 +350,8 @@ jobs:
             --arg db     "$DATABASE_URL" \
             --arg gemini "$GEMINI_API_KEY" \
             --arg role   "$ECR_ROLE" \
+            --arg s3key  "$S3_ACCESS_KEY_ID" \
+            --arg s3sec  "$S3_SECRET_ACCESS_KEY" \
             '{
               ImageRepository: {
                 ImageIdentifier: $image,
@@ -347,13 +359,15 @@ jobs:
                   Port: "8000",
                   StartCommand: "python -m web.worker_main",
                   RuntimeEnvironmentVariables: {
-                    DATABASE_URL:   $db,
-                    GEMINI_API_KEY: $gemini,
-                    SKIP_MIGRATE:   "true",
-                    WORKER_ID:      "apprunner-worker",
-                    ENVIRONMENT:    "production",
-                    AWS_REGION:     "ap-northeast-1",
-                    S3_BUCKET_NAME: "tenasia-thumbnails"
+                    DATABASE_URL:          $db,
+                    GEMINI_API_KEY:        $gemini,
+                    SKIP_MIGRATE:          "true",
+                    WORKER_ID:             "apprunner-worker",
+                    ENVIRONMENT:           "production",
+                    AWS_REGION:            "ap-northeast-1",
+                    S3_BUCKET_NAME:        "tenasia-thumbnails",
+                    AWS_ACCESS_KEY_ID:     $s3key,
+                    AWS_SECRET_ACCESS_KEY: $s3sec
                   }
                 },
                 ImageRepositoryType: "ECR"
