@@ -90,8 +90,18 @@ export function MappingsTab() {
     setDeleting((prev) => ({ ...prev, [id]: true }));
     try {
       await idolsApi.deleteMapping(id);
+      // 낙관적 업데이트 + 서버에서 재조회 (일관성 보장)
       setMappings((prev) => prev.filter((m) => m.id !== id));
-      setTotal((t) => t - 1);
+      setTotal((t) => Math.max(0, t - 1));
+      // 서버 재조회로 확인
+      const result = await idolsApi.listMappings({
+        q:          searchQ || undefined,
+        article_id: filterArticleId ? Number(filterArticleId) : undefined,
+        limit:      PAGE_SIZE,
+        offset:     page * PAGE_SIZE,
+      });
+      setMappings(result.items);
+      setTotal(result.total);
     } catch (e) {
       alert(`삭제 실패: ${e}`);
     } finally {
@@ -331,6 +341,7 @@ export function MappingsTab() {
                       </span>
                       <span className="font-medium">{label}</span>
                       <button
+                        type="button"
                         onClick={() => handleDelete(m.id)}
                         disabled={deleting[m.id]}
                         title={`${label} 연결 해제`}
